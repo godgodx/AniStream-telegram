@@ -43,6 +43,11 @@ video {
   margin-bottom: 18px;
 }
 
+.header-actions {
+  display: flex;
+  gap: 8px;
+}
+
 .eyebrow {
   margin: 0 0 6px;
   color: var(--tg-theme-button-color, #8b5cf6);
@@ -73,6 +78,17 @@ h1 {
   cursor: pointer;
 }
 
+.icon-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
+.icon-button svg {
+  width: 22px;
+  height: 22px;
+  fill: currentColor;
+}
+
 .player-card {
   position: relative;
   overflow: hidden;
@@ -88,6 +104,43 @@ video {
   width: 100%;
   height: 100%;
   background: #000;
+}
+
+.episode-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.episode-controls button {
+  min-height: 46px;
+  padding: 10px 14px;
+  border: 1px solid color-mix(in srgb, var(--tg-theme-button-color, #8b5cf6) 35%, transparent);
+  border-radius: 14px;
+  color: var(--tg-theme-button-text-color, #fff);
+  background: var(--tg-theme-button-color, #7c3aed);
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.episode-controls button:last-child {
+  justify-self: stretch;
+}
+
+.episode-controls button:disabled {
+  border-color: transparent;
+  color: var(--tg-theme-hint-color, #9ba4b5);
+  background: var(--tg-theme-secondary-bg-color, #151b27);
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+#autoplay-status {
+  color: var(--tg-theme-hint-color, #9ba4b5);
+  font-size: 0.78rem;
+  text-align: center;
 }
 
 .loading {
@@ -162,6 +215,14 @@ video {
   background: rgb(127 29 29 / 35%);
 }
 
+.cast-status {
+  min-height: 1.4em;
+  margin: 12px 2px 0;
+  color: var(--tg-theme-hint-color, #9ba4b5);
+  font-size: 0.82rem;
+  text-align: right;
+}
+
 @media (max-width: 560px) {
   .details {
     grid-template-columns: 0.7fr 1.3fr;
@@ -174,5 +235,14 @@ video {
   .player-card {
     margin-inline: -8px;
     border-radius: 14px;
+  }
+
+  .episode-controls {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  #autoplay-status {
+    grid-column: 1 / -1;
+    grid-row: 2;
   }
 }

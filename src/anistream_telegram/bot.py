@@ -570,7 +570,7 @@ class BotHandlers:
             )
             catalogue = entry["catalogue"]
             label = (
-                f"▶ {catalogue['title']} · E{entry['next_episode']} · "
+                f"▶ {catalogue['title']} · E{entry['resume_episode']} · "
                 f"{catalogue['provider_name']}"
             )[:60]
             buttons.append(
@@ -604,7 +604,7 @@ class BotHandlers:
         await self._send_watch_button(
             callback,
             entry["catalogue"],
-            int(entry["next_episode"]),
+            int(entry["resume_episode"]),
             start_position=float(entry.get("position", 0.0)),
             back_callback="menu:continue",
         )

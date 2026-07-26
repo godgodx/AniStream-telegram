@@ -63,8 +63,113 @@ async def test_positions_are_stored_per_episode(tmp_path: Path) -> None:
         await database.record_progress(123, catalogue(), 4, 240.0, 1500, False)
         entries = await database.continue_watching(123)
         assert entries[0]["next_episode"] == 4
+        assert entries[0]["resume_episode"] == 4
         assert await database.episode_position(123, catalogue(), 2) == 88.5
         assert await database.episode_position(123, catalogue(), 4) == 240.0
+    finally:
+        await database.close()
+
+
+async def test_skip_forward_then_rewind_resumes_last_interrupted_episode(
+    tmp_path: Path,
+) -> None:
+    database = await database_at(tmp_path / "db.sqlite")
+    try:
+        await database.record_progress(123, catalogue(), 8, 420.0, 1500, False)
+        await database.record_progress(123, catalogue(), 2, 95.0, 1500, False)
+
+        entry = (await database.continue_watching(123))[0]
+        assert entry["next_episode"] == 8
+        assert entry["last_played_episode"] == 2
+        assert entry["resume_episode"] == 2
+        assert entry["position"] == 95.0
+        assert await database.episode_position(123, catalogue(), 8) == 420.0
+    finally:
+        await database.close()
+
+
+async def test_completed_rewatch_returns_to_forward_continuation(tmp_path: Path) -> None:
+    database = await database_at(tmp_path / "db.sqlite")
+    try:
+        await database.record_progress(123, catalogue(), 7, 0, 1500, True)
+        await database.record_progress(123, catalogue(), 2, 300.0, 1500, False)
+        interrupted = (await database.continue_watching(123))[0]
+        assert interrupted["resume_episode"] == 2
+        assert interrupted["next_episode"] == 8
+
+        await database.record_progress(123, catalogue(), 2, 1500, 1500, True)
+        resumed = (await database.continue_watching(123))[0]
+        assert resumed["resume_episode"] == 8
+        assert resumed["next_episode"] == 8
+        assert resumed["position"] == 0.0
+    finally:
+        await database.close()
+
+
+async def test_selected_episode_at_zero_is_the_interruption_point(tmp_path: Path) -> None:
+    database = await database_at(tmp_path / "db.sqlite")
+    try:
+        await database.record_progress(123, catalogue(), 7, 0, 1500, True)
+        await database.record_progress(123, catalogue(), 2, 0, 0, False)
+
+        entry = (await database.continue_watching(123))[0]
+        assert entry["next_episode"] == 8
+        assert entry["last_played_episode"] == 2
+        assert entry["resume_episode"] == 2
+        assert entry["position"] == 0.0
+    finally:
+        await database.close()
+
+
+async def test_completed_season_stays_completed_during_partial_rewatch(
+    tmp_path: Path,
+) -> None:
+    database = await database_at(tmp_path / "db.sqlite")
+    try:
+        await database.record_progress(123, catalogue(), 12, 1500, 1500, True)
+        await database.record_progress(123, catalogue(), 1, 120.0, 1500, False)
+
+        entry = (await database.continue_watching(123))[0]
+        assert entry["status"] == "completed"
+        assert entry["next_episode"] == 12
+        assert entry["resume_episode"] == 1
+        assert entry["position"] == 120.0
+    finally:
+        await database.close()
+
+
+async def test_cast_grant_is_playback_bound_and_revoked_with_whitelist(
+    tmp_path: Path,
+) -> None:
+    database = await database_at(tmp_path / "db.sqlite")
+    try:
+        await database.set_allowed(123, True)
+        playback = await database.create_playback(
+            123,
+            catalogue(),
+            3,
+            media_url="https://cdn.example/video.mp4",
+            media_headers={},
+            media_kind="mp4",
+            source_name="Test",
+            ttl_seconds=600,
+        )
+        other = await database.create_playback(
+            123,
+            catalogue(),
+            4,
+            media_url="https://cdn.example/video-4.mp4",
+            media_headers={},
+            media_kind="mp4",
+            source_name="Test",
+            ttl_seconds=600,
+        )
+        grant = await database.create_cast_grant(playback, ttl_seconds=300)
+
+        assert await database.get_cast_playback(grant, playback.id) is not None
+        assert await database.get_cast_playback(grant, other.id) is None
+        await database.set_allowed(123, False)
+        assert await database.get_cast_playback(grant, playback.id) is None
     finally:
         await database.close()
 

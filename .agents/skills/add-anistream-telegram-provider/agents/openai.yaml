@@ -1,0 +1,4 @@
+interface:
+  display_name: "Add an AniStream Telegram Provider"
+  short_description: "Add and validate a Telegram provider"
+  default_prompt: "Use $add-anistream-telegram-provider to add a new media provider to AniStream Telegram."

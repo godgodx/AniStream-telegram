@@ -35,6 +35,14 @@ PLAYLIST_TYPES = {
     "audio/mpegurl",
     "audio/x-mpegurl",
 }
+CAST_CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+    "Access-Control-Allow-Headers": "Accept-Encoding, Range",
+    "Access-Control-Expose-Headers": (
+        "Accept-Ranges, Content-Length, Content-Range, Content-Type"
+    ),
+}
 
 
 class SafeResolver(AbstractResolver):
@@ -164,11 +172,20 @@ class MediaGateway:
     async def close(self) -> None:
         await self.upstream.close()
 
+    async def options(self, request: web.Request) -> web.Response:
+        return web.Response(status=204, headers=CAST_CORS_HEADERS)
+
     async def _session_and_playback(
         self,
         request: web.Request,
         playback_id: str,
-    ) -> tuple[Any, PlaybackSession]:
+    ) -> tuple[int, PlaybackSession, str]:
+        cast_token = request.query.get("cast", "")
+        if cast_token:
+            playback = await self.database.get_cast_playback(cast_token, playback_id)
+            if playback is None:
+                raise web.HTTPForbidden(text="Cast session is unavailable")
+            return playback.telegram_user_id, playback, cast_token
         raw_session = request.cookies.get(self.config.cookie_name, "")
         session = await self.database.get_web_session(raw_session)
         if session is None:
@@ -176,7 +193,7 @@ class MediaGateway:
         playback = await self.database.get_playback(playback_id, session.telegram_user_id)
         if playback is None:
             raise web.HTTPForbidden(text="Playback session is unavailable")
-        return session, playback
+        return session.telegram_user_id, playback, ""
 
     @asynccontextmanager
     async def _stream_slot(self, user_id: int):
@@ -194,18 +211,25 @@ class MediaGateway:
 
     async def master(self, request: web.Request) -> web.StreamResponse:
         playback_id = request.match_info["playback_id"]
-        session, playback = await self._session_and_playback(request, playback_id)
+        user_id, playback, cast_token = await self._session_and_playback(
+            request,
+            playback_id,
+        )
         return await self._serve_target(
             request,
-            session.telegram_user_id,
+            user_id,
             playback,
             playback.media_url,
             force_playlist=playback.media_kind == "hls",
+            cast_token=cast_token,
         )
 
     async def resource(self, request: web.Request) -> web.StreamResponse:
         playback_id = request.match_info["playback_id"]
-        session, playback = await self._session_and_playback(request, playback_id)
+        user_id, playback, cast_token = await self._session_and_playback(
+            request,
+            playback_id,
+        )
         token = request.query.get("t", "")
         try:
             target = self.tokens.parse(token, playback_id)
@@ -213,10 +237,11 @@ class MediaGateway:
             raise web.HTTPForbidden(text="Invalid media resource") from exc
         return await self._serve_target(
             request,
-            session.telegram_user_id,
+            user_id,
             playback,
             target,
             force_playlist=False,
+            cast_token=cast_token,
         )
 
     async def _serve_target(
@@ -227,6 +252,7 @@ class MediaGateway:
         target: str,
         *,
         force_playlist: bool,
+        cast_token: str = "",
     ) -> web.StreamResponse:
         range_header = request.headers.get("Range", "")
         if range_header and not RANGE_PATTERN.fullmatch(range_header):
@@ -253,8 +279,17 @@ class MediaGateway:
                         or force_playlist
                     ) and not range_header
                     if is_playlist:
-                        return await self._playlist_response(playback, upstream, final_url)
-                    return await self._stream_response(request, upstream)
+                        return await self._playlist_response(
+                            playback,
+                            upstream,
+                            final_url,
+                            cast_token=cast_token,
+                        )
+                    return await self._stream_response(
+                        request,
+                        upstream,
+                        cast_enabled=bool(cast_token),
+                    )
                 except Exception:
                     upstream.release()
                     raise
@@ -270,6 +305,8 @@ class MediaGateway:
         playback: PlaybackSession,
         upstream: ClientResponse,
         base_url: str,
+        *,
+        cast_token: str = "",
     ) -> web.Response:
         body = await upstream.content.read(2_000_001)
         upstream.release()
@@ -288,7 +325,10 @@ class MediaGateway:
             absolute = urljoin(base_url, uri.strip())
             public_url_parts(absolute, self.config.media_allowed_hosts)
             token = self.tokens.create(playback.id, absolute, expires_at)
-            return f"/media/{playback.id}/resource?t={quote(token)}"
+            path = f"/media/{playback.id}/resource?t={quote(token)}"
+            if cast_token:
+                path += f"&cast={quote(cast_token)}"
+            return path
 
         output: list[str] = []
         for line in text.splitlines():
@@ -304,21 +344,28 @@ class MediaGateway:
                 )
             else:
                 output.append(route(stripped))
+        headers = {"Cache-Control": "private, no-store"}
+        if cast_token:
+            headers.update(CAST_CORS_HEADERS)
         return web.Response(
             text="\n".join(output) + "\n",
             content_type="application/vnd.apple.mpegurl",
-            headers={"Cache-Control": "private, no-store"},
+            headers=headers,
         )
 
     async def _stream_response(
         self,
         request: web.Request,
         upstream: ClientResponse,
+        *,
+        cast_enabled: bool = False,
     ) -> web.StreamResponse:
         headers: dict[str, str] = {
             "Cache-Control": "private, max-age=30",
             "X-Content-Type-Options": "nosniff",
         }
+        if cast_enabled:
+            headers.update(CAST_CORS_HEADERS)
         for name in (
             "Content-Length",
             "Content-Range",

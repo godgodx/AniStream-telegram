@@ -5,6 +5,7 @@ import hmac
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import urlencode
 
 from aiohttp import web
@@ -22,6 +23,30 @@ from anistream_telegram.web import (
 
 
 BOT_TOKEN = "123456789:test-token"
+
+
+class FakeCore:
+    async def prepare_media(self, catalogue: dict, episode: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            url=f"https://cdn.example/episode-{episode}.mp4",
+            headers={"Referer": "https://provider.example/"},
+            kind="mp4",
+            resolver_name="Test resolver",
+        )
+
+
+def catalogue() -> dict:
+    return {
+        "provider_id": "test",
+        "provider_name": "Test Provider",
+        "title": "Example",
+        "url": "https://provider.example/catalogue/example/season-1/vf/",
+        "season": "Season 1",
+        "language_code": "vf",
+        "language_label": "VF",
+        "total_episodes": 12,
+        "episodes": [],
+    }
 
 
 def config(tmp_path: Path) -> Config:
@@ -125,6 +150,105 @@ async def test_auth_endpoint_rejects_wrong_origin(tmp_path: Path) -> None:
             json={"init_data": signed_init_data(123), "launch_token": "x"},
         )
         assert response.status == 403
+    finally:
+        await client.close()
+        await database.close()
+
+
+async def test_episode_change_resumes_position_and_updates_session(
+    tmp_path: Path,
+) -> None:
+    settings = config(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize(settings.allowed_users)
+    await database.record_progress(123, catalogue(), 4, 92.5, 1500, False)
+    raw_session, csrf = await database.create_web_session(
+        123,
+        {
+            "catalogue": catalogue(),
+            "episode": 2,
+            "start_position": 0,
+        },
+        ttl_seconds=600,
+    )
+    media = MediaGateway(settings, database)
+    app = web.Application(middlewares=[error_boundary, security_headers])
+    app[CONFIG_KEY] = settings
+    WebRoutes(settings, database, FakeCore(), media).register(app)  # type: ignore[arg-type]
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.post(
+            "/api/playback/episode",
+            headers={
+                "Origin": settings.public_origin,
+                "X-CSRF-Token": csrf,
+                "Cookie": f"{settings.cookie_name}={raw_session}",
+            },
+            json={"episode": 4},
+        )
+        assert response.status == 200
+        payload = await response.json()
+        assert payload["episode"] == 4
+        assert payload["total_episodes"] == 12
+        assert payload["has_previous"] is True
+        assert payload["has_next"] is True
+        assert payload["start_position"] == 92.5
+
+        updated = await database.get_web_session(raw_session)
+        assert updated is not None
+        assert updated.payload["episode"] == 4
+        assert updated.payload["start_position"] == 92.5
+    finally:
+        await client.close()
+        await database.close()
+
+
+async def test_cast_endpoint_returns_short_lived_playback_grant(
+    tmp_path: Path,
+) -> None:
+    settings = config(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize(settings.allowed_users)
+    raw_session, csrf = await database.create_web_session(
+        123,
+        {"catalogue": catalogue(), "episode": 3},
+        ttl_seconds=600,
+    )
+    playback = await database.create_playback(
+        123,
+        catalogue(),
+        3,
+        media_url="https://cdn.example/episode-3.mp4",
+        media_headers={},
+        media_kind="mp4",
+        source_name="Test",
+        ttl_seconds=600,
+    )
+    media = MediaGateway(settings, database)
+    app = web.Application(middlewares=[error_boundary, security_headers])
+    app[CONFIG_KEY] = settings
+    WebRoutes(settings, database, FakeCore(), media).register(app)  # type: ignore[arg-type]
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.post(
+            "/api/cast",
+            headers={
+                "Origin": settings.public_origin,
+                "X-CSRF-Token": csrf,
+                "Cookie": f"{settings.cookie_name}={raw_session}",
+            },
+            json={"playback_id": playback.id},
+        )
+        assert response.status == 200
+        payload = await response.json()
+        assert payload["content_type"] == "video/mp4"
+        assert payload["url"].startswith(
+            f"{settings.public_base_url}/media/{playback.id}/master?cast="
+        )
+        grant = payload["url"].split("cast=", 1)[1]
+        assert await database.get_cast_playback(grant, playback.id) is not None
     finally:
         await client.close()
         await database.close()

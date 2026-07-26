@@ -17,15 +17,41 @@
           <h1 id="title">Preparing your stream…</h1>
           <p id="subtitle" class="subtitle">Secure Telegram playback</p>
         </div>
-        <button id="fullscreen" class="icon-button" type="button" aria-label="Enter fullscreen">⛶</button>
+        <div class="header-actions">
+          <button
+            id="cast"
+            class="icon-button"
+            type="button"
+            aria-label="Cast to a TV"
+            title="Checking cast support…"
+            disabled
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M3 18v3h3a3 3 0 0 0-3-3Zm0-4v2a5 5 0 0 1 5 5h2a7 7 0 0 0-7-7Zm0-4v2a9 9 0 0 1 9 9h2A11 11 0 0 0 3 10Zm2-7a2 2 0 0 0-2 2v3h2V5h14v12h-3v2h3a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2Z" />
+            </svg>
+          </button>
+          <button id="fullscreen" class="icon-button" type="button" aria-label="Enter fullscreen">⛶</button>
+        </div>
       </header>
 
       <section class="player-card" aria-label="Video player">
-        <video id="video" controls playsinline preload="metadata"></video>
+        <video
+          id="video"
+          controls
+          playsinline
+          preload="metadata"
+          x-webkit-airplay="allow"
+        ></video>
         <div id="loading" class="loading" role="status">
           <span class="spinner" aria-hidden="true"></span>
           <span id="status">Authenticating with Telegram…</span>
         </div>
+      </section>
+
+      <section class="episode-controls" aria-label="Episode navigation">
+        <button id="previous" type="button">← Previous episode</button>
+        <span id="autoplay-status">Autoplay next is on</span>
+        <button id="next" type="button">Next episode →</button>
       </section>
 
       <section class="details">
@@ -43,6 +69,7 @@
         </div>
       </section>
 
+      <p id="cast-status" class="cast-status" aria-live="polite"></p>
       <p id="error" class="error" role="alert" hidden></p>
     </main>
     <script type="module" src="/app/assets/main.js"></script>

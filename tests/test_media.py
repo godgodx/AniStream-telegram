@@ -85,3 +85,34 @@ async def test_hls_playlist_urls_are_opaque_and_bound(tmp_path: Path) -> None:
     token = parse_qs(urlparse(resource).query)["t"][0]
     assert gateway.tokens.parse(token, "playback-id").endswith("/path/segment-001.ts")
     assert len(re.findall(r"/media/playback-id/resource", response.text)) == 2
+
+
+async def test_cast_hls_playlist_propagates_grant_and_cors(tmp_path: Path) -> None:
+    database = Database(config(tmp_path).database_url)
+    gateway = MediaGateway(config(tmp_path), database)
+    playback = PlaybackSession(
+        id="playback-id",
+        telegram_user_id=123,
+        catalogue_payload={},
+        episode=1,
+        media_url="https://cdn.example/master.m3u8",
+        media_headers={},
+        media_kind="hls",
+        source_name="Test",
+        expires_at=utcnow() + timedelta(minutes=10),
+    )
+    upstream = FakeResponse(
+        b"#EXTM3U\n#EXTINF:10,\nsegment-001.ts\n",
+        "https://cdn.example/path/master.m3u8",
+    )
+
+    response = await gateway._playlist_response(
+        playback,
+        upstream,
+        str(upstream.url),
+        cast_token="cast-grant",
+    )
+
+    assert "cast=cast-grant" in response.text
+    assert response.headers["Access-Control-Allow-Origin"] == "*"
+    assert "Range" in response.headers["Access-Control-Allow-Headers"]

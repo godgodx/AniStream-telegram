@@ -89,6 +89,19 @@ class PlaybackSession(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime, index=True, nullable=False)
 
 
+class CastGrant(Base):
+    __tablename__ = "cast_grants"
+
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    playback_id: Mapped[str] = mapped_column(
+        ForeignKey("playback_sessions.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True, nullable=False)
+
+
 class WatchState(Base):
     __tablename__ = "watch_states"
     __table_args__ = (
@@ -290,6 +303,26 @@ class Database:
                 delete(WebSession).where(WebSession.token_hash == token_hash(raw_token))
             )
 
+    async def update_web_session_payload(
+        self,
+        raw_token: str,
+        user_id: int,
+        payload: dict[str, Any],
+    ) -> bool:
+        if not raw_token:
+            return False
+        async with self.sessions.begin() as session:
+            item = await session.get(WebSession, token_hash(raw_token), with_for_update=True)
+            if (
+                item is None
+                or item.telegram_user_id != user_id
+                or item.expires_at <= utcnow()
+            ):
+                return False
+            item.payload = payload
+            item.last_seen_at = utcnow()
+            return True
+
     async def create_playback(
         self,
         user_id: int,
@@ -327,6 +360,56 @@ class Database:
             ):
                 return None
             return item
+
+    async def create_cast_grant(
+        self,
+        playback: PlaybackSession,
+        *,
+        ttl_seconds: int = 7200,
+    ) -> str:
+        raw = secrets.token_urlsafe(32)
+        expires_at = min(
+            playback.expires_at,
+            utcnow() + timedelta(seconds=max(60, ttl_seconds)),
+        )
+        async with self.sessions.begin() as session:
+            session.add(
+                CastGrant(
+                    token_hash=token_hash(raw),
+                    playback_id=playback.id,
+                    telegram_user_id=playback.telegram_user_id,
+                    expires_at=expires_at,
+                )
+            )
+        return raw
+
+    async def get_cast_playback(
+        self,
+        raw_token: str,
+        playback_id: str,
+    ) -> PlaybackSession | None:
+        if not raw_token or len(raw_token) > 128:
+            return None
+        now = utcnow()
+        async with self.sessions() as session:
+            grant = await session.get(CastGrant, token_hash(raw_token))
+            if (
+                grant is None
+                or grant.playback_id != playback_id
+                or grant.expires_at <= now
+            ):
+                return None
+            allowed = await session.get(AllowedUser, grant.telegram_user_id)
+            if allowed is None or not allowed.enabled:
+                return None
+            playback = await session.get(PlaybackSession, playback_id)
+            if (
+                playback is None
+                or playback.telegram_user_id != grant.telegram_user_id
+                or playback.expires_at <= now
+            ):
+                return None
+            return playback
 
     @staticmethod
     def catalogue_identity(payload: dict[str, Any]) -> tuple[str, str, str]:
@@ -380,8 +463,6 @@ class Database:
                     state.status = "completed"
             else:
                 state.next_episode = max(state.next_episode, episode)
-                if state.status == "completed":
-                    state.status = "in_progress"
 
             progress = await session.scalar(
                 select(EpisodeProgress)
@@ -396,7 +477,9 @@ class Database:
                 session.add(progress)
             progress.position_seconds = 0.0 if completed else position
             progress.duration_seconds = max(float(progress.duration_seconds or 0.0), duration)
-            progress.completed = progress.completed or completed
+            # Opening or replaying an episode makes it the active interruption
+            # point again, even if that episode was completed in the past.
+            progress.completed = completed
             progress.updated_at = now
 
     async def continue_watching(self, user_id: int, limit: int = 20) -> list[dict[str, Any]]:
@@ -411,18 +494,33 @@ class Database:
             )
             output: list[dict[str, Any]] = []
             for state in states:
-                position = await session.scalar(
-                    select(EpisodeProgress.position_seconds).where(
+                last_progress = await session.scalar(
+                    select(EpisodeProgress).where(
                         EpisodeProgress.watch_state_id == state.id,
-                        EpisodeProgress.episode == state.next_episode,
+                        EpisodeProgress.episode == state.last_played_episode,
                     )
                 )
+                if last_progress is not None and not last_progress.completed:
+                    resume_episode = state.last_played_episode
+                    position = float(last_progress.position_seconds or 0.0)
+                else:
+                    resume_episode = state.next_episode
+                    position = float(
+                        await session.scalar(
+                            select(EpisodeProgress.position_seconds).where(
+                                EpisodeProgress.watch_state_id == state.id,
+                                EpisodeProgress.episode == state.next_episode,
+                            )
+                        )
+                        or 0.0
+                    )
                 output.append(
                     {
                         "catalogue": dict(state.catalogue_payload),
                         "next_episode": state.next_episode,
                         "last_played_episode": state.last_played_episode,
-                        "position": float(position or 0.0),
+                        "resume_episode": resume_episode,
+                        "position": position,
                         "status": state.status,
                         "updated_at": state.updated_at.isoformat(),
                     }
@@ -456,6 +554,7 @@ class Database:
             )
             await session.execute(delete(LaunchTicket).where(LaunchTicket.expires_at <= now))
             await session.execute(delete(WebSession).where(WebSession.expires_at <= now))
+            await session.execute(delete(CastGrant).where(CastGrant.expires_at <= now))
             await session.execute(
                 delete(PlaybackSession).where(PlaybackSession.expires_at <= now)
             )

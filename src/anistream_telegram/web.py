@@ -63,15 +63,21 @@ class WebRoutes:
         self.media = media
         self.auth_limiter = SlidingWindowLimiter(12, 60)
         self.progress_limiter = SlidingWindowLimiter(120, 60)
+        self.playback_limiter = SlidingWindowLimiter(30, 60)
+        self.cast_limiter = SlidingWindowLimiter(10, 60)
 
     def register(self, app: web.Application) -> None:
         app.router.add_post("/api/auth/telegram", self.authenticate)
         app.router.add_get("/api/session", self.session_info)
         app.router.add_get("/api/playback", self.playback)
+        app.router.add_post("/api/playback/episode", self.change_episode)
         app.router.add_post("/api/progress", self.progress)
+        app.router.add_post("/api/cast", self.cast)
         app.router.add_post("/api/logout", self.logout)
         app.router.add_get("/media/{playback_id}/master", self.media.master)
         app.router.add_get("/media/{playback_id}/resource", self.media.resource)
+        app.router.add_options("/media/{playback_id}/master", self.media.options)
+        app.router.add_options("/media/{playback_id}/resource", self.media.options)
         app.router.add_get("/health/live", self.live)
         app.router.add_get("/health/ready", self.ready)
 
@@ -168,19 +174,32 @@ class WebRoutes:
         )
         return response
 
-    async def playback(self, request: web.Request) -> web.Response:
-        session = await self._authenticated(request)
-        launch = dict(session.payload)
-        catalogue = launch.get("catalogue")
+    @staticmethod
+    def _catalogue(session: WebSession) -> dict[str, Any]:
+        catalogue = session.payload.get("catalogue")
         if not isinstance(catalogue, dict):
             raise web.HTTPBadRequest(text="Playback catalogue is missing")
+        return catalogue
+
+    @staticmethod
+    def _episode(catalogue: dict[str, Any], value: Any) -> tuple[int, int]:
         try:
-            episode = int(launch["episode"])
+            episode = int(value)
             total = int(catalogue["total_episodes"])
         except (KeyError, TypeError, ValueError) as exc:
             raise web.HTTPBadRequest(text="Playback metadata is malformed") from exc
         if not 1 <= episode <= total:
             raise web.HTTPBadRequest(text="Episode is outside the catalogue")
+        return episode, total
+
+    async def _prepare_episode(
+        self,
+        session: WebSession,
+        catalogue: dict[str, Any],
+        episode: int,
+        total: int,
+        start_position: float,
+    ) -> dict[str, Any]:
         try:
             media = await self.core.prepare_media(catalogue, episode)
             public_url_parts(media.url, self.config.media_allowed_hosts)
@@ -197,19 +216,87 @@ class WebRoutes:
             source_name=media.resolver_name,
             ttl_seconds=self.config.playback_ttl_seconds,
         )
-        return web.json_response(
-            {
-                "playback_id": playback.id,
-                "stream_url": f"/media/{playback.id}/master",
-                "kind": playback.media_kind,
-                "source": playback.source_name,
-                "episode": episode,
-                "start_position": max(0.0, float(launch.get("start_position", 0.0) or 0.0)),
-                "title": str(catalogue.get("title", ""))[:200],
-                "season": str(catalogue.get("season", ""))[:100],
-                "language": str(catalogue.get("language_label", ""))[:100],
-            }
+        # Persist the selected episode immediately. This covers a Mini App
+        # being closed before the first timeupdate/pagehide event fires.
+        await self.database.record_progress(
+            session.telegram_user_id,
+            catalogue,
+            episode,
+            start_position,
+            0.0,
+            False,
         )
+        return {
+            "playback_id": playback.id,
+            "stream_url": f"/media/{playback.id}/master",
+            "kind": playback.media_kind,
+            "source": playback.source_name,
+            "episode": episode,
+            "total_episodes": total,
+            "has_previous": episode > 1,
+            "has_next": episode < total,
+            "start_position": max(0.0, float(start_position or 0.0)),
+            "title": str(catalogue.get("title", ""))[:200],
+            "season": str(catalogue.get("season", ""))[:100],
+            "language": str(catalogue.get("language_label", ""))[:100],
+        }
+
+    async def playback(self, request: web.Request) -> web.Response:
+        session = await self._authenticated(request)
+        launch = dict(session.payload)
+        catalogue = self._catalogue(session)
+        episode, total = self._episode(catalogue, launch.get("episode"))
+        stored_position = await self.database.episode_position(
+            session.telegram_user_id,
+            catalogue,
+            episode,
+        )
+        start_position = (
+            stored_position
+            if stored_position > 0
+            else max(0.0, float(launch.get("start_position", 0.0) or 0.0))
+        )
+        return web.json_response(
+            await self._prepare_episode(
+                session,
+                catalogue,
+                episode,
+                total,
+                start_position,
+            )
+        )
+
+    async def change_episode(self, request: web.Request) -> web.Response:
+        session = await self._authenticated(request)
+        await self._csrf(request, session)
+        if not await self.playback_limiter.allow(str(session.telegram_user_id)):
+            raise web.HTTPTooManyRequests(text="Episode changes are too frequent")
+        payload = await self._json(request)
+        catalogue = self._catalogue(session)
+        episode, total = self._episode(catalogue, payload.get("episode"))
+        start_position = await self.database.episode_position(
+            session.telegram_user_id,
+            catalogue,
+            episode,
+        )
+        response_payload = await self._prepare_episode(
+            session,
+            catalogue,
+            episode,
+            total,
+            start_position,
+        )
+        launch = dict(session.payload)
+        launch["episode"] = episode
+        launch["start_position"] = start_position
+        raw_session = request.cookies.get(self.config.cookie_name, "")
+        if not await self.database.update_web_session_payload(
+            raw_session,
+            session.telegram_user_id,
+            launch,
+        ):
+            raise web.HTTPUnauthorized(text="Authentication required")
+        return web.json_response(response_payload)
 
     async def session_info(self, request: web.Request) -> web.Response:
         session = await self._authenticated(request)
@@ -263,6 +350,41 @@ class WebRoutes:
         )
         return web.json_response({"ok": True, "completed": completed})
 
+    async def cast(self, request: web.Request) -> web.Response:
+        session = await self._authenticated(request)
+        await self._csrf(request, session)
+        if not await self.cast_limiter.allow(str(session.telegram_user_id)):
+            raise web.HTTPTooManyRequests(text="Cast requests are too frequent")
+        payload = await self._json(request)
+        playback_id = str(payload.get("playback_id", ""))
+        playback = await self.database.get_playback(
+            playback_id,
+            session.telegram_user_id,
+        )
+        if playback is None:
+            raise web.HTTPForbidden(text="Playback session is invalid")
+        grant = await self.database.create_cast_grant(
+            playback,
+            ttl_seconds=min(7200, self.config.playback_ttl_seconds),
+        )
+        content_type = (
+            "application/vnd.apple.mpegurl"
+            if playback.media_kind == "hls"
+            else "video/mp4"
+        )
+        return web.json_response(
+            {
+                "url": (
+                    f"{self.config.public_base_url}/media/{playback.id}/master"
+                    f"?cast={grant}"
+                ),
+                "content_type": content_type,
+                "kind": playback.media_kind,
+                "episode": playback.episode,
+                "title": str(playback.catalogue_payload.get("title", ""))[:200],
+            }
+        )
+
     async def logout(self, request: web.Request) -> web.Response:
         session = await self._authenticated(request)
         await self._csrf(request, session)
@@ -306,12 +428,13 @@ async def security_headers(request: web.Request, handler):
     response.headers.setdefault("Referrer-Policy", "no-referrer")
     response.headers.setdefault(
         "Permissions-Policy",
-        "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+        "camera=(), microphone=(), geolocation=(), payment=(), usb=(), "
+        "remote-playback=(self)",
     )
     response.headers.setdefault(
         "Content-Security-Policy",
         "default-src 'self'; "
-        "script-src 'self' https://telegram.org; "
+        "script-src 'self' https://telegram.org https://www.gstatic.com; "
         "style-src 'self'; img-src 'self' data:; "
         "media-src 'self' blob:; connect-src 'self'; "
         "object-src 'none'; base-uri 'none'; form-action 'self'; "
