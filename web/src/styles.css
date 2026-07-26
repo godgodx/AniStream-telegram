@@ -109,13 +109,18 @@ video {
 .episode-controls {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
-  align-items: center;
+  align-items: stretch;
   gap: 10px;
   margin-top: 14px;
 }
 
 .episode-controls button {
+  display: flex;
+  width: 100%;
+  min-width: 0;
   min-height: 46px;
+  align-items: center;
+  justify-content: center;
   padding: 10px 14px;
   border: 1px solid color-mix(in srgb, var(--tg-theme-button-color, #8b5cf6) 35%, transparent);
   border-radius: 14px;
@@ -123,10 +128,9 @@ video {
   background: var(--tg-theme-button-color, #7c3aed);
   cursor: pointer;
   font-weight: 700;
-}
-
-.episode-controls button:last-child {
-  justify-self: stretch;
+  line-height: 1.25;
+  text-align: center;
+  text-wrap: balance;
 }
 
 .episode-controls button:disabled {
@@ -238,11 +242,47 @@ video {
   }
 
   .episode-controls {
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   #autoplay-status {
+    align-self: center;
     grid-column: 1 / -1;
     grid-row: 2;
+  }
+}
+
+@media (max-width: 360px) {
+  body {
+    padding-right: max(12px, var(--tg-content-safe-area-inset-right, 0px));
+    padding-left: max(12px, var(--tg-content-safe-area-inset-left, 0px));
+  }
+
+  .header {
+    gap: 10px;
+  }
+
+  .header > div:first-child {
+    min-width: 0;
+  }
+
+  .header-actions {
+    gap: 6px;
+  }
+
+  .icon-button {
+    width: 40px;
+    height: 40px;
+    flex-basis: 40px;
+  }
+
+  .episode-controls {
+    gap: 8px;
+  }
+
+  .episode-controls button {
+    min-height: 52px;
+    padding-inline: 10px;
+    font-size: clamp(0.85rem, 3.8vw, 1rem);
   }
 }

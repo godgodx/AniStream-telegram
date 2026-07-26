@@ -31,9 +31,10 @@ workflow.
 - **Private whitelist access** — every bot update, callback, Mini App session,
   API request, media request, and cast grant is bound to an allowed numeric
   Telegram user ID.
-- **Native Telegram navigation** — Search, Continue Watching, Help, paginated
-  episodes, provider attribution, and breadcrumb-style Back buttons use native
-  inline keyboards.
+- **Clean native Telegram navigation** — Search, Continue Watching, Help,
+  paginated episodes, provider attribution, and breadcrumb-style Back buttons
+  use styled inline keyboards that replace the current panel instead of
+  flooding the conversation with new messages.
 - **Multi-provider search** — query every registered catalogue concurrently and
   keep each result clearly attributed to its source.
 - **Structured seasons and languages** — providers expose one neutral variant
@@ -47,7 +48,10 @@ workflow.
   keys, and required upstream headers through the same protected origin.
 - **Reliable watch history** — save a distinct position for every episode,
   preserve forward continuation during rewatches, and resume the last genuinely
-  interrupted episode.
+  interrupted episode. Finished series move to a clearly labelled Completed
+  section, while any active or completed entry can be restarted from episode 1.
+  Users can also remove an entry and its saved positions through a confirmed
+  private action.
 - **Series controls** — move to the previous or next episode and automatically
   start the next episode after normal completion.
 - **TV playback** — expose Google Cast, AirPlay, or Remote Playback when the

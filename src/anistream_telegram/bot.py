@@ -6,6 +6,7 @@ from typing import Any
 from urllib.parse import quote, urlparse
 
 from aiogram import BaseMiddleware, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -50,24 +51,60 @@ def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="🔎 Search", callback_data="menu:search"),
                 InlineKeyboardButton(
-                    text="▶️ Continue Watching",
+                    text="🔎 Search",
+                    callback_data="menu:search",
+                    style="primary",
+                ),
+                InlineKeyboardButton(
+                    text="▶ Continue watching",
                     callback_data="menu:continue",
+                    style="primary",
                 ),
             ],
-            [InlineKeyboardButton(text="❓ Help", callback_data="menu:help")],
+            [InlineKeyboardButton(text="❔ Help", callback_data="menu:help")],
+        ]
+    )
+
+
+MAIN_MENU_TEXT = "🎬 AniStream\n\nWhat would you like to watch?"
+
+
+def back_to_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="‹ Back to menu",
+                    callback_data="menu:main",
+                )
+            ]
+        ]
+    )
+
+
+def cancel_search_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="‹ Cancel",
+                    callback_data="menu:main",
+                )
+            ]
         ]
     )
 
 
 HELP_TEXT = (
-    "AniStream Telegram lets you search enabled providers and watch inside a secure "
-    "Telegram Mini App.\n\n"
-    "• Search: find a title, source, season, language and episode.\n"
-    "• Continue Watching: resume your saved episode and position.\n"
-    "• /cancel: cancel the current search.\n\n"
-    "Access is private and tied to your Telegram account."
+    "❔ AniStream help\n\n"
+    "🔎 Search\n"
+    "Find a title, then choose its provider, season, language and episode.\n\n"
+    "▶ Continue watching\n"
+    "Resume a saved episode from your last position.\n\n"
+    "🔒 Private access\n"
+    "Playback is tied to your Telegram account and opens in the secure Mini App.\n\n"
+    "Use /cancel at any time while entering a search."
 )
 
 
@@ -118,76 +155,161 @@ class BotHandlers:
             F.data.startswith("watch:"),
         )
         self.router.callback_query.register(
+            self.manage_continue_watching,
+            F.data == "continue:manage",
+        )
+        self.router.callback_query.register(
+            self.completed_watching,
+            F.data == "continue:completed",
+        )
+        self.router.callback_query.register(
+            self.select_completed,
+            F.data.startswith("continue:completed-entry:"),
+        )
+        self.router.callback_query.register(
+            self.confirm_restart,
+            F.data.startswith("continue:restart:"),
+        )
+        self.router.callback_query.register(
+            self.restart_entry,
+            F.data.startswith("continue:restart-confirm:"),
+        )
+        self.router.callback_query.register(
+            self.confirm_continue_removal,
+            F.data.startswith("continue:remove:"),
+        )
+        self.router.callback_query.register(
+            self.remove_continue_entry,
+            F.data.startswith("continue:delete:"),
+        )
+        self.router.callback_query.register(
             self.select_continue,
             F.data.startswith("continue:"),
         )
         self.router.message.register(self.search_query, SearchFlow.waiting_query)
+
+    @staticmethod
+    async def _replace_callback_message(
+        callback: CallbackQuery,
+        text: str,
+        reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> None:
+        if not callback.message:
+            return
+        try:
+            await callback.message.edit_text(text, reply_markup=reply_markup)
+        except TelegramBadRequest as exc:
+            # Old duplicate menu messages can still be clicked after a deployment.
+            # Treat an already-current panel as a successful navigation.
+            if "message is not modified" not in str(exc).casefold():
+                raise
+
+    @staticmethod
+    async def _edit_flow_panel(
+        message: Message,
+        flow_data: dict[str, Any],
+        text: str,
+        reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> Message:
+        chat_id = flow_data.get("panel_chat_id")
+        message_id = flow_data.get("panel_message_id")
+        if isinstance(chat_id, int) and isinstance(message_id, int):
+            try:
+                edited = await message.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=text,
+                    reply_markup=reply_markup,
+                )
+                if isinstance(edited, Message):
+                    return edited
+            except TelegramBadRequest:
+                LOGGER.info("Search panel could not be reused; creating a new panel")
+        return await message.answer(text, reply_markup=reply_markup)
 
     async def start(self, message: Message, state: FSMContext) -> None:
         if message.chat.type != "private":
             return
         await state.clear()
         await message.answer(
-            "Welcome to AniStream. What would you like to watch?",
+            MAIN_MENU_TEXT,
             reply_markup=main_keyboard(),
         )
 
     async def help_command(self, message: Message) -> None:
         if message.chat.type == "private":
-            await message.answer(HELP_TEXT, reply_markup=main_keyboard())
+            await message.answer(HELP_TEXT, reply_markup=back_to_menu_keyboard())
 
     async def help_callback(self, callback: CallbackQuery) -> None:
         await callback.answer()
-        if callback.message:
-            await callback.message.answer(HELP_TEXT, reply_markup=main_keyboard())
+        await self._replace_callback_message(
+            callback,
+            HELP_TEXT,
+            back_to_menu_keyboard(),
+        )
 
     async def main_menu(self, callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
         await state.clear()
-        if callback.message:
-            await callback.message.answer(
-                "What would you like to watch?",
-                reply_markup=main_keyboard(),
-            )
+        await self._replace_callback_message(
+            callback,
+            MAIN_MENU_TEXT,
+            main_keyboard(),
+        )
 
     async def cancel(self, message: Message, state: FSMContext) -> None:
+        flow_data = await state.get_data()
         await state.clear()
-        await message.answer("Cancelled.", reply_markup=main_keyboard())
+        await self._edit_flow_panel(
+            message,
+            flow_data,
+            MAIN_MENU_TEXT,
+            main_keyboard(),
+        )
 
     async def search_prompt(self, callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
         await state.set_state(SearchFlow.waiting_query)
         if callback.message:
-            await callback.message.answer(
-                "Send the title you want to watch. Use /cancel to stop.",
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [
-                            InlineKeyboardButton(
-                                text="⬅ Back to menu",
-                                callback_data="menu:main",
-                            )
-                        ]
-                    ]
-                ),
+            await state.update_data(
+                panel_chat_id=callback.message.chat.id,
+                panel_message_id=callback.message.message_id,
             )
+        await self._replace_callback_message(
+            callback,
+            "🔎 Search\n\nSend the title you want to watch.",
+            cancel_search_keyboard(),
+        )
 
     async def search_query(self, message: Message, state: FSMContext) -> None:
         query = (message.text or "").strip()
+        flow_data = await state.get_data()
         if not 2 <= len(query) <= 120:
-            await message.answer("Enter a title between 2 and 120 characters.")
+            await self._edit_flow_panel(
+                message,
+                flow_data,
+                "🔎 Search\n\nEnter a title between 2 and 120 characters.",
+                cancel_search_keyboard(),
+            )
             return
         await state.clear()
-        status = await message.answer("Searching enabled providers…")
+        status = await self._edit_flow_panel(
+            message,
+            flow_data,
+            f"🔎 Searching for “{query}”…",
+        )
         try:
             results, errors = await self.core.search(query)
         except Exception:
             LOGGER.exception("Provider search failed")
-            await status.edit_text("Search failed temporarily. Please try again.")
+            await status.edit_text(
+                "⚠ Search is temporarily unavailable.\n\nPlease try again.",
+                reply_markup=main_keyboard(),
+            )
             return
         if not results:
             await status.edit_text(
-                "No result was found.",
+                f"🔎 No results for “{query}”.\n\nTry another title.",
                 reply_markup=main_keyboard(),
             )
             return
@@ -220,10 +342,10 @@ class BotHandlers:
                 ]
             )
         buttons.append(
-            [InlineKeyboardButton(text="⬅ Back to menu", callback_data="menu:main")]
+            [InlineKeyboardButton(text="‹ Back to menu", callback_data="menu:main")]
         )
         await message.edit_text(
-            f"Results for “{payload['query']}”. Choose a provider:",
+            f"🔎 Results for “{payload['query']}”\n\nChoose a provider:",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         )
 
@@ -273,7 +395,7 @@ class BotHandlers:
                 await self._expired(callback)
                 return
         if callback.message:
-            await callback.message.edit_text("Loading seasons and languages…")
+            await callback.message.edit_text("⏳ Loading seasons and languages…")
         try:
             variants = await self.core.variants(payload["provider_id"], payload["url"])
         except Exception:
@@ -320,18 +442,18 @@ class BotHandlers:
             buttons.append(
                 [
                     InlineKeyboardButton(
-                        text="⬅ Back to results",
+                        text="‹ Back to results",
                         callback_data=f"search-results:{search_selection_id}",
                     )
                 ]
             )
         else:
             buttons.append(
-                [InlineKeyboardButton(text="⬅ Back to menu", callback_data="menu:main")]
+                [InlineKeyboardButton(text="‹ Back to menu", callback_data="menu:main")]
             )
         if callback.message:
             await callback.message.edit_text(
-                "Choose a season and language:",
+                "🎞 Seasons and languages\n\nChoose an option:",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
             )
 
@@ -380,7 +502,7 @@ class BotHandlers:
                 await self._expired(callback)
                 return
         if callback.message:
-            await callback.message.edit_text("Loading episodes…")
+            await callback.message.edit_text("⏳ Loading episodes…")
         await self._load_catalogue(
             callback,
             payload,
@@ -488,14 +610,14 @@ class BotHandlers:
         if page > 0:
             navigation.append(
                 InlineKeyboardButton(
-                    text="←",
+                    text="‹ Previous",
                     callback_data=f"episodes:{selection_id}:{page - 1}",
                 )
             )
         if page < max_page:
             navigation.append(
                 InlineKeyboardButton(
-                    text="→",
+                    text="Next ›",
                     callback_data=f"episodes:{selection_id}:{page + 1}",
                 )
             )
@@ -505,19 +627,21 @@ class BotHandlers:
             rows.append(
                 [
                     InlineKeyboardButton(
-                        text="⬅ Back to seasons",
+                        text="‹ Back to seasons",
                         callback_data=f"variants:{variant_selection_id}",
                     )
                 ]
             )
         else:
             rows.append(
-                [InlineKeyboardButton(text="⬅ Back to menu", callback_data="menu:main")]
+                [InlineKeyboardButton(text="‹ Back to menu", callback_data="menu:main")]
             )
         text = (
-            f"{catalogue['title']}\n"
+            f"🎬 {catalogue['title']}\n"
             f"{catalogue['provider_name']} · {catalogue['season']} · "
-            f"{catalogue['language_label']}\n\nChoose an episode:"
+            f"{catalogue['language_label']}\n\n"
+            f"Episodes {start}–{end} of {total}\n"
+            "Choose an episode:"
         )
         if callback.message:
             await callback.message.edit_text(
@@ -553,42 +677,408 @@ class BotHandlers:
 
     async def continue_watching(self, callback: CallbackQuery) -> None:
         await callback.answer()
-        entries = await self.database.continue_watching(callback.from_user.id)
-        if not entries:
-            if callback.message:
-                await callback.message.answer(
-                    "Your watch history is empty.",
-                    reply_markup=main_keyboard(),
+        await self._render_continue_watching(callback, manage=False)
+
+    async def manage_continue_watching(self, callback: CallbackQuery) -> None:
+        await callback.answer()
+        await self._render_continue_watching(callback, manage=True)
+
+    async def _render_continue_watching(
+        self,
+        callback: CallbackQuery,
+        *,
+        manage: bool,
+    ) -> None:
+        user_id = callback.from_user.id
+        if manage:
+            entries = await self.database.continue_watching(user_id)
+            completed_entries: list[dict[str, Any]] = []
+        else:
+            entries = await self.database.continue_watching(
+                user_id,
+                status="in_progress",
+            )
+            completed_entries = await self.database.continue_watching(
+                user_id,
+                status="completed",
+            )
+        if not entries and not completed_entries:
+            await self._replace_callback_message(
+                callback,
+                "📭 Nothing to resume yet\n\nStart watching a title and it will appear here.",
+                back_to_menu_keyboard(),
+            )
+            return
+        buttons: list[list[InlineKeyboardButton]] = []
+        for entry in entries:
+            selection_id = await self.database.create_selection(
+                user_id,
+                "continue_remove" if manage else "continue",
+                entry,
+            )
+            catalogue = entry["catalogue"]
+            if manage:
+                details = " · ".join(
+                    value
+                    for value in (
+                        str(catalogue.get("season", "")),
+                        str(catalogue.get("language_label", "")),
+                    )
+                    if value
                 )
+                label = f"🗑 {catalogue['title']}"
+                if details:
+                    label += f" · {details}"
+                callback_data = f"continue:remove:{selection_id}"
+            else:
+                label = (
+                    f"▶ {catalogue['title']} · Episode {entry['resume_episode']} · "
+                    f"{catalogue['provider_name']}"
+                )
+                callback_data = f"continue:{selection_id}"
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text=label[:60],
+                        callback_data=callback_data,
+                        style="danger" if manage else None,
+                    )
+                ]
+            )
+        if manage:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text="✓ Done",
+                        callback_data="menu:continue",
+                        style="primary",
+                    ),
+                    InlineKeyboardButton(
+                        text="🏠 Main menu",
+                        callback_data="menu:main",
+                    ),
+                ]
+            )
+            text = (
+                "⚙ Manage Continue Watching\n\n"
+                "Choose an entry to remove from your list:"
+            )
+        else:
+            if completed_entries:
+                buttons.append(
+                    [
+                        InlineKeyboardButton(
+                            text=f"✓ Completed ({len(completed_entries)})",
+                            callback_data="continue:completed",
+                            style="success",
+                        )
+                    ]
+                )
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text="⚙ Manage list",
+                        callback_data="continue:manage",
+                    ),
+                    InlineKeyboardButton(
+                        text="‹ Back",
+                        callback_data="menu:main",
+                    ),
+                ]
+            )
+            if entries:
+                text = "▶ Continue watching\n\nChoose a title to resume:"
+            else:
+                text = (
+                    "▶ Continue watching\n\n"
+                    "No series are currently in progress.\n"
+                    "Your completed series are saved separately."
+                )
+        await self._replace_callback_message(
+            callback,
+            text,
+            InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
+
+    async def completed_watching(self, callback: CallbackQuery) -> None:
+        await callback.answer()
+        await self._render_completed_watching(callback)
+
+    async def _render_completed_watching(self, callback: CallbackQuery) -> None:
+        entries = await self.database.continue_watching(
+            callback.from_user.id,
+            status="completed",
+        )
+        if not entries:
+            await self._replace_callback_message(
+                callback,
+                "✓ Completed\n\nNo completed series yet.",
+                InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="‹ Back to Continue Watching",
+                                callback_data="menu:continue",
+                            )
+                        ]
+                    ]
+                ),
+            )
             return
         buttons: list[list[InlineKeyboardButton]] = []
         for entry in entries:
             selection_id = await self.database.create_selection(
                 callback.from_user.id,
-                "continue",
+                "continue_completed",
                 entry,
             )
             catalogue = entry["catalogue"]
-            label = (
-                f"▶ {catalogue['title']} · E{entry['resume_episode']} · "
-                f"{catalogue['provider_name']}"
-            )[:60]
+            details = " · ".join(
+                value
+                for value in (
+                    str(catalogue.get("season", "")),
+                    str(catalogue.get("language_label", "")),
+                )
+                if value
+            )
+            label = f"✓ {catalogue['title']}"
+            if details:
+                label += f" · {details}"
             buttons.append(
                 [
                     InlineKeyboardButton(
-                        text=label,
-                        callback_data=f"continue:{selection_id}",
+                        text=label[:60],
+                        callback_data=f"continue:completed-entry:{selection_id}",
+                        style="success",
                     )
                 ]
             )
-        if callback.message:
-            buttons.append(
-                [InlineKeyboardButton(text="⬅ Back to menu", callback_data="menu:main")]
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text="‹ Continue Watching",
+                    callback_data="menu:continue",
+                ),
+                InlineKeyboardButton(
+                    text="🏠 Main menu",
+                    callback_data="menu:main",
+                ),
+            ]
+        )
+        await self._replace_callback_message(
+            callback,
+            "✓ Completed\n\nChoose a series to view its options:",
+            InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
+
+    async def select_completed(self, callback: CallbackQuery) -> None:
+        await callback.answer()
+        selection_id = (callback.data or "").rsplit(":", 1)[-1]
+        entry = await self.database.get_selection(
+            selection_id,
+            callback.from_user.id,
+            kind="continue_completed",
+        )
+        if entry is None:
+            await self._expired(callback)
+            return
+        catalogue = entry["catalogue"]
+        details = " · ".join(
+            value
+            for value in (
+                str(catalogue.get("provider_name", "")),
+                str(catalogue.get("season", "")),
+                str(catalogue.get("language_label", "")),
             )
-            await callback.message.answer(
-                "Continue watching:",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+            if value
+        )
+        detail_line = f"\n{details}" if details else ""
+        await self._replace_callback_message(
+            callback,
+            f"✓ Completed\n\n{catalogue['title']}{detail_line}\n\n"
+            "You finished this series.",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="↻ Restart from episode 1",
+                            callback_data=(
+                                f"continue:restart:completed:{selection_id}"
+                            ),
+                            style="primary",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="‹ Back to Completed",
+                            callback_data="continue:completed",
+                        )
+                    ],
+                ]
+            ),
+        )
+
+    @staticmethod
+    def _restart_selection_kind(source: str) -> str | None:
+        return {
+            "active": "continue",
+            "completed": "continue_completed",
+        }.get(source)
+
+    async def confirm_restart(self, callback: CallbackQuery) -> None:
+        await callback.answer()
+        parts = (callback.data or "").split(":")
+        if len(parts) != 4:
+            await self._expired(callback)
+            return
+        source, selection_id = parts[2], parts[3]
+        selection_kind = self._restart_selection_kind(source)
+        if selection_kind is None:
+            await self._expired(callback)
+            return
+        entry = await self.database.get_selection(
+            selection_id,
+            callback.from_user.id,
+            kind=selection_kind,
+        )
+        if entry is None:
+            await self._expired(callback)
+            return
+        catalogue = entry["catalogue"]
+        cancel_callback = (
+            f"continue:{selection_id}"
+            if source == "active"
+            else f"continue:completed-entry:{selection_id}"
+        )
+        await self._replace_callback_message(
+            callback,
+            f"↻ Restart {catalogue['title']}?\n\n"
+            "Every saved episode position will be cleared and the series will "
+            "restart from episode 1.",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="↻ Restart",
+                            callback_data=(
+                                f"continue:restart-confirm:{source}:{selection_id}"
+                            ),
+                            style="danger",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="‹ Cancel",
+                            callback_data=cancel_callback,
+                        )
+                    ],
+                ]
+            ),
+        )
+
+    async def restart_entry(self, callback: CallbackQuery) -> None:
+        parts = (callback.data or "").split(":")
+        if len(parts) != 4:
+            await callback.answer("This selection has expired.")
+            await self._expired(callback)
+            return
+        source, selection_id = parts[2], parts[3]
+        selection_kind = self._restart_selection_kind(source)
+        if selection_kind is None:
+            await callback.answer("This selection has expired.")
+            await self._expired(callback)
+            return
+        entry = await self.database.get_selection(
+            selection_id,
+            callback.from_user.id,
+            kind=selection_kind,
+        )
+        if entry is None:
+            await callback.answer("This selection has expired.")
+            await self._expired(callback)
+            return
+        restarted = await self.database.restart_watch_entry(
+            callback.from_user.id,
+            entry["catalogue"],
+        )
+        if not restarted:
+            await callback.answer("This entry no longer exists.")
+            await self._render_continue_watching(callback, manage=False)
+            return
+        await callback.answer("Restarted from episode 1.")
+        await self._send_watch_button(
+            callback,
+            entry["catalogue"],
+            1,
+            start_position=0.0,
+            back_callback="menu:continue",
+        )
+
+    async def confirm_continue_removal(self, callback: CallbackQuery) -> None:
+        await callback.answer()
+        selection_id = (callback.data or "").rsplit(":", 1)[-1]
+        entry = await self.database.get_selection(
+            selection_id,
+            callback.from_user.id,
+            kind="continue_remove",
+        )
+        if entry is None:
+            await self._expired(callback)
+            return
+        catalogue = entry["catalogue"]
+        details = " · ".join(
+            value
+            for value in (
+                str(catalogue.get("provider_name", "")),
+                str(catalogue.get("season", "")),
+                str(catalogue.get("language_label", "")),
             )
+            if value
+        )
+        detail_line = f"\n{details}" if details else ""
+        await self._replace_callback_message(
+            callback,
+            "🗑 Remove from Continue Watching?\n\n"
+            f"{catalogue['title']}{detail_line}\n\n"
+            "This clears every saved episode position for this entry.",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="🗑 Remove",
+                            callback_data=f"continue:delete:{selection_id}",
+                            style="danger",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="‹ Cancel",
+                            callback_data="continue:manage",
+                        )
+                    ],
+                ]
+            ),
+        )
+
+    async def remove_continue_entry(self, callback: CallbackQuery) -> None:
+        selection_id = (callback.data or "").rsplit(":", 1)[-1]
+        entry = await self.database.get_selection(
+            selection_id,
+            callback.from_user.id,
+            kind="continue_remove",
+        )
+        if entry is None:
+            await callback.answer("This selection has expired.")
+            await self._expired(callback)
+            return
+        removed = await self.database.remove_from_continue_watching(
+            callback.from_user.id,
+            entry["catalogue"],
+        )
+        await callback.answer(
+            "Removed from Continue Watching." if removed else "Already removed."
+        )
+        await self._render_continue_watching(callback, manage=True)
 
     async def select_continue(self, callback: CallbackQuery) -> None:
         await callback.answer()
@@ -607,6 +1097,7 @@ class BotHandlers:
             int(entry["resume_episode"]),
             start_position=float(entry.get("position", 0.0)),
             back_callback="menu:continue",
+            restart_callback=f"continue:restart:active:{selection_id}",
         )
 
     async def _send_watch_button(
@@ -616,29 +1107,34 @@ class BotHandlers:
         episode: int,
         start_position: float = 0.0,
         back_callback: str | None = None,
+        restart_callback: str | None = None,
     ) -> None:
         navigation: list[list[InlineKeyboardButton]] = []
         if back_callback:
             navigation.append(
                 [
                     InlineKeyboardButton(
-                        text="⬅ Back",
+                        text="‹ Back",
                         callback_data=back_callback,
-                    )
+                    ),
+                    InlineKeyboardButton(
+                        text="🏠 Main menu",
+                        callback_data="menu:main",
+                    ),
                 ]
             )
-        navigation.append(
-            [InlineKeyboardButton(text="⌂ Main menu", callback_data="menu:main")]
-        )
+        else:
+            navigation.append(
+                [InlineKeyboardButton(text="🏠 Main menu", callback_data="menu:main")]
+            )
         if urlparse(self.config.public_base_url).scheme.casefold() != "https":
-            if callback.message:
-                await callback.message.answer(
-                    f"{catalogue['title']} · Episode {episode}\n\n"
-                    "The episode is ready, but Telegram only accepts HTTPS Mini App "
-                    "URLs. Start an HTTPS tunnel, set PUBLIC_BASE_URL to that URL, "
-                    "set COOKIE_SECURE=true, then restart the bot.",
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=navigation),
-                )
+            await self._replace_callback_message(
+                callback,
+                f"⚠ {catalogue['title']} · Episode {episode}\n\n"
+                "The player requires a production HTTPS URL. Configure "
+                "PUBLIC_BASE_URL and COOKIE_SECURE, then restart the bot.",
+                InlineKeyboardMarkup(inline_keyboard=navigation),
+            )
             return
         if start_position <= 0:
             start_position = await self.database.episode_position(
@@ -655,30 +1151,42 @@ class BotHandlers:
             },
         )
         url = f"{self.config.public_base_url}/app/?launch={quote(ticket)}"
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
+        actions = [
+            [
+                InlineKeyboardButton(
+                    text=f"▶ Watch episode {episode}",
+                    web_app=WebAppInfo(url=url),
+                    style="success",
+                )
+            ]
+        ]
+        if restart_callback:
+            actions.append(
                 [
                     InlineKeyboardButton(
-                        text=f"▶ Watch episode {episode}",
-                        web_app=WebAppInfo(url=url),
+                        text="↻ Restart from episode 1",
+                        callback_data=restart_callback,
+                        style="primary",
                     )
-                ],
-                *navigation,
-            ]
-        )
-        if callback.message:
-            await callback.message.answer(
-                f"{catalogue['title']} · Episode {episode}\n"
-                "This private launch link expires shortly.",
-                reply_markup=keyboard,
+                ]
             )
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[*actions, *navigation]
+        )
+        await self._replace_callback_message(
+            callback,
+            f"🎬 {catalogue['title']}\n"
+            f"Episode {episode}\n\n"
+            "🔒 Your private player is ready. This launch link expires shortly.",
+            keyboard,
+        )
 
     async def _expired(self, callback: CallbackQuery) -> None:
-        if callback.message:
-            await callback.message.answer(
-                "This selection expired. Start a new search.",
-                reply_markup=main_keyboard(),
-            )
+        await self._replace_callback_message(
+            callback,
+            "⌛ This selection has expired.\n\nStart a new search to continue.",
+            main_keyboard(),
+        )
 
     async def _error(self, callback: CallbackQuery, message: str) -> None:
         if callback.message:

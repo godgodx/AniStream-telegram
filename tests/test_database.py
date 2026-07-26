@@ -138,6 +138,70 @@ async def test_completed_season_stays_completed_during_partial_rewatch(
         await database.close()
 
 
+async def test_remove_continue_entry_is_user_scoped_and_clears_episode_progress(
+    tmp_path: Path,
+) -> None:
+    database = await database_at(tmp_path / "db.sqlite")
+    try:
+        other_catalogue = {
+            **catalogue(),
+            "title": "Other Series",
+            "url": "https://provider.example/catalogue/other/season-1/vf/",
+        }
+        await database.record_progress(123, catalogue(), 2, 88.5, 1500, False)
+        await database.record_progress(123, other_catalogue, 4, 120.0, 1500, False)
+        await database.record_progress(999, catalogue(), 3, 45.0, 1500, False)
+
+        assert await database.remove_from_continue_watching(123, catalogue()) is True
+        assert await database.remove_from_continue_watching(123, catalogue()) is False
+
+        own_entries = await database.continue_watching(123)
+        assert [entry["catalogue"]["title"] for entry in own_entries] == [
+            "Other Series"
+        ]
+        assert await database.episode_position(123, catalogue(), 2) == 0.0
+
+        other_user_entries = await database.continue_watching(999)
+        assert other_user_entries[0]["catalogue"]["title"] == "Example"
+        assert await database.episode_position(999, catalogue(), 3) == 45.0
+    finally:
+        await database.close()
+
+
+async def test_completed_filter_and_restart_reset_progress_for_only_one_user(
+    tmp_path: Path,
+) -> None:
+    database = await database_at(tmp_path / "db.sqlite")
+    try:
+        await database.record_progress(123, catalogue(), 4, 240.0, 1500, False)
+        await database.record_progress(999, catalogue(), 3, 45.0, 1500, False)
+
+        assert len(
+            await database.continue_watching(123, status="in_progress")
+        ) == 1
+        assert await database.continue_watching(123, status="completed") == []
+
+        await database.record_progress(123, catalogue(), 12, 1500, 1500, True)
+        assert await database.continue_watching(123, status="in_progress") == []
+        completed = await database.continue_watching(123, status="completed")
+        assert completed[0]["status"] == "completed"
+
+        assert await database.restart_watch_entry(123, catalogue()) is True
+        restarted = await database.continue_watching(123, status="in_progress")
+        assert restarted[0]["status"] == "in_progress"
+        assert restarted[0]["next_episode"] == 1
+        assert restarted[0]["resume_episode"] == 1
+        assert restarted[0]["position"] == 0.0
+        assert await database.episode_position(123, catalogue(), 4) == 0.0
+        assert await database.episode_position(123, catalogue(), 12) == 0.0
+
+        other_user = await database.continue_watching(999)
+        assert other_user[0]["resume_episode"] == 3
+        assert await database.episode_position(999, catalogue(), 3) == 45.0
+    finally:
+        await database.close()
+
+
 async def test_cast_grant_is_playback_bound_and_revoked_with_whitelist(
     tmp_path: Path,
 ) -> None:

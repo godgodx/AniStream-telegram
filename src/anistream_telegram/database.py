@@ -482,14 +482,22 @@ class Database:
             progress.completed = completed
             progress.updated_at = now
 
-    async def continue_watching(self, user_id: int, limit: int = 20) -> list[dict[str, Any]]:
+    async def continue_watching(
+        self,
+        user_id: int,
+        limit: int = 20,
+        *,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
         async with self.sessions() as session:
+            statement = select(WatchState).where(
+                WatchState.telegram_user_id == user_id
+            )
+            if status is not None:
+                statement = statement.where(WatchState.status == status)
             states = list(
                 await session.scalars(
-                    select(WatchState)
-                    .where(WatchState.telegram_user_id == user_id)
-                    .order_by(WatchState.updated_at.desc())
-                    .limit(limit)
+                    statement.order_by(WatchState.updated_at.desc()).limit(limit)
                 )
             )
             output: list[dict[str, Any]] = []
@@ -526,6 +534,62 @@ class Database:
                     }
                 )
             return output
+
+    async def remove_from_continue_watching(
+        self,
+        user_id: int,
+        catalogue_payload: dict[str, Any],
+    ) -> bool:
+        _, _, identity = self.catalogue_identity(catalogue_payload)
+        async with self.sessions.begin() as session:
+            state = await session.scalar(
+                select(WatchState)
+                .where(
+                    WatchState.telegram_user_id == user_id,
+                    WatchState.identity_hash == identity,
+                )
+                .with_for_update()
+            )
+            if state is None:
+                return False
+            # Delete explicitly as well as relying on ON DELETE CASCADE. SQLite
+            # does not enforce foreign-key cascades unless its PRAGMA is enabled.
+            await session.execute(
+                delete(EpisodeProgress).where(
+                    EpisodeProgress.watch_state_id == state.id
+                )
+            )
+            await session.delete(state)
+            return True
+
+    async def restart_watch_entry(
+        self,
+        user_id: int,
+        catalogue_payload: dict[str, Any],
+    ) -> bool:
+        _, _, identity = self.catalogue_identity(catalogue_payload)
+        async with self.sessions.begin() as session:
+            state = await session.scalar(
+                select(WatchState)
+                .where(
+                    WatchState.telegram_user_id == user_id,
+                    WatchState.identity_hash == identity,
+                )
+                .with_for_update()
+            )
+            if state is None:
+                return False
+            await session.execute(
+                delete(EpisodeProgress).where(
+                    EpisodeProgress.watch_state_id == state.id
+                )
+            )
+            state.catalogue_payload = catalogue_payload
+            state.next_episode = 1
+            state.last_played_episode = 1
+            state.status = "in_progress"
+            state.updated_at = utcnow()
+            return True
 
     async def episode_position(
         self,
