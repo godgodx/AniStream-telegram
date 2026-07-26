@@ -1,0 +1,16 @@
+{$ANISTREAM_DOMAIN} {
+	encode zstd gzip
+
+	@blocked {
+		path /.env /.git/* /data/* /src/* /tests/*
+	}
+	respond @blocked 404
+
+	reverse_proxy app:8080 {
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 60s
+			keepalive 30s
+		}
+	}
+}

@@ -1,0 +1,461 @@
+from __future__ import annotations
+
+import hashlib
+import secrets
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    delete,
+    select,
+)
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+def utcnow() -> datetime:
+    # Keep UTC naive consistently because SQLite drops timezone information.
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
+def token_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class AllowedUser(Base):
+    __tablename__ = "allowed_users"
+
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
+class EphemeralSelection(Base):
+    __tablename__ = "ephemeral_selections"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True, nullable=False)
+
+
+class LaunchTicket(Base):
+    __tablename__ = "launch_tickets"
+
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True, nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class WebSession(Base):
+    __tablename__ = "web_sessions"
+
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    csrf_token: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True, nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
+class PlaybackSession(Base):
+    __tablename__ = "playback_sessions"
+
+    id: Mapped[str] = mapped_column(String(48), primary_key=True)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    catalogue_payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    episode: Mapped[int] = mapped_column(Integer, nullable=False)
+    media_url: Mapped[str] = mapped_column(Text, nullable=False)
+    media_headers: Mapped[dict[str, str]] = mapped_column(JSON, nullable=False)
+    media_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    source_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True, nullable=False)
+
+
+class WatchState(Base):
+    __tablename__ = "watch_states"
+    __table_args__ = (
+        UniqueConstraint(
+            "telegram_user_id",
+            "identity_hash",
+            name="uq_watch_state_user_identity",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    provider_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    catalogue_url: Mapped[str] = mapped_column(Text, nullable=False)
+    identity_hash: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    catalogue_payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    next_episode: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    last_played_episode: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="in_progress", nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True, nullable=False)
+
+
+class EpisodeProgress(Base):
+    __tablename__ = "episode_progress"
+    __table_args__ = (
+        UniqueConstraint(
+            "watch_state_id",
+            "episode",
+            name="uq_episode_progress_state_episode",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    watch_state_id: Mapped[int] = mapped_column(
+        ForeignKey("watch_states.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    episode: Mapped[int] = mapped_column(Integer, nullable=False)
+    position_seconds: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    duration_seconds: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    completed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
+class Database:
+    def __init__(self, url: str) -> None:
+        connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
+        self.engine: AsyncEngine = create_async_engine(
+            url,
+            pool_pre_ping=True,
+            connect_args=connect_args,
+        )
+        self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
+
+    async def initialize(self, bootstrap_users: tuple[int, ...] = ()) -> None:
+        async with self.engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        for user_id in bootstrap_users:
+            await self.set_allowed(user_id, True)
+        await self.cleanup()
+
+    async def close(self) -> None:
+        await self.engine.dispose()
+
+    async def set_allowed(self, user_id: int, enabled: bool) -> None:
+        async with self.sessions.begin() as session:
+            item = await session.get(AllowedUser, user_id)
+            if item is None:
+                session.add(AllowedUser(telegram_user_id=user_id, enabled=enabled))
+            else:
+                item.enabled = enabled
+
+    async def is_allowed(self, user_id: int) -> bool:
+        async with self.sessions() as session:
+            item = await session.get(AllowedUser, user_id)
+            return bool(item and item.enabled)
+
+    async def list_allowed(self) -> list[int]:
+        async with self.sessions() as session:
+            result = await session.scalars(
+                select(AllowedUser.telegram_user_id)
+                .where(AllowedUser.enabled.is_(True))
+                .order_by(AllowedUser.telegram_user_id)
+            )
+            return list(result)
+
+    async def create_selection(
+        self,
+        user_id: int,
+        kind: str,
+        payload: dict[str, Any],
+        *,
+        ttl_seconds: int = 600,
+    ) -> str:
+        selection_id = secrets.token_urlsafe(9)
+        async with self.sessions.begin() as session:
+            session.add(
+                EphemeralSelection(
+                    id=selection_id,
+                    telegram_user_id=user_id,
+                    kind=kind,
+                    payload=payload,
+                    expires_at=utcnow() + timedelta(seconds=ttl_seconds),
+                )
+            )
+        return selection_id
+
+    async def get_selection(
+        self,
+        selection_id: str,
+        user_id: int,
+        *,
+        kind: str | None = None,
+    ) -> dict[str, Any] | None:
+        async with self.sessions() as session:
+            item = await session.get(EphemeralSelection, selection_id)
+            if (
+                item is None
+                or item.telegram_user_id != user_id
+                or item.expires_at <= utcnow()
+                or (kind is not None and item.kind != kind)
+            ):
+                return None
+            return dict(item.payload)
+
+    async def create_launch_ticket(
+        self,
+        user_id: int,
+        payload: dict[str, Any],
+        *,
+        ttl_seconds: int = 120,
+    ) -> str:
+        raw = secrets.token_urlsafe(32)
+        async with self.sessions.begin() as session:
+            session.add(
+                LaunchTicket(
+                    token_hash=token_hash(raw),
+                    telegram_user_id=user_id,
+                    payload=payload,
+                    expires_at=utcnow() + timedelta(seconds=ttl_seconds),
+                )
+            )
+        return raw
+
+    async def exchange_launch_ticket(
+        self,
+        raw_token: str,
+        user_id: int,
+    ) -> dict[str, Any] | None:
+        async with self.sessions.begin() as session:
+            item = await session.get(LaunchTicket, token_hash(raw_token), with_for_update=True)
+            if (
+                item is None
+                or item.telegram_user_id != user_id
+                or item.consumed_at is not None
+                or item.expires_at <= utcnow()
+            ):
+                return None
+            item.consumed_at = utcnow()
+            return dict(item.payload)
+
+    async def create_web_session(
+        self,
+        user_id: int,
+        payload: dict[str, Any],
+        *,
+        ttl_seconds: int,
+    ) -> tuple[str, str]:
+        raw = secrets.token_urlsafe(32)
+        csrf = secrets.token_urlsafe(24)
+        async with self.sessions.begin() as session:
+            session.add(
+                WebSession(
+                    token_hash=token_hash(raw),
+                    telegram_user_id=user_id,
+                    csrf_token=csrf,
+                    payload=payload,
+                    expires_at=utcnow() + timedelta(seconds=ttl_seconds),
+                )
+            )
+        return raw, csrf
+
+    async def get_web_session(self, raw_token: str) -> WebSession | None:
+        if not raw_token:
+            return None
+        async with self.sessions() as session:
+            item = await session.get(WebSession, token_hash(raw_token))
+            if item is None or item.expires_at <= utcnow():
+                return None
+            allowed = await session.get(AllowedUser, item.telegram_user_id)
+            if allowed is None or not allowed.enabled:
+                return None
+            return item
+
+    async def delete_web_session(self, raw_token: str) -> None:
+        async with self.sessions.begin() as session:
+            await session.execute(
+                delete(WebSession).where(WebSession.token_hash == token_hash(raw_token))
+            )
+
+    async def create_playback(
+        self,
+        user_id: int,
+        catalogue_payload: dict[str, Any],
+        episode: int,
+        *,
+        media_url: str,
+        media_headers: dict[str, str],
+        media_kind: str,
+        source_name: str,
+        ttl_seconds: int,
+    ) -> PlaybackSession:
+        item = PlaybackSession(
+            id=secrets.token_urlsafe(18),
+            telegram_user_id=user_id,
+            catalogue_payload=catalogue_payload,
+            episode=episode,
+            media_url=media_url,
+            media_headers=media_headers,
+            media_kind=media_kind,
+            source_name=source_name[:128],
+            expires_at=utcnow() + timedelta(seconds=ttl_seconds),
+        )
+        async with self.sessions.begin() as session:
+            session.add(item)
+        return item
+
+    async def get_playback(self, playback_id: str, user_id: int) -> PlaybackSession | None:
+        async with self.sessions() as session:
+            item = await session.get(PlaybackSession, playback_id)
+            if (
+                item is None
+                or item.telegram_user_id != user_id
+                or item.expires_at <= utcnow()
+            ):
+                return None
+            return item
+
+    @staticmethod
+    def catalogue_identity(payload: dict[str, Any]) -> tuple[str, str, str]:
+        provider_id = str(payload["provider_id"])
+        catalogue_url = str(payload["url"])
+        identity = hashlib.sha256(
+            f"{provider_id}:{catalogue_url.rstrip('/').casefold()}".encode("utf-8")
+        ).hexdigest()
+        return provider_id, catalogue_url, identity
+
+    async def record_progress(
+        self,
+        user_id: int,
+        catalogue_payload: dict[str, Any],
+        episode: int,
+        position: float,
+        duration: float,
+        completed: bool,
+    ) -> None:
+        provider_id, catalogue_url, identity = self.catalogue_identity(catalogue_payload)
+        total = max(1, int(catalogue_payload.get("total_episodes", 1)))
+        episode = max(1, min(total, int(episode)))
+        now = utcnow()
+        async with self.sessions.begin() as session:
+            state = await session.scalar(
+                select(WatchState)
+                .where(
+                    WatchState.telegram_user_id == user_id,
+                    WatchState.identity_hash == identity,
+                )
+                .with_for_update()
+            )
+            if state is None:
+                state = WatchState(
+                    telegram_user_id=user_id,
+                    provider_id=provider_id,
+                    catalogue_url=catalogue_url,
+                    identity_hash=identity,
+                    catalogue_payload=catalogue_payload,
+                    next_episode=episode,
+                    last_played_episode=episode,
+                )
+                session.add(state)
+                await session.flush()
+            state.catalogue_payload = catalogue_payload
+            state.last_played_episode = episode
+            state.updated_at = now
+            if completed:
+                state.next_episode = max(state.next_episode, min(total, episode + 1))
+                if episode == total:
+                    state.status = "completed"
+            else:
+                state.next_episode = max(state.next_episode, episode)
+                if state.status == "completed":
+                    state.status = "in_progress"
+
+            progress = await session.scalar(
+                select(EpisodeProgress)
+                .where(
+                    EpisodeProgress.watch_state_id == state.id,
+                    EpisodeProgress.episode == episode,
+                )
+                .with_for_update()
+            )
+            if progress is None:
+                progress = EpisodeProgress(watch_state_id=state.id, episode=episode)
+                session.add(progress)
+            progress.position_seconds = 0.0 if completed else position
+            progress.duration_seconds = max(float(progress.duration_seconds or 0.0), duration)
+            progress.completed = progress.completed or completed
+            progress.updated_at = now
+
+    async def continue_watching(self, user_id: int, limit: int = 20) -> list[dict[str, Any]]:
+        async with self.sessions() as session:
+            states = list(
+                await session.scalars(
+                    select(WatchState)
+                    .where(WatchState.telegram_user_id == user_id)
+                    .order_by(WatchState.updated_at.desc())
+                    .limit(limit)
+                )
+            )
+            output: list[dict[str, Any]] = []
+            for state in states:
+                position = await session.scalar(
+                    select(EpisodeProgress.position_seconds).where(
+                        EpisodeProgress.watch_state_id == state.id,
+                        EpisodeProgress.episode == state.next_episode,
+                    )
+                )
+                output.append(
+                    {
+                        "catalogue": dict(state.catalogue_payload),
+                        "next_episode": state.next_episode,
+                        "last_played_episode": state.last_played_episode,
+                        "position": float(position or 0.0),
+                        "status": state.status,
+                        "updated_at": state.updated_at.isoformat(),
+                    }
+                )
+            return output
+
+    async def episode_position(
+        self,
+        user_id: int,
+        catalogue_payload: dict[str, Any],
+        episode: int,
+    ) -> float:
+        _, _, identity = self.catalogue_identity(catalogue_payload)
+        async with self.sessions() as session:
+            value = await session.scalar(
+                select(EpisodeProgress.position_seconds)
+                .join(WatchState, WatchState.id == EpisodeProgress.watch_state_id)
+                .where(
+                    WatchState.telegram_user_id == user_id,
+                    WatchState.identity_hash == identity,
+                    EpisodeProgress.episode == episode,
+                )
+            )
+            return float(value or 0.0)
+
+    async def cleanup(self) -> None:
+        now = utcnow()
+        async with self.sessions.begin() as session:
+            await session.execute(
+                delete(EphemeralSelection).where(EphemeralSelection.expires_at <= now)
+            )
+            await session.execute(delete(LaunchTicket).where(LaunchTicket.expires_at <= now))
+            await session.execute(delete(WebSession).where(WebSession.expires_at <= now))
+            await session.execute(
+                delete(PlaybackSession).where(PlaybackSession.expires_at <= now)
+            )

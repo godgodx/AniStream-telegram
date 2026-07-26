@@ -1,0 +1,12 @@
+{
+  "name": "anistream-telegram-miniapp",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "hls.js": "1.6.13"
+  }
+}
