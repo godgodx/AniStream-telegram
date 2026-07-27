@@ -109,6 +109,13 @@ def button_label_with_suffix(
     return f"{shortened}…{separator}{clean_suffix}"
 
 
+def button_label(title: object, *, limit: int = BUTTON_TEXT_LIMIT) -> str:
+    clean_title = " ".join(str(title).split())
+    if len(clean_title) <= limit:
+        return clean_title
+    return clean_title[: max(1, limit - 1)].rstrip() + "…"
+
+
 def is_anonymous_provider_alias(value: object) -> bool:
     alias = str(value).strip()
     if alias == "Provider":
@@ -238,6 +245,10 @@ class BotHandlers:
             F.data.startswith("search-results:"),
         )
         self.protected_router.callback_query.register(
+            self.search_results_menu,
+            F.data.startswith("search-menu:"),
+        )
+        self.protected_router.callback_query.register(
             self.select_variant,
             F.data.startswith("variant:"),
         )
@@ -349,16 +360,12 @@ class BotHandlers:
         message_id = flow_data.get("panel_message_id")
         if isinstance(chat_id, int) and isinstance(message_id, int):
             try:
-                edited = await message.bot.edit_message_text(
+                await message.bot.delete_message(
                     chat_id=chat_id,
                     message_id=message_id,
-                    text=text,
-                    reply_markup=reply_markup,
                 )
-                if isinstance(edited, Message):
-                    return edited
             except TelegramBadRequest:
-                LOGGER.info("Search panel could not be reused; creating a new panel")
+                LOGGER.info("Previous search panel could not be removed")
         return await message.answer(text, reply_markup=reply_markup)
 
     async def start(self, message: Message, state: FSMContext) -> None:
@@ -452,11 +459,15 @@ class BotHandlers:
         query = (message.text or "").strip()
         flow_data = await state.get_data()
         if not 2 <= len(query) <= 120:
-            await self._edit_flow_panel(
+            panel = await self._edit_flow_panel(
                 message,
                 flow_data,
                 "🔎 Search\n\nEnter a title between 2 and 120 characters.",
                 cancel_search_keyboard(),
+            )
+            await state.update_data(
+                panel_chat_id=panel.chat.id,
+                panel_message_id=panel.message_id,
             )
             return
         await state.clear()
@@ -489,39 +500,117 @@ class BotHandlers:
         )
         if errors:
             LOGGER.warning("Partial provider search errors: %s", errors)
-        await self._render_search_results(status, selection_id, search_payload)
+        await self._render_search_results(
+            status,
+            selection_id,
+            search_payload,
+            message.from_user.id,
+        )
 
     async def _render_search_results(
         self,
         message: Message,
         selection_id: str,
         payload: dict[str, Any],
+        user_id: int,
+        provider_id: str | None = None,
     ) -> None:
-        buttons: list[list[InlineKeyboardButton]] = []
+        groups: dict[str, tuple[str, list[tuple[int, dict[str, Any]]]]] = {}
         for index, item in enumerate(payload["results"]):
-            label = button_label_with_suffix(
-                item["title"],
-                self._provider_alias(item),
-            )
-            buttons.append(
+            item_provider_id = str(item.get("provider_id", ""))
+            if provider_id is not None and item_provider_id != provider_id:
+                continue
+            alias = self._provider_alias(item)
+            group = groups.setdefault(item_provider_id, (alias, []))
+            group[1].append((index, item))
+
+        def provider_order(
+            entry: tuple[str, tuple[str, list[tuple[int, dict[str, Any]]]]],
+        ) -> tuple[int, str]:
+            alias = entry[1][0]
+            number = alias.removeprefix("Provider ")
+            return (int(number) if number.isdigit() else 10_000, alias)
+
+        ordered_groups = sorted(groups.items(), key=provider_order)
+        rendered_messages: list[Message] = []
+        for group_index, (_, (alias, results)) in enumerate(ordered_groups):
+            buttons = [
                 [
                     InlineKeyboardButton(
-                        text=label,
+                        text=button_label(item["title"]),
                         callback_data=f"result:{selection_id}:{index}",
                     )
                 ]
+                for index, item in results
+            ]
+            if group_index == len(ordered_groups) - 1:
+                buttons.append(
+                    [
+                        InlineKeyboardButton(
+                            text="‹ Back to menu",
+                            callback_data=f"search-menu:{selection_id}",
+                        )
+                    ]
+                )
+            text = (
+                f"🔎 Results for “{payload['query']}”\n\n"
+                f"🎞 {alias}"
             )
-        buttons.append(
-            [InlineKeyboardButton(text="‹ Back to menu", callback_data="menu:main")]
+            keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+            if group_index == 0:
+                await message.edit_text(text, reply_markup=keyboard)
+                rendered_messages.append(message)
+            else:
+                rendered_messages.append(
+                    await message.answer(text, reply_markup=keyboard)
+                )
+
+        payload["message_ids"] = [
+            {
+                "chat_id": item.chat.id,
+                "message_id": item.message_id,
+            }
+            for item in rendered_messages
+        ]
+        await self.database.update_selection_payload(
+            selection_id,
+            user_id,
+            payload,
+            kind="search_results",
         )
-        await message.edit_text(
-            f"🔎 Results for “{payload['query']}”\n\nChoose a provider:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-        )
+
+    @staticmethod
+    async def _delete_search_siblings(
+        callback: CallbackQuery,
+        payload: dict[str, Any],
+    ) -> None:
+        if callback.message is None:
+            return
+        current = (callback.message.chat.id, callback.message.message_id)
+        for item in payload.get("message_ids", []):
+            if not isinstance(item, dict):
+                continue
+            chat_id = item.get("chat_id")
+            message_id = item.get("message_id")
+            if (
+                not isinstance(chat_id, int)
+                or not isinstance(message_id, int)
+                or (chat_id, message_id) == current
+            ):
+                continue
+            try:
+                await callback.bot.delete_message(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                )
+            except TelegramBadRequest:
+                LOGGER.info("A sibling search result block was already removed")
 
     async def show_search_results(self, callback: CallbackQuery) -> None:
         await callback.answer()
-        selection_id = (callback.data or "").split(":", 1)[-1]
+        parts = (callback.data or "").split(":", 2)
+        selection_id = parts[1] if len(parts) >= 2 else ""
+        provider_id = parts[2] if len(parts) == 3 else None
         payload = await self.database.get_selection(
             selection_id,
             callback.from_user.id,
@@ -531,7 +620,30 @@ class BotHandlers:
             await self._expired(callback)
             return
         if callback.message:
-            await self._render_search_results(callback.message, selection_id, payload)
+            await self._delete_search_siblings(callback, payload)
+            await self._render_search_results(
+                callback.message,
+                selection_id,
+                payload,
+                callback.from_user.id,
+                provider_id,
+            )
+
+    async def search_results_menu(self, callback: CallbackQuery) -> None:
+        await callback.answer()
+        selection_id = (callback.data or "").split(":", 1)[-1]
+        payload = await self.database.get_selection(
+            selection_id,
+            callback.from_user.id,
+            kind="search_results",
+        )
+        if payload is not None:
+            await self._delete_search_siblings(callback, payload)
+        await self._replace_callback_message(
+            callback,
+            MAIN_MENU_TEXT,
+            main_keyboard(),
+        )
 
     async def select_result(self, callback: CallbackQuery) -> None:
         await callback.answer()
@@ -553,6 +665,7 @@ class BotHandlers:
                 await self._expired(callback)
                 return
             payload = search_payload["results"][index]
+            await self._delete_search_siblings(callback, search_payload)
         else:
             # Compatibility with buttons created before breadcrumb navigation.
             selection_id = (callback.data or "").split(":", 1)[-1]
@@ -575,6 +688,7 @@ class BotHandlers:
         variant_payload = {
             "variants": variants[:40],
             "search_selection_id": search_selection_id,
+            "search_provider_id": str(payload.get("provider_id", "")),
         }
         variant_selection_id = await self.database.create_selection(
             callback.from_user.id,
@@ -608,12 +722,17 @@ class BotHandlers:
                 ]
             )
         search_selection_id = payload.get("search_selection_id")
+        search_provider_id = str(payload.get("search_provider_id", ""))
         if search_selection_id:
             buttons.append(
                 [
                     InlineKeyboardButton(
                         text="‹ Back to results",
-                        callback_data=f"search-results:{search_selection_id}",
+                        callback_data=(
+                            f"search-results:{search_selection_id}:{search_provider_id}"
+                            if search_provider_id
+                            else f"search-results:{search_selection_id}"
+                        ),
                     )
                 ]
             )

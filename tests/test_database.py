@@ -59,6 +59,54 @@ async def test_autoplay_defaults_on_and_persists_per_user(tmp_path: Path) -> Non
         await reopened.close()
 
 
+async def test_selection_payload_updates_are_user_and_kind_scoped(
+    tmp_path: Path,
+) -> None:
+    database = await database_at(tmp_path / "db.sqlite")
+    try:
+        selection_id = await database.create_selection(
+            123,
+            "search_results",
+            {"query": "example", "message_ids": []},
+        )
+        updated = {"query": "example", "message_ids": [{"message_id": 7}]}
+
+        assert (
+            await database.update_selection_payload(
+                selection_id,
+                999,
+                updated,
+                kind="search_results",
+            )
+            is False
+        )
+        assert (
+            await database.update_selection_payload(
+                selection_id,
+                123,
+                updated,
+                kind="other",
+            )
+            is False
+        )
+        assert (
+            await database.update_selection_payload(
+                selection_id,
+                123,
+                updated,
+                kind="search_results",
+            )
+            is True
+        )
+        assert await database.get_selection(
+            selection_id,
+            123,
+            kind="search_results",
+        ) == updated
+    finally:
+        await database.close()
+
+
 async def test_rewatch_does_not_move_continuation_backwards(tmp_path: Path) -> None:
     database = await database_at(tmp_path / "db.sqlite")
     try:

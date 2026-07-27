@@ -84,6 +84,12 @@ h1 {
   opacity: 0.42;
 }
 
+.icon-button.is-active {
+  border-color: var(--tg-theme-button-color, #8b5cf6);
+  color: var(--tg-theme-button-text-color, #fff);
+  background: var(--tg-theme-button-color, #7c3aed);
+}
+
 .icon-button svg {
   width: 22px;
   height: 22px;
@@ -222,8 +228,7 @@ video {
   margin-top: 14px;
 }
 
-.stream-controls[hidden],
-.stream-controls label[hidden] {
+.stream-controls[hidden] {
   display: none;
 }
 
@@ -261,6 +266,11 @@ video {
 .stream-controls select:focus-visible {
   border-color: var(--tg-theme-button-color, #8b5cf6);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--tg-theme-button-color, #8b5cf6) 24%, transparent);
+}
+
+.stream-controls select:disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
 }
 
 .loading {
@@ -345,6 +355,21 @@ video {
 }
 
 @media (max-width: 560px) {
+  .header > div:first-child {
+    min-width: 0;
+  }
+
+  .header-actions {
+    flex: 0 0 auto;
+    gap: 6px;
+  }
+
+  .icon-button {
+    width: 40px;
+    height: 40px;
+    flex-basis: 40px;
+  }
+
   .details {
     grid-template-columns: 0.7fr 1.3fr;
   }
@@ -398,9 +423,9 @@ video {
   }
 
   .icon-button {
-    width: 40px;
-    height: 40px;
-    flex-basis: 40px;
+    width: 38px;
+    height: 38px;
+    flex-basis: 38px;
   }
 
   .episode-controls {

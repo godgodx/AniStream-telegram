@@ -29,12 +29,16 @@ def test_mini_app_exposes_dynamic_hls_track_controls() -> None:
     project_root = Path(__file__).resolve().parents[1]
     html = (project_root / "web" / "index.html").read_text(encoding="utf-8")
     script = (project_root / "web" / "src" / "main.js").read_text(encoding="utf-8")
+    assert 'id="playback-options"' in html
+    assert 'aria-controls="stream-controls"' in html
     assert 'id="quality-picker"' in html
     assert 'id="audio-picker"' in html
     assert 'id="subtitle-picker"' in html
     assert "Hls.Events.AUDIO_TRACKS_UPDATED" in script
     assert "Hls.Events.SUBTITLE_TRACKS_UPDATED" in script
     assert "hls.currentLevel = level" in script
+    assert '"Unavailable"' in script
+    assert "streamControlsExpanded = !streamControlsExpanded" in script
 
 
 class FakeCore:

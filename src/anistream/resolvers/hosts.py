@@ -194,7 +194,6 @@ class JwPlayerResolver(Resolver):
         "oneupload.net",
         "oneupload.to",
         "uqload.is",
-        "uqload.io",
         "uqload.com",
         "smoothpre.com",
         "movearnpre.com",
@@ -231,10 +230,7 @@ class JwPlayerResolver(Resolver):
 
 
 def default_resolvers(http: HttpClient) -> list[Resolver]:
-    from anistream.resolvers.frembed import FrembedRedirectResolver
-
     resolvers: list[Resolver] = [
-        FrembedRedirectResolver(http),
         Embed4MeResolver(http),
         SendvidResolver(http),
         SibnetResolver(http),

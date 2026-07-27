@@ -19,6 +19,19 @@
         </div>
         <div class="header-actions">
           <button
+            id="playback-options"
+            class="icon-button"
+            type="button"
+            aria-label="Playback options"
+            aria-controls="stream-controls"
+            aria-expanded="false"
+            title="Quality, audio and subtitles"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 7h9a2 2 0 1 0 0-2H4a1 1 0 0 0 0 2Zm16-2h-1a1 1 0 0 0 0 2h1a1 1 0 1 0 0-2ZM4 13h1a2 2 0 1 0 0-2H4a1 1 0 1 0 0 2Zm16-2h-9a1 1 0 1 0 0 2h9a1 1 0 1 0 0-2ZM4 19h9a2 2 0 1 0 0-2H4a1 1 0 1 0 0 2Zm16-2h-1a1 1 0 1 0 0 2h1a1 1 0 1 0 0-2Z" />
+            </svg>
+          </button>
+          <button
             id="cast"
             class="icon-button"
             type="button"
@@ -60,15 +73,15 @@
       </section>
 
       <section id="stream-controls" class="stream-controls" aria-label="Playback options" hidden>
-        <label id="quality-control" hidden>
+        <label id="quality-control">
           <span>Quality</span>
           <select id="quality-picker" aria-label="Video quality"></select>
         </label>
-        <label id="audio-control" hidden>
+        <label id="audio-control">
           <span>Audio</span>
           <select id="audio-picker" aria-label="Audio language"></select>
         </label>
-        <label id="subtitle-control" hidden>
+        <label id="subtitle-control">
           <span>Subtitles</span>
           <select id="subtitle-picker" aria-label="Subtitle language"></select>
         </label>

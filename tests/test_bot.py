@@ -9,6 +9,7 @@ from anistream_telegram.bot import (
     BotHandlers,
     PublicIdCommandFilter,
     WhitelistMiddleware,
+    button_label,
     button_label_with_suffix,
     main_keyboard,
     settings_keyboard,
@@ -23,6 +24,7 @@ def handler(public_base_url: str) -> BotHandlers:
         create_launch_ticket=AsyncMock(return_value="launch-ticket"),
         autoplay_enabled=AsyncMock(return_value=True),
         toggle_autoplay=AsyncMock(return_value=False),
+        update_selection_payload=AsyncMock(return_value=True),
     )
     instance.core = SimpleNamespace(
         provider_alias=lambda _provider_id: "Provider 1",
@@ -33,6 +35,7 @@ def handler(public_base_url: str) -> BotHandlers:
 def callback() -> SimpleNamespace:
     return SimpleNamespace(
         answer=AsyncMock(),
+        bot=SimpleNamespace(delete_message=AsyncMock()),
         from_user=SimpleNamespace(id=123),
         message=SimpleNamespace(
             answer=AsyncMock(),
@@ -197,6 +200,16 @@ def test_long_button_title_preserves_anonymous_provider_suffix() -> None:
     assert "…" in label
 
 
+def test_search_result_title_uses_full_width_without_provider_suffix() -> None:
+    label = button_label(
+        "Violet Evergarden : Éternité et la Poupée de Souvenirs Automatiques"
+    )
+
+    assert len(label) <= 60
+    assert "Provider" not in label
+    assert label.endswith("…")
+
+
 @pytest.mark.asyncio
 async def test_main_menu_replaces_the_clicked_message() -> None:
     handlers = handler("https://watch.example")
@@ -280,7 +293,7 @@ async def test_search_prompt_replaces_menu_and_remembers_panel() -> None:
 
 
 @pytest.mark.asyncio
-async def test_search_result_reuses_the_existing_panel() -> None:
+async def test_search_results_are_sent_below_query_and_grouped_by_provider() -> None:
     handlers = handler("https://watch.example")
     handlers.core = SimpleNamespace(
         provider_alias=lambda _provider_id: "Provider 2",
@@ -296,6 +309,13 @@ async def test_search_result_reuses_the_existing_panel() -> None:
                         "provider_id": "anime-sama",
                         "provider_alias": "Provider 2",
                         "url": "https://example.test/tokyo-ghoul",
+                    },
+                    {
+                        "title": "Violet Evergarden",
+                        "provider_name": "French Stream",
+                        "provider_id": "french-stream",
+                        "provider_alias": "Provider 1",
+                        "url": "https://example.test/violet-evergarden",
                     }
                 ],
                 [],
@@ -305,14 +325,20 @@ async def test_search_result_reuses_the_existing_panel() -> None:
     handlers.database.create_selection = AsyncMock(return_value="search-selection")
     panel = MagicMock(spec=Message)
     panel.edit_text = AsyncMock()
+    panel.chat = SimpleNamespace(id=456)
+    panel.message_id = 790
+    second_panel = MagicMock(spec=Message)
+    second_panel.chat = SimpleNamespace(id=456)
+    second_panel.message_id = 791
+    panel.answer = AsyncMock(return_value=second_panel)
     telegram_bot = SimpleNamespace(
-        edit_message_text=AsyncMock(return_value=panel),
+        delete_message=AsyncMock(),
     )
     message = SimpleNamespace(
         text="Tokyo Ghoul",
         bot=telegram_bot,
         from_user=SimpleNamespace(id=123),
-        answer=AsyncMock(),
+        answer=AsyncMock(return_value=panel),
     )
     state = SimpleNamespace(
         get_data=AsyncMock(
@@ -323,16 +349,57 @@ async def test_search_result_reuses_the_existing_panel() -> None:
 
     await handlers.search_query(message, state)
 
-    message.answer.assert_not_awaited()
-    telegram_bot.edit_message_text.assert_awaited_once()
-    assert telegram_bot.edit_message_text.await_args.kwargs["message_id"] == 789
+    telegram_bot.delete_message.assert_awaited_once_with(
+        chat_id=456,
+        message_id=789,
+    )
+    message.answer.assert_awaited_once()
+    assert "Searching for" in message.answer.await_args.args[0]
     panel.edit_text.assert_awaited_once()
     assert "Results for" in panel.edit_text.await_args.args[0]
-    keyboard = panel.edit_text.await_args.kwargs["reply_markup"]
-    result_label = keyboard.inline_keyboard[0][0].text
-    assert result_label.endswith(" · Provider 2")
-    assert "Anime-Sama" not in result_label
+    assert "Provider 1" in panel.edit_text.await_args.args[0]
+    first_keyboard = panel.edit_text.await_args.kwargs["reply_markup"]
+    assert first_keyboard.inline_keyboard[0][0].text == "Violet Evergarden"
+    assert "Provider" not in first_keyboard.inline_keyboard[0][0].text
+
+    panel.answer.assert_awaited_once()
+    assert "Provider 2" in panel.answer.await_args.args[0]
+    second_keyboard = panel.answer.await_args.kwargs["reply_markup"]
+    result_label = second_keyboard.inline_keyboard[0][0].text
+    assert "Provider" not in result_label
     assert len(result_label) <= 60
+    handlers.database.update_selection_payload.assert_awaited_once()
+    saved_payload = handlers.database.update_selection_payload.await_args.args[2]
+    assert saved_payload["message_ids"] == [
+        {"chat_id": 456, "message_id": 790},
+        {"chat_id": 456, "message_id": 791},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_search_menu_removes_sibling_provider_blocks() -> None:
+    handlers = handler("https://watch.example")
+    handlers.database.get_selection = AsyncMock(
+        return_value={
+            "query": "Tokyo Ghoul",
+            "results": [],
+            "message_ids": [
+                {"chat_id": 456, "message_id": 788},
+                {"chat_id": 456, "message_id": 789},
+            ],
+        }
+    )
+    event = callback()
+    event.data = "search-menu:search-selection"
+
+    await handlers.search_results_menu(event)
+
+    event.bot.delete_message.assert_awaited_once_with(
+        chat_id=456,
+        message_id=788,
+    )
+    event.message.edit_text.assert_awaited_once()
+    assert event.message.edit_text.await_args.args[0] == MAIN_MENU_TEXT
 
 
 @pytest.mark.asyncio

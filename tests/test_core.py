@@ -41,7 +41,6 @@ def test_registered_providers_receive_stable_anonymous_aliases() -> None:
     assert aliases == {
         "anime_sama": "Provider 1",
         "french_stream": "Provider 2",
-        "cinehd": "Provider 3",
     }
     assert service.provider_alias("unknown-provider") == "Provider"
     assert service._with_provider_alias(

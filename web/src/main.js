@@ -17,12 +17,10 @@ const episodePickerShell = document.querySelector("#episode-picker-shell");
 const episodePicker = document.querySelector("#episode-picker");
 const castButton = document.querySelector("#cast");
 const castStatus = document.querySelector("#cast-status");
+const playbackOptionsButton = document.querySelector("#playback-options");
 const streamControls = document.querySelector("#stream-controls");
-const qualityControl = document.querySelector("#quality-control");
 const qualityPicker = document.querySelector("#quality-picker");
-const audioControl = document.querySelector("#audio-control");
 const audioPicker = document.querySelector("#audio-picker");
-const subtitleControl = document.querySelector("#subtitle-control");
 const subtitlePicker = document.querySelector("#subtitle-picker");
 
 let csrfToken = "";
@@ -37,6 +35,7 @@ let changingEpisode = false;
 let preferredQualityHeight = 0;
 let preferredAudio = "";
 let preferredSubtitle = "";
+let streamControlsExpanded = false;
 
 let googleCastReady = false;
 let castContext = null;
@@ -160,17 +159,21 @@ function trackLabel(track, fallback) {
 }
 
 function refreshStreamControls() {
-  streamControls.hidden =
-    qualityControl.hidden && audioControl.hidden && subtitleControl.hidden;
+  streamControls.hidden = !streamControlsExpanded;
+  playbackOptionsButton.setAttribute(
+    "aria-expanded",
+    String(streamControlsExpanded),
+  );
+  playbackOptionsButton.classList.toggle("is-active", streamControlsExpanded);
 }
 
 function resetStreamControls() {
-  qualityControl.hidden = true;
-  audioControl.hidden = true;
-  subtitleControl.hidden = true;
-  qualityPicker.replaceChildren();
-  audioPicker.replaceChildren();
-  subtitlePicker.replaceChildren();
+  qualityPicker.replaceChildren(option("", "Auto (source)"));
+  audioPicker.replaceChildren(option("", "Source audio"));
+  subtitlePicker.replaceChildren(option("-1", "Unavailable"));
+  qualityPicker.disabled = true;
+  audioPicker.disabled = true;
+  subtitlePicker.disabled = true;
   refreshStreamControls();
 }
 
@@ -179,7 +182,16 @@ function updateQualityOptions(levels = []) {
     .map((level, index) => ({ level, index }))
     .filter(({ level }) => Number(level?.height) > 0 || Number(level?.bitrate) > 0);
   if (usable.length <= 1 || !hls) {
-    qualityControl.hidden = true;
+    const only = usable[0]?.level;
+    const height = Number(only?.height) || 0;
+    const bitrate = Math.round((Number(only?.bitrate) || 0) / 1000);
+    const label = height
+      ? `${height}p (source)`
+      : bitrate
+        ? `${bitrate} kbps (source)`
+        : "Auto (source)";
+    qualityPicker.replaceChildren(option("", label));
+    qualityPicker.disabled = true;
     refreshStreamControls();
     return;
   }
@@ -197,13 +209,17 @@ function updateQualityOptions(levels = []) {
   );
   qualityPicker.value = preferred ? String(preferred.index) : "-1";
   hls.currentLevel = preferred ? preferred.index : -1;
-  qualityControl.hidden = false;
+  qualityPicker.disabled = false;
   refreshStreamControls();
 }
 
 function updateAudioOptions(tracks = [], native = false) {
   if (tracks.length <= 1) {
-    audioControl.hidden = true;
+    const label = tracks.length
+      ? trackLabel(tracks[0], "Source audio")
+      : "Source audio";
+    audioPicker.replaceChildren(option("", label));
+    audioPicker.disabled = true;
     refreshStreamControls();
     return;
   }
@@ -224,13 +240,14 @@ function updateAudioOptions(tracks = [], native = false) {
     hls.audioTrack = selectedIndex;
   }
   preferredAudio = trackLabel(tracks[selectedIndex], `Audio ${selectedIndex + 1}`);
-  audioControl.hidden = false;
+  audioPicker.disabled = false;
   refreshStreamControls();
 }
 
 function updateSubtitleOptions(tracks = [], native = false) {
   if (!tracks.length) {
-    subtitleControl.hidden = true;
+    subtitlePicker.replaceChildren(option("-1", "Unavailable"));
+    subtitlePicker.disabled = true;
     refreshStreamControls();
     return;
   }
@@ -251,7 +268,7 @@ function updateSubtitleOptions(tracks = [], native = false) {
   } else if (hls) {
     hls.subtitleTrack = selectedIndex;
   }
-  subtitleControl.hidden = false;
+  subtitlePicker.disabled = false;
   refreshStreamControls();
 }
 
@@ -751,6 +768,11 @@ episodePicker.addEventListener("change", () => {
   }
 });
 
+playbackOptionsButton.addEventListener("click", () => {
+  streamControlsExpanded = !streamControlsExpanded;
+  refreshStreamControls();
+});
+
 qualityPicker.addEventListener("change", () => {
   if (!hls) return;
   const level = Number(qualityPicker.value);
@@ -865,4 +887,5 @@ window.addEventListener("pagehide", () => {
   hls?.destroy();
 });
 
+resetStreamControls();
 void initialize();

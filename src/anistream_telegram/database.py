@@ -273,6 +273,30 @@ class Database:
                 return None
             return dict(item.payload)
 
+    async def update_selection_payload(
+        self,
+        selection_id: str,
+        user_id: int,
+        payload: dict[str, Any],
+        *,
+        kind: str,
+    ) -> bool:
+        async with self.sessions.begin() as session:
+            item = await session.get(
+                EphemeralSelection,
+                selection_id,
+                with_for_update=True,
+            )
+            if (
+                item is None
+                or item.telegram_user_id != user_id
+                or item.expires_at <= utcnow()
+                or item.kind != kind
+            ):
+                return False
+            item.payload = payload
+            return True
+
     async def create_launch_ticket(
         self,
         user_id: int,
