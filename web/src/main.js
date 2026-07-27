@@ -12,6 +12,8 @@ const progress = document.querySelector("#progress");
 const fullscreen = document.querySelector("#fullscreen");
 const previous = document.querySelector("#previous");
 const next = document.querySelector("#next");
+const episodePickerShell = document.querySelector("#episode-picker-shell");
+const episodePicker = document.querySelector("#episode-picker");
 const castButton = document.querySelector("#cast");
 const castStatus = document.querySelector("#cast-status");
 
@@ -142,6 +144,31 @@ function teardownPlayer() {
   video.load();
 }
 
+function updateEpisodePicker(info) {
+  const totalEpisodes = Math.max(1, Number(info.total_episodes) || 1);
+  if (totalEpisodes <= 1) {
+    episodePickerShell.hidden = true;
+    episodePicker.disabled = true;
+    episodePicker.replaceChildren();
+    return;
+  }
+
+  if (episodePicker.options.length !== totalEpisodes) {
+    const options = document.createDocumentFragment();
+    for (let number = 1; number <= totalEpisodes; number += 1) {
+      const option = document.createElement("option");
+      option.value = String(number);
+      option.textContent = `Episode ${number}`;
+      options.append(option);
+    }
+    episodePicker.replaceChildren(options);
+  }
+
+  episodePicker.value = String(info.episode);
+  episodePicker.disabled = changingEpisode;
+  episodePickerShell.hidden = false;
+}
+
 function updateEpisodeUi(info) {
   currentInfo = info;
   playbackId = info.playback_id;
@@ -155,6 +182,7 @@ function updateEpisodeUi(info) {
   progress.textContent = formatTime(info.start_position);
   previous.disabled = !info.has_previous;
   next.disabled = !info.has_next;
+  updateEpisodePicker(info);
 }
 
 function attachPlayer(info, { autoplay = false } = {}) {
@@ -453,6 +481,7 @@ async function changeEpisode(targetEpisode, { autoplay = false } = {}) {
   changingEpisode = true;
   previous.disabled = true;
   next.disabled = true;
+  episodePicker.disabled = true;
   clearError();
   loading.hidden = false;
   status.textContent = `Preparing episode ${target}…`;
@@ -485,6 +514,7 @@ async function changeEpisode(targetEpisode, { autoplay = false } = {}) {
     next.disabled = !currentInfo.has_next;
   } finally {
     changingEpisode = false;
+    updateEpisodePicker(currentInfo);
   }
 }
 
@@ -534,6 +564,13 @@ previous.addEventListener("click", () => {
 next.addEventListener("click", () => {
   if (currentInfo?.has_next) {
     void changeEpisode(currentInfo.episode + 1, { autoplay: true });
+  }
+});
+
+episodePicker.addEventListener("change", () => {
+  const target = Number(episodePicker.value);
+  if (currentInfo && target !== currentInfo.episode) {
+    void changeEpisode(target, { autoplay: true });
   }
 });
 

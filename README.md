@@ -28,15 +28,17 @@ workflow.
 
 ## Features
 
-- **Private whitelist access** — every bot update, callback, Mini App session,
-  API request, media request, and cast grant is bound to an allowed numeric
-  Telegram user ID.
+- **Private whitelist access** — every functional bot action, callback, Mini
+  App session, API request, media request, and cast grant is bound to an allowed
+  numeric Telegram user ID. The only public command is `/id`, which reveals
+  only the sender's own ID for access requests.
 - **Clean native Telegram navigation** — Search, Continue Watching, Help,
-  paginated episodes, provider attribution, and breadcrumb-style Back buttons
-  use styled inline keyboards that replace the current panel instead of
-  flooding the conversation with new messages.
+  paginated episodes, anonymous provider attribution, and breadcrumb-style Back
+  buttons use styled inline keyboards that replace the current panel instead
+  of flooding the conversation with new messages.
 - **Multi-provider search** — query every registered catalogue concurrently and
-  keep each result clearly attributed to its source.
+  expose stable `Provider 1`, `Provider 2`, and subsequent aliases without
+  revealing catalogue names in the Telegram interface.
 - **Structured seasons and languages** — providers expose one neutral variant
   per season/language pair without global language assumptions.
 - **Source preflight planning** — resolve and probe ordered candidates before
@@ -73,6 +75,11 @@ workflow.
 Anime-Sama exposes provider-native variants such as VF and VOSTFR. French
 Stream exposes movie and series variants including French/VF, VOSTFR,
 TrueFrench/VFF, VFQ, and VO/VOSTENG when supplied by the selected title.
+
+These integration names are documented for maintainers, but the Telegram
+interface exposes only stable aliases based on registration order:
+`Provider 1`, `Provider 2`, and so on. Long titles are shortened before the
+alias, so the provider choice always remains visible.
 
 The resolver layer recognizes direct media plus embeds served through
 Embed4me, Sendvid, Sibnet, Vidmoly, Vidzy, OneUpload, Uqload, Smoothpre,
@@ -181,9 +188,10 @@ Whitelisted Telegram user
 ### Search
 
 Search runs across all registered providers concurrently. Results include the
-provider name, so adding more sites never makes the source ambiguous.
-Selections are stored server-side under short-lived opaque IDs instead of being
-serialized into Telegram callback data.
+provider's stable anonymous alias, so adding more sites never makes the choices
+ambiguous or reveals catalogue names to Telegram users. Selections are stored
+server-side under short-lived opaque IDs instead of being serialized into
+Telegram callback data.
 
 Season and language variants lead to a paginated episode keyboard. Every level
 includes a Back action so an accidental selection can be corrected without
@@ -249,7 +257,14 @@ anistream-admin deny 123456789
 anistream-admin list
 ```
 
-There is deliberately no Telegram command for modifying the whitelist.
+A prospective user can send `/id` to the bot in a private chat before being
+whitelisted. The bot returns only that user's numeric Telegram ID and a native
+copy button. Send the supplied number to the administrator, who can then run
+`anistream-admin allow <id>` on the VPS.
+
+`/id` does not add anyone to the whitelist, create a launch ticket, expose the
+menu, or authorize the Mini App. There is deliberately no Telegram command for
+modifying the whitelist.
 
 Important configuration:
 
@@ -353,6 +368,9 @@ through the neutral core as a stable code and user-facing label.
 - HLS child resources use encrypted, playback-bound, expiring URLs.
 - Removing a user from the whitelist revokes sessions and cast access at the
   next authorization boundary.
+- Unlisted users can invoke only the exact `/id` command in a private chat;
+  callbacks, other commands, launch tickets, and Mini App authentication remain
+  blocked.
 - Raw launch, media, and cast tokens are excluded from application access logs.
 - Production containers run with a read-only filesystem, no-new-privileges,
   dropped capabilities, and a private database network.

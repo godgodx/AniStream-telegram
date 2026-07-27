@@ -133,6 +133,41 @@ async def test_auth_endpoint_sets_host_cookie_and_consumes_ticket(tmp_path: Path
         await database.close()
 
 
+async def test_unlisted_user_cannot_authenticate_even_with_valid_init_data_and_ticket(
+    tmp_path: Path,
+) -> None:
+    settings = config(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize(settings.allowed_users)
+    media = MediaGateway(settings, database)
+    app = web.Application(middlewares=[error_boundary, security_headers])
+    app[CONFIG_KEY] = settings
+    WebRoutes(settings, database, None, media).register(app)  # type: ignore[arg-type]
+    ticket = await database.create_launch_ticket(
+        999,
+        {"catalogue": {"title": "Test"}, "episode": 1},
+    )
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.post(
+            "/api/auth/telegram",
+            headers={"Origin": settings.public_origin},
+            json={
+                "init_data": signed_init_data(999),
+                "launch_token": ticket,
+            },
+        )
+        assert response.status == 403
+        assert "__Host-anistream_session=" not in response.headers.get(
+            "Set-Cookie",
+            "",
+        )
+    finally:
+        await client.close()
+        await database.close()
+
+
 async def test_auth_endpoint_rejects_wrong_origin(tmp_path: Path) -> None:
     settings = config(tmp_path)
     database = Database(settings.database_url)
@@ -199,6 +234,70 @@ async def test_episode_change_resumes_position_and_updates_session(
         assert updated is not None
         assert updated.payload["episode"] == 4
         assert updated.payload["start_position"] == 92.5
+    finally:
+        await client.close()
+        await database.close()
+
+
+async def test_episode_picker_rewind_becomes_the_resume_point(
+    tmp_path: Path,
+) -> None:
+    settings = config(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize(settings.allowed_users)
+    await database.record_progress(123, catalogue(), 3, 750.0, 1500, False)
+    raw_session, csrf = await database.create_web_session(
+        123,
+        {
+            "catalogue": catalogue(),
+            "episode": 3,
+            "start_position": 750.0,
+        },
+        ttl_seconds=600,
+    )
+    media = MediaGateway(settings, database)
+    app = web.Application(middlewares=[error_boundary, security_headers])
+    app[CONFIG_KEY] = settings
+    WebRoutes(settings, database, FakeCore(), media).register(app)  # type: ignore[arg-type]
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        selected = await client.post(
+            "/api/playback/episode",
+            headers={
+                "Origin": settings.public_origin,
+                "X-CSRF-Token": csrf,
+                "Cookie": f"{settings.cookie_name}={raw_session}",
+            },
+            json={"episode": 2},
+        )
+        assert selected.status == 200
+        selected_payload = await selected.json()
+        assert selected_payload["episode"] == 2
+        assert selected_payload["start_position"] == 0.0
+
+        saved = await client.post(
+            "/api/progress",
+            headers={
+                "Origin": settings.public_origin,
+                "X-CSRF-Token": csrf,
+                "Cookie": f"{settings.cookie_name}={raw_session}",
+            },
+            json={
+                "playback_id": selected_payload["playback_id"],
+                "position": 300.0,
+                "duration": 600.0,
+                "completed": False,
+            },
+        )
+        assert saved.status == 200
+
+        resumed = (await database.continue_watching(123))[0]
+        assert resumed["next_episode"] == 3
+        assert resumed["last_played_episode"] == 2
+        assert resumed["resume_episode"] == 2
+        assert resumed["position"] == 300.0
+        assert await database.episode_position(123, catalogue(), 3) == 750.0
     finally:
         await client.close()
         await database.close()

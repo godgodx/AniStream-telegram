@@ -126,28 +126,48 @@ class CoreService:
             cookie=cookie,
             cookie_hosts={"anime-sama.to", "www.anime-sama.to"},
         )
-        self.providers = ProviderRegistry(default_providers(self.http))
+        providers = default_providers(self.http)
+        self.providers = ProviderRegistry(providers)
+        self._provider_aliases = {
+            provider.id: f"Provider {index}"
+            for index, provider in enumerate(providers, start=1)
+        }
         self.resolvers = ResolverRegistry(default_resolvers(self.http))
         self.probe = RemoteMediaProbe(self.http)
         self.planner = SourcePlanner(self.resolvers, self.probe)
 
+    def provider_alias(self, provider_id: str) -> str:
+        return self._provider_aliases.get(str(provider_id), "Provider")
+
+    def _with_provider_alias(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            **payload,
+            "provider_alias": self.provider_alias(str(payload["provider_id"])),
+        }
+
     async def search(self, query: str) -> tuple[list[dict[str, Any]], list[str]]:
         results, errors = await asyncio.to_thread(self.providers.search, query)
-        return [search_result_payload(item) for item in results], errors
+        return [
+            self._with_provider_alias(search_result_payload(item))
+            for item in results
+        ], errors
 
     async def variants(self, provider_id: str, url: str) -> list[dict[str, Any]]:
         provider = self.providers.get(provider_id)
         if provider is None:
             raise ValueError("unknown provider")
         items = await asyncio.to_thread(provider.variants, url)
-        return [variant_payload(provider_id, item) for item in items]
+        return [
+            self._with_provider_alias(variant_payload(provider_id, item))
+            for item in items
+        ]
 
     async def catalogue(self, provider_id: str, url: str) -> dict[str, Any]:
         provider = self.providers.get(provider_id)
         if provider is None:
             raise ValueError("unknown provider")
         item = await asyncio.to_thread(provider.catalogue, url)
-        return catalogue_payload(item)
+        return self._with_provider_alias(catalogue_payload(item))
 
     async def prepare_media(
         self,

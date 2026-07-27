@@ -1,6 +1,6 @@
 ---
 name: add-anistream-telegram-provider
-description: Add, update, or repair a media catalogue provider in AniStream Telegram, including strict URL detection, cross-provider search attribution, structured season and language variants, episode and embed extraction, provider registration, Telegram callback navigation, Mini App playback, resolver integration, SSRF-safe networking, media-gateway compatibility, and regression tests. Use whenever an agent is asked to support a new streaming site or adapt an existing provider after a site change in the AniStream Telegram repository.
+description: Add, update, or repair a media catalogue provider in AniStream Telegram, including strict URL detection, anonymous cross-provider search attribution, structured season and language variants, episode and embed extraction, provider registration, Telegram callback navigation, Mini App playback, resolver integration, SSRF-safe networking, media-gateway compatibility, and regression tests. Use whenever an agent is asked to support a new streaming site or adapt an existing provider after a site change in the AniStream Telegram repository.
 ---
 
 # Add an AniStream Telegram Provider
@@ -86,8 +86,19 @@ Export the provider and instantiate it in `default_providers()` in
 `src/anistream/providers/__init__.py`. Every registered provider participates
 in Telegram Search; there is no CLI Settings source selector in this edition.
 
-Use a stable lowercase `provider.id`. Search result labels already include the
-provider display name. A new provider should not require conditional code in
+Use a stable lowercase `provider.id` and keep the real provider display name
+available internally for diagnostics. The Telegram product must never expose
+that name to users. `CoreService` assigns stable anonymous aliases
+(`Provider 1`, `Provider 2`, and so on) from the explicit
+`default_providers()` registration order. New providers automatically receive
+the next alias. Append new providers and never reorder existing registrations,
+because that order is a user-facing compatibility contract. Update the alias
+regression test when appending a provider. Do not hardcode provider IDs, names,
+or alias numbers in `BotHandlers`.
+
+Every Telegram button that combines a title with an alias must reserve room for
+the complete `Provider N` suffix. Truncate only the title with an ellipsis.
+A new provider should not require provider-specific conditional code in
 `CoreService`, `BotHandlers`, `WebRoutes`, or the Mini App.
 
 If provider-specific configuration is genuinely required:
@@ -107,7 +118,9 @@ button.
 
 Provider additions must preserve:
 
-- visible provider attribution in Search;
+- visible anonymous `Provider N` attribution in Search, Continue Watching,
+  Completed, and management views without leaking the real provider name;
+- title truncation that always preserves the complete provider alias;
 - a Back action from variants to search results;
 - a Back action from episodes to variants;
 - paginated episodes when the catalogue is large;
@@ -175,7 +188,8 @@ automated suite depend on a live provider or commit captured pages.
 Cover at least:
 
 - accepted canonical/alternate domains and rejected lookalikes;
-- empty search and provider attribution;
+- empty search, stable anonymous provider attribution, and long-title
+  truncation that preserves the alias;
 - root catalogue discovery and direct deep links;
 - separate related seasons, including optional partial failures;
 - every supported language mapping and label;
@@ -227,7 +241,8 @@ Telegram watch-only product.
 Confirm all of the following:
 
 - Link detection accepts only the intended provider URLs.
-- Search results visibly identify the source.
+- Search results visibly identify the anonymous `Provider N` choice without
+  exposing the provider's real name.
 - Every season/language variant opens the matching catalogue.
 - Bot callbacks remain short, opaque, user-bound, expiring, and navigable.
 - Episode lists remain contiguous and paginate correctly.

@@ -7,11 +7,12 @@ from urllib.parse import quote, urlparse
 
 from aiogram import BaseMiddleware, F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import BaseFilter, Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
+    CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -29,6 +30,14 @@ LOGGER = logging.getLogger(__name__)
 
 class SearchFlow(StatesGroup):
     waiting_query = State()
+
+
+class PublicIdCommandFilter(BaseFilter):
+    async def __call__(self, message: Message) -> bool:
+        return (
+            message.chat.type == "private"
+            and (message.text or "").strip().casefold() == "/id"
+        )
 
 
 class WhitelistMiddleware(BaseMiddleware):
@@ -68,6 +77,34 @@ def main_keyboard() -> InlineKeyboardMarkup:
 
 
 MAIN_MENU_TEXT = "🎬 AniStream\n\nWhat would you like to watch?"
+BUTTON_TEXT_LIMIT = 60
+
+
+def button_label_with_suffix(
+    title: object,
+    suffix: object,
+    *,
+    limit: int = BUTTON_TEXT_LIMIT,
+) -> str:
+    clean_title = " ".join(str(title).split())
+    clean_suffix = " ".join(str(suffix).split())
+    separator = " · "
+    full_label = f"{clean_title}{separator}{clean_suffix}"
+    if len(full_label) <= limit:
+        return full_label
+    available = limit - len(separator) - len(clean_suffix)
+    if available <= 1:
+        return clean_suffix[:limit]
+    shortened = clean_title[: available - 1].rstrip()
+    return f"{shortened}…{separator}{clean_suffix}"
+
+
+def is_anonymous_provider_alias(value: object) -> bool:
+    alias = str(value).strip()
+    if alias == "Provider":
+        return True
+    number = alias.removeprefix("Provider ")
+    return number.isdigit() and int(number) > 0
 
 
 def back_to_menu_keyboard() -> InlineKeyboardMarkup:
@@ -114,79 +151,131 @@ class BotHandlers:
         self.database = database
         self.core = core
         self.router = Router(name="anistream")
+        self.public_router = Router(name="anistream-public")
+        self.protected_router = Router(name="anistream-protected")
         middleware = WhitelistMiddleware(database)
-        self.router.message.middleware(middleware)
-        self.router.callback_query.middleware(middleware)
+        self.protected_router.message.middleware(middleware)
+        self.protected_router.callback_query.middleware(middleware)
         self._register()
+        self.router.include_router(self.public_router)
+        self.router.include_router(self.protected_router)
 
     def _register(self) -> None:
-        self.router.message.register(self.start, CommandStart())
-        self.router.message.register(self.help_command, Command("help"))
-        self.router.message.register(self.cancel, Command("cancel"))
-        self.router.callback_query.register(self.search_prompt, F.data == "menu:search")
-        self.router.callback_query.register(self.main_menu, F.data == "menu:main")
-        self.router.callback_query.register(
+        self.public_router.message.register(
+            self.id_command,
+            PublicIdCommandFilter(),
+        )
+        self.protected_router.message.register(self.start, CommandStart())
+        self.protected_router.message.register(self.help_command, Command("help"))
+        self.protected_router.message.register(self.cancel, Command("cancel"))
+        self.protected_router.callback_query.register(
+            self.search_prompt,
+            F.data == "menu:search",
+        )
+        self.protected_router.callback_query.register(
+            self.main_menu,
+            F.data == "menu:main",
+        )
+        self.protected_router.callback_query.register(
             self.continue_watching,
             F.data == "menu:continue",
         )
-        self.router.callback_query.register(self.help_callback, F.data == "menu:help")
-        self.router.callback_query.register(
+        self.protected_router.callback_query.register(
+            self.help_callback,
+            F.data == "menu:help",
+        )
+        self.protected_router.callback_query.register(
             self.select_result,
             F.data.startswith("result:"),
         )
-        self.router.callback_query.register(
+        self.protected_router.callback_query.register(
             self.show_search_results,
             F.data.startswith("search-results:"),
         )
-        self.router.callback_query.register(
+        self.protected_router.callback_query.register(
             self.select_variant,
             F.data.startswith("variant:"),
         )
-        self.router.callback_query.register(
+        self.protected_router.callback_query.register(
             self.show_variants,
             F.data.startswith("variants:"),
         )
-        self.router.callback_query.register(
+        self.protected_router.callback_query.register(
             self.episode_page,
             F.data.startswith("episodes:"),
         )
-        self.router.callback_query.register(
+        self.protected_router.callback_query.register(
             self.select_episode,
             F.data.startswith("watch:"),
         )
-        self.router.callback_query.register(
+        self.protected_router.callback_query.register(
             self.manage_continue_watching,
             F.data == "continue:manage",
         )
-        self.router.callback_query.register(
+        self.protected_router.callback_query.register(
             self.completed_watching,
             F.data == "continue:completed",
         )
-        self.router.callback_query.register(
+        self.protected_router.callback_query.register(
             self.select_completed,
             F.data.startswith("continue:completed-entry:"),
         )
-        self.router.callback_query.register(
+        self.protected_router.callback_query.register(
             self.confirm_restart,
             F.data.startswith("continue:restart:"),
         )
-        self.router.callback_query.register(
+        self.protected_router.callback_query.register(
             self.restart_entry,
             F.data.startswith("continue:restart-confirm:"),
         )
-        self.router.callback_query.register(
+        self.protected_router.callback_query.register(
             self.confirm_continue_removal,
             F.data.startswith("continue:remove:"),
         )
-        self.router.callback_query.register(
+        self.protected_router.callback_query.register(
             self.remove_continue_entry,
             F.data.startswith("continue:delete:"),
         )
-        self.router.callback_query.register(
+        self.protected_router.callback_query.register(
             self.select_continue,
             F.data.startswith("continue:"),
         )
-        self.router.message.register(self.search_query, SearchFlow.waiting_query)
+        self.protected_router.message.register(
+            self.search_query,
+            SearchFlow.waiting_query,
+        )
+
+    async def id_command(self, message: Message) -> None:
+        if message.chat.type != "private" or message.from_user is None:
+            return
+        user_id = str(message.from_user.id)
+        await message.answer(
+            "🪪 Your Telegram ID\n\n"
+            f"{user_id}\n\n"
+            "Send this number to the AniStream administrator to request access.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="📋 Copy ID",
+                            copy_text=CopyTextButton(text=user_id),
+                            style="primary",
+                        )
+                    ]
+                ]
+            ),
+        )
+
+    def _provider_alias(self, payload: dict[str, Any]) -> str:
+        alias = str(payload.get("provider_alias", "")).strip()
+        if is_anonymous_provider_alias(alias):
+            return alias
+        resolver = getattr(self.core, "provider_alias", None)
+        if callable(resolver):
+            alias = str(resolver(str(payload.get("provider_id", "")))).strip()
+            if is_anonymous_provider_alias(alias):
+                return alias
+        return "Provider"
 
     @staticmethod
     async def _replace_callback_message(
@@ -332,7 +421,10 @@ class BotHandlers:
     ) -> None:
         buttons: list[list[InlineKeyboardButton]] = []
         for index, item in enumerate(payload["results"]):
-            label = f"{item['title']} · {item['provider_name']}"[:60]
+            label = button_label_with_suffix(
+                item["title"],
+                self._provider_alias(item),
+            )
             buttons.append(
                 [
                     InlineKeyboardButton(
@@ -452,8 +544,13 @@ class BotHandlers:
                 [InlineKeyboardButton(text="‹ Back to menu", callback_data="menu:main")]
             )
         if callback.message:
+            provider_alias = (
+                self._provider_alias(payload["variants"][0])
+                if payload["variants"]
+                else "Provider"
+            )
             await callback.message.edit_text(
-                "🎞 Seasons and languages\n\nChoose an option:",
+                f"🎞 {provider_alias}\n\nChoose a season and language:",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
             )
 
@@ -638,7 +735,7 @@ class BotHandlers:
             )
         text = (
             f"🎬 {catalogue['title']}\n"
-            f"{catalogue['provider_name']} · {catalogue['season']} · "
+            f"{self._provider_alias(catalogue)} · {catalogue['season']} · "
             f"{catalogue['language_label']}\n\n"
             f"Episodes {start}–{end} of {total}\n"
             "Choose an episode:"
@@ -723,23 +820,26 @@ class BotHandlers:
                     for value in (
                         str(catalogue.get("season", "")),
                         str(catalogue.get("language_label", "")),
+                        self._provider_alias(catalogue),
                     )
                     if value
                 )
-                label = f"🗑 {catalogue['title']}"
-                if details:
-                    label += f" · {details}"
+                label = button_label_with_suffix(
+                    f"🗑 {catalogue['title']}",
+                    details,
+                )
                 callback_data = f"continue:remove:{selection_id}"
             else:
-                label = (
-                    f"▶ {catalogue['title']} · Episode {entry['resume_episode']} · "
-                    f"{catalogue['provider_name']}"
+                label = button_label_with_suffix(
+                    f"▶ {catalogue['title']}",
+                    f"E{entry['resume_episode']} · "
+                    f"{self._provider_alias(catalogue)}",
                 )
                 callback_data = f"continue:{selection_id}"
             buttons.append(
                 [
                     InlineKeyboardButton(
-                        text=label[:60],
+                        text=label,
                         callback_data=callback_data,
                         style="danger" if manage else None,
                     )
@@ -838,16 +938,18 @@ class BotHandlers:
                 for value in (
                     str(catalogue.get("season", "")),
                     str(catalogue.get("language_label", "")),
+                    self._provider_alias(catalogue),
                 )
                 if value
             )
-            label = f"✓ {catalogue['title']}"
-            if details:
-                label += f" · {details}"
+            label = button_label_with_suffix(
+                f"✓ {catalogue['title']}",
+                details,
+            )
             buttons.append(
                 [
                     InlineKeyboardButton(
-                        text=label[:60],
+                        text=label,
                         callback_data=f"continue:completed-entry:{selection_id}",
                         style="success",
                     )
@@ -886,7 +988,7 @@ class BotHandlers:
         details = " · ".join(
             value
             for value in (
-                str(catalogue.get("provider_name", "")),
+                self._provider_alias(catalogue),
                 str(catalogue.get("season", "")),
                 str(catalogue.get("language_label", "")),
             )
@@ -1029,7 +1131,7 @@ class BotHandlers:
         details = " · ".join(
             value
             for value in (
-                str(catalogue.get("provider_name", "")),
+                self._provider_alias(catalogue),
                 str(catalogue.get("season", "")),
                 str(catalogue.get("language_label", "")),
             )
