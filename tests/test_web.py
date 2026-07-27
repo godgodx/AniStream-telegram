@@ -43,6 +43,16 @@ def test_mini_app_exposes_dynamic_hls_track_controls() -> None:
     assert 'api("/api/playback", { method: "POST" })' in script
 
 
+def test_episode_picker_is_outside_native_video_controls() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    html = (project_root / "web" / "index.html").read_text(encoding="utf-8")
+    picker_start = html.index('id="episode-picker-shell"')
+    picker_end = html.index("</label>", picker_start)
+    player_start = html.index('<section class="player-card"')
+
+    assert picker_end < player_start
+
+
 class FakeCore:
     def __init__(self) -> None:
         self.calls = 0
