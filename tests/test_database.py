@@ -39,6 +39,26 @@ async def test_whitelist_and_one_time_launch_ticket(tmp_path: Path) -> None:
         await database.close()
 
 
+async def test_autoplay_defaults_on_and_persists_per_user(tmp_path: Path) -> None:
+    path = tmp_path / "db.sqlite"
+    database = await database_at(path)
+    try:
+        assert await database.autoplay_enabled(123) is True
+        assert await database.toggle_autoplay(123) is False
+        assert await database.autoplay_enabled(123) is False
+        assert await database.autoplay_enabled(999) is True
+    finally:
+        await database.close()
+
+    reopened = await database_at(path)
+    try:
+        assert await reopened.autoplay_enabled(123) is False
+        assert await reopened.set_autoplay_enabled(123, True) is True
+        assert await reopened.autoplay_enabled(123) is True
+    finally:
+        await reopened.close()
+
+
 async def test_rewatch_does_not_move_continuation_backwards(tmp_path: Path) -> None:
     database = await database_at(tmp_path / "db.sqlite")
     try:

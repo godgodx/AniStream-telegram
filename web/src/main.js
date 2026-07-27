@@ -12,6 +12,7 @@ const progress = document.querySelector("#progress");
 const fullscreen = document.querySelector("#fullscreen");
 const previous = document.querySelector("#previous");
 const next = document.querySelector("#next");
+const autoplayStatus = document.querySelector("#autoplay-status");
 const episodePickerShell = document.querySelector("#episode-picker-shell");
 const episodePicker = document.querySelector("#episode-picker");
 const castButton = document.querySelector("#cast");
@@ -169,6 +170,15 @@ function updateEpisodePicker(info) {
   episodePickerShell.hidden = false;
 }
 
+function updateAutoplayUi(info) {
+  const isSeries = Number(info.total_episodes) > 1;
+  autoplayStatus.hidden = !isSeries;
+  autoplayStatus.textContent =
+    info.autoplay_enabled === false
+      ? "Autoplay next is off"
+      : "Autoplay next is on";
+}
+
 function updateEpisodeUi(info) {
   currentInfo = info;
   playbackId = info.playback_id;
@@ -183,6 +193,7 @@ function updateEpisodeUi(info) {
   previous.disabled = !info.has_previous;
   next.disabled = !info.has_next;
   updateEpisodePicker(info);
+  updateAutoplayUi(info);
 }
 
 function attachPlayer(info, { autoplay = false } = {}) {
@@ -263,8 +274,10 @@ function attachPlayer(info, { autoplay = false } = {}) {
       if (changingEpisode) return;
       completed = true;
       await saveProgress(true, true);
-      if (info.has_next) {
+      if (info.has_next && info.autoplay_enabled !== false) {
         await changeEpisode(info.episode + 1, { autoplay: true });
+      } else if (info.has_next) {
+        setCastStatus("Autoplay is off. Choose the next episode when ready.");
       } else {
         setCastStatus("Season completed.");
       }
@@ -341,8 +354,10 @@ async function handleRemoteCastFinished() {
     remotePlayer.currentTime,
     remotePlayer.duration,
   );
-  if (currentInfo.has_next) {
+  if (currentInfo.has_next && currentInfo.autoplay_enabled !== false) {
     await changeEpisode(currentInfo.episode + 1, { autoplay: true });
+  } else if (currentInfo.has_next) {
+    setCastStatus("Autoplay is off. Choose the next episode when ready.");
   } else {
     setCastStatus("Season completed on TV.");
   }
@@ -555,6 +570,19 @@ async function initialize() {
   }
 }
 
+async function refreshAutoplayPreference() {
+  if (!currentInfo) return;
+  try {
+    const session = await api("/api/session");
+    if (typeof session.autoplay_enabled === "boolean") {
+      currentInfo.autoplay_enabled = session.autoplay_enabled;
+      updateAutoplayUi(currentInfo);
+    }
+  } catch {
+    // Keep the last known preference if Telegram briefly loses connectivity.
+  }
+}
+
 previous.addEventListener("click", () => {
   if (currentInfo?.has_previous) {
     void changeEpisode(currentInfo.episode - 1, { autoplay: true });
@@ -607,7 +635,11 @@ fullscreen.addEventListener("click", async () => {
 });
 
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState !== "hidden" || completed) return;
+  if (document.visibilityState === "visible") {
+    void refreshAutoplayPreference();
+    return;
+  }
+  if (completed) return;
   if (googleCastConnected() && remotePlayer?.isMediaLoaded) {
     void saveProgress(
       true,

@@ -226,6 +226,9 @@ class WebRoutes:
             0.0,
             False,
         )
+        autoplay_enabled = await self.database.autoplay_enabled(
+            session.telegram_user_id
+        )
         return {
             "playback_id": playback.id,
             "stream_url": f"/media/{playback.id}/master",
@@ -235,6 +238,7 @@ class WebRoutes:
             "total_episodes": total,
             "has_previous": episode > 1,
             "has_next": episode < total,
+            "autoplay_enabled": autoplay_enabled,
             "start_position": max(0.0, float(start_position or 0.0)),
             "title": str(catalogue.get("title", ""))[:200],
             "season": str(catalogue.get("season", ""))[:100],
@@ -305,6 +309,9 @@ class WebRoutes:
                 "ok": True,
                 "csrf_token": session.csrf_token,
                 "user_id": session.telegram_user_id,
+                "autoplay_enabled": await self.database.autoplay_enabled(
+                    session.telegram_user_id
+                ),
             }
         )
 

@@ -11,6 +11,7 @@ from anistream_telegram.bot import (
     WhitelistMiddleware,
     button_label_with_suffix,
     main_keyboard,
+    settings_keyboard,
 )
 
 
@@ -20,6 +21,8 @@ def handler(public_base_url: str) -> BotHandlers:
     instance.database = SimpleNamespace(
         episode_position=AsyncMock(return_value=0.0),
         create_launch_ticket=AsyncMock(return_value="launch-ticket"),
+        autoplay_enabled=AsyncMock(return_value=True),
+        toggle_autoplay=AsyncMock(return_value=False),
     )
     instance.core = SimpleNamespace(
         provider_alias=lambda _provider_id: "Provider 1",
@@ -126,6 +129,9 @@ def test_only_id_handler_is_registered_on_public_router() -> None:
     assert {
         "search_prompt",
         "continue_watching",
+        "watch_list_coming_soon",
+        "settings",
+        "toggle_autoplay",
         "select_episode",
         "select_continue",
     } <= protected_callbacks
@@ -155,13 +161,29 @@ async def test_id_command_returns_only_own_id_with_copy_button() -> None:
 def test_main_keyboard_has_clear_native_action_hierarchy() -> None:
     keyboard = main_keyboard()
 
-    assert len(keyboard.inline_keyboard) == 2
+    assert len(keyboard.inline_keyboard) == 3
     search, resume = keyboard.inline_keyboard[0]
     assert search.text == "🔎 Search"
     assert search.style == "primary"
     assert resume.text == "▶ Continue watching"
     assert resume.style == "primary"
-    assert keyboard.inline_keyboard[1][0].text == "❔ Help"
+    watch_list, settings = keyboard.inline_keyboard[1]
+    assert watch_list.text == "⭐ Watch list"
+    assert watch_list.callback_data == "menu:watchlist"
+    assert settings.text == "⚙ Settings"
+    assert settings.callback_data == "menu:settings"
+    assert keyboard.inline_keyboard[2][0].text == "❔ Help"
+
+
+def test_settings_keyboard_reflects_autoplay_state() -> None:
+    enabled = settings_keyboard(True).inline_keyboard[0][0]
+    disabled = settings_keyboard(False).inline_keyboard[0][0]
+
+    assert enabled.text == "✅ Autoplay next episode · On"
+    assert enabled.style == "success"
+    assert disabled.text == "Autoplay next episode · Off"
+    assert disabled.style is None
+    assert enabled.callback_data == disabled.callback_data == "settings:autoplay"
 
 
 def test_long_button_title_preserves_anonymous_provider_suffix() -> None:
@@ -188,6 +210,52 @@ async def test_main_menu_replaces_the_clicked_message() -> None:
     event.message.answer.assert_not_awaited()
     event.message.edit_text.assert_awaited_once()
     assert event.message.edit_text.await_args.args[0] == MAIN_MENU_TEXT
+
+
+@pytest.mark.asyncio
+async def test_watch_list_button_shows_coming_soon_alert_without_new_message() -> None:
+    handlers = handler("https://watch.example")
+    event = callback()
+
+    await handlers.watch_list_coming_soon(event)
+
+    event.answer.assert_awaited_once_with(
+        "Watch List is coming soon.",
+        show_alert=True,
+    )
+    event.message.answer.assert_not_awaited()
+    event.message.edit_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_settings_panel_reads_saved_autoplay_state() -> None:
+    handlers = handler("https://watch.example")
+    handlers.database.autoplay_enabled = AsyncMock(return_value=False)
+    event = callback()
+
+    await handlers.settings(event)
+
+    event.answer.assert_awaited_once()
+    handlers.database.autoplay_enabled.assert_awaited_once_with(123)
+    text = event.message.edit_text.await_args.args[0]
+    keyboard = event.message.edit_text.await_args.kwargs["reply_markup"]
+    assert text.startswith("⚙ Settings")
+    assert keyboard.inline_keyboard[0][0].text.endswith("· Off")
+    assert keyboard.inline_keyboard[1][0].callback_data == "menu:main"
+
+
+@pytest.mark.asyncio
+async def test_settings_toggle_persists_and_refreshes_panel() -> None:
+    handlers = handler("https://watch.example")
+    handlers.database.toggle_autoplay = AsyncMock(return_value=False)
+    event = callback()
+
+    await handlers.toggle_autoplay(event)
+
+    handlers.database.toggle_autoplay.assert_awaited_once_with(123)
+    event.answer.assert_awaited_once_with("Autoplay disabled.")
+    keyboard = event.message.edit_text.await_args.kwargs["reply_markup"]
+    assert keyboard.inline_keyboard[0][0].text.endswith("· Off")
 
 
 @pytest.mark.asyncio

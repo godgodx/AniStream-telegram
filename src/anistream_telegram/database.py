@@ -44,6 +44,14 @@ class AllowedUser(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
 
 
+class UserPreference(Base):
+    __tablename__ = "user_preferences"
+
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    autoplay_next: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
 class EphemeralSelection(Base):
     __tablename__ = "ephemeral_selections"
 
@@ -188,6 +196,43 @@ class Database:
                 .order_by(AllowedUser.telegram_user_id)
             )
             return list(result)
+
+    async def autoplay_enabled(self, user_id: int) -> bool:
+        async with self.sessions() as session:
+            preference = await session.get(UserPreference, user_id)
+            return True if preference is None else bool(preference.autoplay_next)
+
+    async def set_autoplay_enabled(self, user_id: int, enabled: bool) -> bool:
+        async with self.sessions.begin() as session:
+            preference = await session.get(UserPreference, user_id)
+            if preference is None:
+                preference = UserPreference(
+                    telegram_user_id=user_id,
+                    autoplay_next=bool(enabled),
+                )
+                session.add(preference)
+            else:
+                preference.autoplay_next = bool(enabled)
+                preference.updated_at = utcnow()
+        return bool(enabled)
+
+    async def toggle_autoplay(self, user_id: int) -> bool:
+        async with self.sessions.begin() as session:
+            preference = await session.scalar(
+                select(UserPreference)
+                .where(UserPreference.telegram_user_id == user_id)
+                .with_for_update()
+            )
+            if preference is None:
+                preference = UserPreference(
+                    telegram_user_id=user_id,
+                    autoplay_next=False,
+                )
+                session.add(preference)
+            else:
+                preference.autoplay_next = not preference.autoplay_next
+                preference.updated_at = utcnow()
+            return bool(preference.autoplay_next)
 
     async def create_selection(
         self,

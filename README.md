@@ -32,10 +32,10 @@ workflow.
   App session, API request, media request, and cast grant is bound to an allowed
   numeric Telegram user ID. The only public command is `/id`, which reveals
   only the sender's own ID for access requests.
-- **Clean native Telegram navigation** — Search, Continue Watching, Help,
-  paginated episodes, anonymous provider attribution, and breadcrumb-style Back
-  buttons use styled inline keyboards that replace the current panel instead
-  of flooding the conversation with new messages.
+- **Clean native Telegram navigation** — Search, Continue Watching, Watch List
+  preview, Settings, Help, paginated episodes, anonymous provider attribution,
+  and breadcrumb-style Back buttons use styled inline keyboards that replace
+  the current panel instead of flooding the conversation with new messages.
 - **Multi-provider search** — query every registered catalogue concurrently and
   expose stable `Provider 1`, `Provider 2`, and subsequent aliases without
   revealing catalogue names in the Telegram interface.
@@ -54,8 +54,9 @@ workflow.
   section, while any active or completed entry can be restarted from episode 1.
   Users can also remove an entry and its saved positions through a confirmed
   private action.
-- **Series controls** — move to the previous or next episode and automatically
-  start the next episode after normal completion.
+- **Series controls** — move to the previous, next, or any specific episode and
+  optionally start the next episode after normal completion. Autoplay is enabled
+  by default and stored per Telegram account.
 - **TV playback** — expose Google Cast, AirPlay, or Remote Playback when the
   current Telegram client or external browser supports it.
 - **Hardened outbound networking** — block credentials, unsafe ports,
@@ -161,7 +162,9 @@ The main menu keeps the watch flow intentionally small:
 
 1. **Continue Watching** — reopen the last interrupted episode and position;
 2. **Search** — discover a title across every registered provider;
-3. **Help** — explain access and playback behavior.
+3. **Watch List** — reserved for the upcoming personal watch list;
+4. **Settings** — enable or disable next-episode autoplay;
+5. **Help** — explain access and playback behavior.
 
 ```text
 Whitelisted Telegram user
@@ -225,8 +228,9 @@ encrypted playback-bound URLs, validates redirects, and relays ranges without
 exposing provider credentials.
 
 Progress is saved periodically, on pause, when Telegram hides the Mini App, and
-when the page closes. Series expose previous/next controls and advance
-automatically after the current episode finishes.
+when the page closes. Series expose an episode selector plus previous/next
+controls. They advance automatically after the current episode finishes when
+the user's per-account autoplay setting is enabled.
 
 ### TV playback
 

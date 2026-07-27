@@ -71,6 +71,16 @@ def main_keyboard() -> InlineKeyboardMarkup:
                     style="primary",
                 ),
             ],
+            [
+                InlineKeyboardButton(
+                    text="⭐ Watch list",
+                    callback_data="menu:watchlist",
+                ),
+                InlineKeyboardButton(
+                    text="⚙ Settings",
+                    callback_data="menu:settings",
+                ),
+            ],
             [InlineKeyboardButton(text="❔ Help", callback_data="menu:help")],
         ]
     )
@@ -116,6 +126,29 @@ def back_to_menu_keyboard() -> InlineKeyboardMarkup:
                     callback_data="menu:main",
                 )
             ]
+        ]
+    )
+
+
+def settings_keyboard(autoplay_enabled: bool) -> InlineKeyboardMarkup:
+    toggle = InlineKeyboardButton(
+        text=(
+            "✅ Autoplay next episode · On"
+            if autoplay_enabled
+            else "Autoplay next episode · Off"
+        ),
+        callback_data="settings:autoplay",
+        style="success" if autoplay_enabled else None,
+    )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [toggle],
+            [
+                InlineKeyboardButton(
+                    text="‹ Back to menu",
+                    callback_data="menu:main",
+                )
+            ],
         ]
     )
 
@@ -179,6 +212,18 @@ class BotHandlers:
         self.protected_router.callback_query.register(
             self.continue_watching,
             F.data == "menu:continue",
+        )
+        self.protected_router.callback_query.register(
+            self.watch_list_coming_soon,
+            F.data == "menu:watchlist",
+        )
+        self.protected_router.callback_query.register(
+            self.settings,
+            F.data == "menu:settings",
+        )
+        self.protected_router.callback_query.register(
+            self.toggle_autoplay,
+            F.data == "settings:autoplay",
         )
         self.protected_router.callback_query.register(
             self.help_callback,
@@ -335,6 +380,39 @@ class BotHandlers:
             callback,
             HELP_TEXT,
             back_to_menu_keyboard(),
+        )
+
+    async def watch_list_coming_soon(self, callback: CallbackQuery) -> None:
+        await callback.answer("Watch List is coming soon.", show_alert=True)
+
+    async def settings(self, callback: CallbackQuery) -> None:
+        await callback.answer()
+        await self._render_settings(callback)
+
+    async def toggle_autoplay(self, callback: CallbackQuery) -> None:
+        enabled = await self.database.toggle_autoplay(callback.from_user.id)
+        await callback.answer(
+            "Autoplay enabled." if enabled else "Autoplay disabled."
+        )
+        await self._render_settings(callback, autoplay_enabled=enabled)
+
+    async def _render_settings(
+        self,
+        callback: CallbackQuery,
+        *,
+        autoplay_enabled: bool | None = None,
+    ) -> None:
+        if autoplay_enabled is None:
+            autoplay_enabled = await self.database.autoplay_enabled(
+                callback.from_user.id
+            )
+        await self._replace_callback_message(
+            callback,
+            "⚙ Settings\n\n"
+            "Autoplay next episode\n"
+            "Automatically start the next episode when the current one ends.\n\n"
+            "This preference is saved to your Telegram account.",
+            settings_keyboard(autoplay_enabled),
         )
 
     async def main_menu(self, callback: CallbackQuery, state: FSMContext) -> None:

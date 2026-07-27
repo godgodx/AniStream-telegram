@@ -228,12 +228,49 @@ async def test_episode_change_resumes_position_and_updates_session(
         assert payload["total_episodes"] == 12
         assert payload["has_previous"] is True
         assert payload["has_next"] is True
+        assert payload["autoplay_enabled"] is True
         assert payload["start_position"] == 92.5
 
         updated = await database.get_web_session(raw_session)
         assert updated is not None
         assert updated.payload["episode"] == 4
         assert updated.payload["start_position"] == 92.5
+    finally:
+        await client.close()
+        await database.close()
+
+
+async def test_playback_and_session_expose_current_autoplay_setting(
+    tmp_path: Path,
+) -> None:
+    settings = config(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize(settings.allowed_users)
+    await database.set_autoplay_enabled(123, False)
+    raw_session, _csrf = await database.create_web_session(
+        123,
+        {
+            "catalogue": catalogue(),
+            "episode": 3,
+            "start_position": 0,
+        },
+        ttl_seconds=600,
+    )
+    media = MediaGateway(settings, database)
+    app = web.Application(middlewares=[error_boundary, security_headers])
+    app[CONFIG_KEY] = settings
+    WebRoutes(settings, database, FakeCore(), media).register(app)  # type: ignore[arg-type]
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        cookie = {"Cookie": f"{settings.cookie_name}={raw_session}"}
+        session_response = await client.get("/api/session", headers=cookie)
+        assert session_response.status == 200
+        assert (await session_response.json())["autoplay_enabled"] is False
+
+        playback_response = await client.get("/api/playback", headers=cookie)
+        assert playback_response.status == 200
+        assert (await playback_response.json())["autoplay_enabled"] is False
     finally:
         await client.close()
         await database.close()
