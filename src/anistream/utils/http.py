@@ -285,7 +285,7 @@ class HttpClient:
                 return response if caller_streams else self._bounded_response(response)
             location = response.headers.get("Location", "").strip()
             if not location or redirect_count >= self.max_redirects:
-                return response
+                return response if caller_streams else self._bounded_response(response)
             next_url = urljoin(current_url, location)
             _url_parts(next_url)
             response.close()

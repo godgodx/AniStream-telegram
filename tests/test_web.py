@@ -13,6 +13,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from anistream_telegram.config import Config
 from anistream_telegram.database import Database
+from anistream_telegram.limits import SlidingWindowLimiter
 from anistream_telegram.media import MediaGateway
 from anistream_telegram.web import (
     CONFIG_KEY,
@@ -39,10 +40,21 @@ def test_mini_app_exposes_dynamic_hls_track_controls() -> None:
     assert "hls.currentLevel = level" in script
     assert '"Unavailable"' in script
     assert "streamControlsExpanded = !streamControlsExpanded" in script
+    assert 'api("/api/playback", { method: "POST" })' in script
 
 
 class FakeCore:
-    async def prepare_media(self, catalogue: dict, episode: int) -> SimpleNamespace:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def prepare_media(
+        self,
+        catalogue: dict,
+        episode: int,
+        *,
+        actor_key: object = "internal",
+    ) -> SimpleNamespace:
+        self.calls += 1
         return SimpleNamespace(
             url=f"https://cdn.example/episode-{episode}.mp4",
             headers={"Referer": "https://provider.example/"},
@@ -263,7 +275,7 @@ async def test_playback_and_session_expose_current_autoplay_setting(
     database = Database(settings.database_url)
     await database.initialize(settings.allowed_users)
     await database.set_autoplay_enabled(123, False)
-    raw_session, _csrf = await database.create_web_session(
+    raw_session, csrf = await database.create_web_session(
         123,
         {
             "catalogue": catalogue(),
@@ -284,9 +296,98 @@ async def test_playback_and_session_expose_current_autoplay_setting(
         assert session_response.status == 200
         assert (await session_response.json())["autoplay_enabled"] is False
 
-        playback_response = await client.get("/api/playback", headers=cookie)
+        playback_response = await client.post(
+            "/api/playback",
+            headers={
+                **cookie,
+                "Origin": settings.public_origin,
+                "X-CSRF-Token": csrf,
+            },
+        )
         assert playback_response.status == 200
         assert (await playback_response.json())["autoplay_enabled"] is False
+    finally:
+        await client.close()
+        await database.close()
+
+
+async def test_playback_rejects_cookie_only_get_and_post_without_csrf(
+    tmp_path: Path,
+) -> None:
+    settings = config(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize(settings.allowed_users)
+    raw_session, _csrf = await database.create_web_session(
+        123,
+        {
+            "catalogue": catalogue(),
+            "episode": 3,
+            "start_position": 0,
+        },
+        ttl_seconds=600,
+    )
+    media = MediaGateway(settings, database)
+    core = FakeCore()
+    app = web.Application(middlewares=[error_boundary, security_headers])
+    app[CONFIG_KEY] = settings
+    WebRoutes(settings, database, core, media).register(app)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        cookie = {"Cookie": f"{settings.cookie_name}={raw_session}"}
+        get_response = await client.get("/api/playback", headers=cookie)
+        assert get_response.status == 405
+
+        post_response = await client.post(
+            "/api/playback",
+            headers={
+                **cookie,
+                "Origin": "https://evil.example",
+            },
+        )
+        assert post_response.status == 403
+        assert core.calls == 0
+    finally:
+        await client.close()
+        await database.close()
+
+
+async def test_playback_rate_limit_rejects_before_repeated_provider_work(
+    tmp_path: Path,
+) -> None:
+    settings = config(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize(settings.allowed_users)
+    raw_session, csrf = await database.create_web_session(
+        123,
+        {
+            "catalogue": catalogue(),
+            "episode": 3,
+            "start_position": 0,
+        },
+        ttl_seconds=600,
+    )
+    media = MediaGateway(settings, database)
+    core = FakeCore()
+    routes = WebRoutes(settings, database, core, media)
+    routes.playback_limiter = SlidingWindowLimiter(1, 60)
+    app = web.Application(middlewares=[error_boundary, security_headers])
+    app[CONFIG_KEY] = settings
+    routes.register(app)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        headers = {
+            "Cookie": f"{settings.cookie_name}={raw_session}",
+            "Origin": settings.public_origin,
+            "X-CSRF-Token": csrf,
+        }
+        first = await client.post("/api/playback", headers=headers)
+        assert first.status == 200
+
+        limited = await client.post("/api/playback", headers=headers)
+        assert limited.status == 429
+        assert core.calls == 1
     finally:
         await client.close()
         await database.close()

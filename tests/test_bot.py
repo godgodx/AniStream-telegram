@@ -14,6 +14,7 @@ from anistream_telegram.bot import (
     main_keyboard,
     settings_keyboard,
 )
+from anistream_telegram.limits import SlidingWindowLimiter
 
 
 def handler(public_base_url: str) -> BotHandlers:
@@ -29,6 +30,7 @@ def handler(public_base_url: str) -> BotHandlers:
     instance.core = SimpleNamespace(
         provider_alias=lambda _provider_id: "Provider 1",
     )
+    instance.provider_limiter = SlidingWindowLimiter(1_000, 60)
     return instance
 
 
@@ -374,6 +376,36 @@ async def test_search_results_are_sent_below_query_and_grouped_by_provider() -> 
         {"chat_id": 456, "message_id": 790},
         {"chat_id": 456, "message_id": 791},
     ]
+
+
+@pytest.mark.asyncio
+async def test_search_rate_limit_rejects_before_provider_work() -> None:
+    handlers = handler("https://watch.example")
+    handlers.provider_limiter = SlidingWindowLimiter(1, 60)
+    assert await handlers.provider_limiter.allow("123") is True
+    handlers.core = SimpleNamespace(search=AsyncMock())
+    panel = MagicMock(spec=Message)
+    panel.chat = SimpleNamespace(id=456)
+    panel.message_id = 790
+    telegram_bot = SimpleNamespace(delete_message=AsyncMock())
+    message = SimpleNamespace(
+        text="Tokyo Ghoul",
+        bot=telegram_bot,
+        from_user=SimpleNamespace(id=123),
+        answer=AsyncMock(return_value=panel),
+    )
+    state = SimpleNamespace(
+        get_data=AsyncMock(
+            return_value={"panel_chat_id": 456, "panel_message_id": 789}
+        ),
+        clear=AsyncMock(),
+    )
+
+    await handlers.search_query(message, state)
+
+    handlers.core.search.assert_not_awaited()
+    state.clear.assert_awaited_once()
+    assert "Too many provider requests" in message.answer.await_args.args[0]
 
 
 @pytest.mark.asyncio

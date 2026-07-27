@@ -169,7 +169,7 @@ class Database:
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
         for user_id in bootstrap_users:
-            await self.set_allowed(user_id, True)
+            await self.bootstrap_allowed_user(user_id)
         await self.cleanup()
 
     async def close(self) -> None:
@@ -182,6 +182,13 @@ class Database:
                 session.add(AllowedUser(telegram_user_id=user_id, enabled=enabled))
             else:
                 item.enabled = enabled
+
+    async def bootstrap_allowed_user(self, user_id: int) -> None:
+        """Create an initial allow entry without overriding a persisted revocation."""
+        async with self.sessions.begin() as session:
+            item = await session.get(AllowedUser, user_id)
+            if item is None:
+                session.add(AllowedUser(telegram_user_id=user_id, enabled=True))
 
     async def is_allowed(self, user_id: int) -> bool:
         async with self.sessions() as session:

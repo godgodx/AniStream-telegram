@@ -726,7 +726,7 @@ async function initialize() {
       csrfToken = current.csrf_token;
     }
     status.textContent = "Finding the best available source…";
-    const info = await api("/api/playback");
+    const info = await api("/api/playback", { method: "POST" });
     attachPlayer(info);
     setupCast();
   } catch (reason) {

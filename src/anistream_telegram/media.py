@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import re
 import socket
@@ -43,6 +44,11 @@ CAST_CORS_HEADERS = {
         "Accept-Ranges, Content-Length, Content-Range, Content-Type"
     ),
 }
+MAX_PLAYLIST_INPUT_BYTES = 2_000_000
+MAX_PLAYLIST_OUTPUT_BYTES = 4_000_000
+MAX_PLAYLIST_REFERENCES = 8_192
+MAX_PLAYLIST_URI_LENGTH = 8_192
+MAX_PLAYLIST_TOKEN_LENGTH = 8_192
 
 
 class SafeResolver(AbstractResolver):
@@ -308,9 +314,9 @@ class MediaGateway:
         *,
         cast_token: str = "",
     ) -> web.Response:
-        body = await upstream.content.read(2_000_001)
+        body = await upstream.content.read(MAX_PLAYLIST_INPUT_BYTES + 1)
         upstream.release()
-        if len(body) > 2_000_000:
+        if len(body) > MAX_PLAYLIST_INPUT_BYTES:
             raise web.HTTPBadGateway(text="Upstream playlist is too large")
         try:
             text = body.decode("utf-8-sig")
@@ -320,35 +326,56 @@ class MediaGateway:
             raise web.HTTPBadGateway(text="Upstream response is not an HLS playlist")
 
         expires_at = int(playback.expires_at.timestamp())
+        reference_count = 0
 
         def route(uri: str) -> str:
-            absolute = urljoin(base_url, uri.strip())
+            nonlocal reference_count
+            reference_count += 1
+            if reference_count > MAX_PLAYLIST_REFERENCES:
+                raise web.HTTPBadGateway(
+                    text="Upstream playlist contains too many resources"
+                )
+            clean_uri = uri.strip()
+            if not clean_uri or len(clean_uri) > MAX_PLAYLIST_URI_LENGTH:
+                raise web.HTTPBadGateway(
+                    text="Upstream playlist contains an invalid resource URI"
+                )
+            absolute = urljoin(base_url, clean_uri)
             public_url_parts(absolute, self.config.media_allowed_hosts)
             token = self.tokens.create(playback.id, absolute, expires_at)
+            if len(token) > MAX_PLAYLIST_TOKEN_LENGTH:
+                raise web.HTTPBadGateway(
+                    text="Upstream playlist contains an invalid resource URI"
+                )
             path = f"/media/{playback.id}/resource?t={quote(token)}"
             if cast_token:
                 path += f"&cast={quote(cast_token)}"
             return path
 
-        output: list[str] = []
-        for line in text.splitlines():
+        output = bytearray()
+        for raw_line in io.StringIO(text):
+            line = raw_line.rstrip("\r\n")
             stripped = line.strip()
             if not stripped:
-                output.append("")
+                rewritten = ""
             elif stripped.startswith("#"):
-                output.append(
-                    URI_ATTRIBUTE.sub(
-                        lambda match: f'URI="{route(match.group(1))}"',
-                        line,
-                    )
+                rewritten = URI_ATTRIBUTE.sub(
+                    lambda match: f'URI="{route(match.group(1))}"',
+                    line,
                 )
             else:
-                output.append(route(stripped))
+                rewritten = route(stripped)
+            encoded = (rewritten + "\n").encode("utf-8")
+            if len(output) + len(encoded) > MAX_PLAYLIST_OUTPUT_BYTES:
+                raise web.HTTPBadGateway(
+                    text="Rewritten playlist exceeds the response size limit"
+                )
+            output.extend(encoded)
         headers = {"Cache-Control": "private, no-store"}
         if cast_token:
             headers.update(CAST_CORS_HEADERS)
         return web.Response(
-            text="\n".join(output) + "\n",
+            body=bytes(output),
             content_type="application/vnd.apple.mpegurl",
             headers=headers,
         )

@@ -18,6 +18,7 @@ from anistream.resolvers import ResolverRegistry, default_resolvers
 from anistream.services.media_probe import RemoteMediaProbe
 from anistream.services.source_planner import SourcePlanner
 from anistream.utils.http import DEFAULT_USER_AGENT, HttpClient
+from anistream_telegram.limits import CapacityLimiter
 
 
 def search_result_payload(item: SearchResult) -> dict[str, Any]:
@@ -135,6 +136,10 @@ class CoreService:
         self.resolvers = ResolverRegistry(default_resolvers(self.http))
         self.probe = RemoteMediaProbe(self.http)
         self.planner = SourcePlanner(self.resolvers, self.probe)
+        self.provider_capacity = CapacityLimiter(
+            total_limit=4,
+            per_key_limit=1,
+        )
 
     def provider_alias(self, provider_id: str) -> str:
         return self._provider_aliases.get(str(provider_id), "Provider")
@@ -145,36 +150,63 @@ class CoreService:
             "provider_alias": self.provider_alias(str(payload["provider_id"])),
         }
 
-    async def search(self, query: str) -> tuple[list[dict[str, Any]], list[str]]:
-        results, errors = await asyncio.to_thread(self.providers.search, query)
+    async def search(
+        self,
+        query: str,
+        *,
+        actor_key: object = "internal",
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        async with self.provider_capacity.slot(str(actor_key)):
+            results, errors = await asyncio.to_thread(self.providers.search, query)
         return [
             self._with_provider_alias(search_result_payload(item))
             for item in results
         ], errors
 
-    async def variants(self, provider_id: str, url: str) -> list[dict[str, Any]]:
+    async def variants(
+        self,
+        provider_id: str,
+        url: str,
+        *,
+        actor_key: object = "internal",
+    ) -> list[dict[str, Any]]:
         provider = self.providers.get(provider_id)
         if provider is None:
             raise ValueError("unknown provider")
-        items = await asyncio.to_thread(provider.variants, url)
+        async with self.provider_capacity.slot(str(actor_key)):
+            items = await asyncio.to_thread(provider.variants, url)
         return [
             self._with_provider_alias(variant_payload(provider_id, item))
             for item in items
         ]
 
-    async def catalogue(self, provider_id: str, url: str) -> dict[str, Any]:
+    async def catalogue(
+        self,
+        provider_id: str,
+        url: str,
+        *,
+        actor_key: object = "internal",
+    ) -> dict[str, Any]:
         provider = self.providers.get(provider_id)
         if provider is None:
             raise ValueError("unknown provider")
-        item = await asyncio.to_thread(provider.catalogue, url)
+        async with self.provider_capacity.slot(str(actor_key)):
+            item = await asyncio.to_thread(provider.catalogue, url)
         return self._with_provider_alias(catalogue_payload(item))
 
     async def prepare_media(
         self,
         payload: dict[str, Any],
         episode_number: int,
+        *,
+        actor_key: object = "internal",
     ) -> ResolvedMedia:
-        return await asyncio.to_thread(self._prepare_media_sync, payload, episode_number)
+        async with self.provider_capacity.slot(str(actor_key)):
+            return await asyncio.to_thread(
+                self._prepare_media_sync,
+                payload,
+                episode_number,
+            )
 
     def _prepare_media_sync(
         self,

@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 import math
-import time
-from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +10,7 @@ from aiohttp import web
 from anistream_telegram.config import Config
 from anistream_telegram.core import CoreService
 from anistream_telegram.database import Database, WebSession
+from anistream_telegram.limits import CapacityExceeded, SlidingWindowLimiter
 from anistream_telegram.media import MediaGateway
 from anistream_telegram.security import (
     AuthenticationError,
@@ -25,28 +23,6 @@ from anistream_telegram.security import (
 
 LOGGER = logging.getLogger(__name__)
 CONFIG_KEY = web.AppKey("config", Config)
-
-
-class SlidingWindowLimiter:
-    def __init__(self, limit: int, window_seconds: int) -> None:
-        self.limit = limit
-        self.window_seconds = window_seconds
-        self.values: dict[str, deque[float]] = defaultdict(deque)
-        self.lock = asyncio.Lock()
-
-    async def allow(self, key: str) -> bool:
-        now = time.monotonic()
-        cutoff = now - self.window_seconds
-        async with self.lock:
-            values = self.values[key]
-            while values and values[0] <= cutoff:
-                values.popleft()
-            if len(values) >= self.limit:
-                return False
-            values.append(now)
-            if len(self.values) > 10_000:
-                self.values = defaultdict(deque, {key: values})
-            return True
 
 
 class WebRoutes:
@@ -63,13 +39,13 @@ class WebRoutes:
         self.media = media
         self.auth_limiter = SlidingWindowLimiter(12, 60)
         self.progress_limiter = SlidingWindowLimiter(120, 60)
-        self.playback_limiter = SlidingWindowLimiter(30, 60)
+        self.playback_limiter = SlidingWindowLimiter(12, 60)
         self.cast_limiter = SlidingWindowLimiter(10, 60)
 
     def register(self, app: web.Application) -> None:
         app.router.add_post("/api/auth/telegram", self.authenticate)
         app.router.add_get("/api/session", self.session_info)
-        app.router.add_get("/api/playback", self.playback)
+        app.router.add_post("/api/playback", self.playback)
         app.router.add_post("/api/playback/episode", self.change_episode)
         app.router.add_post("/api/progress", self.progress)
         app.router.add_post("/api/cast", self.cast)
@@ -201,8 +177,16 @@ class WebRoutes:
         start_position: float,
     ) -> dict[str, Any]:
         try:
-            media = await self.core.prepare_media(catalogue, episode)
+            media = await self.core.prepare_media(
+                catalogue,
+                episode,
+                actor_key=session.telegram_user_id,
+            )
             public_url_parts(media.url, self.config.media_allowed_hosts)
+        except CapacityExceeded as exc:
+            raise web.HTTPTooManyRequests(
+                text="Another playback request is already running"
+            ) from exc
         except (UnsafeUpstreamError, ValueError, RuntimeError) as exc:
             LOGGER.info("Playback preparation failed: %s", type(exc).__name__)
             raise web.HTTPBadGateway(text="No safe playable source is currently available") from exc
@@ -247,6 +231,9 @@ class WebRoutes:
 
     async def playback(self, request: web.Request) -> web.Response:
         session = await self._authenticated(request)
+        await self._csrf(request, session)
+        if not await self.playback_limiter.allow(str(session.telegram_user_id)):
+            raise web.HTTPTooManyRequests(text="Playback requests are too frequent")
         launch = dict(session.payload)
         catalogue = self._catalogue(session)
         episode, total = self._episode(catalogue, launch.get("episode"))

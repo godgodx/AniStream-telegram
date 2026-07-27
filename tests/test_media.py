@@ -5,9 +5,17 @@ from datetime import timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import pytest
+from aiohttp import web
+
 from anistream_telegram.config import Config
 from anistream_telegram.database import Database, PlaybackSession, utcnow
-from anistream_telegram.media import MediaGateway
+from anistream_telegram.media import (
+    MAX_PLAYLIST_INPUT_BYTES,
+    MAX_PLAYLIST_REFERENCES,
+    MAX_PLAYLIST_TOKEN_LENGTH,
+    MediaGateway,
+)
 
 
 class FakeContent:
@@ -152,3 +160,60 @@ async def test_hls_audio_and_subtitle_tracks_are_rewritten(tmp_path: Path) -> No
     assert "subs/fr.m3u8" not in response.text
     assert "video/1080p.m3u8" not in response.text
     assert len(re.findall(r"/media/playback-id/resource", response.text)) == 3
+
+
+async def test_hls_rewrite_rejects_resource_amplification(tmp_path: Path) -> None:
+    database = Database(config(tmp_path).database_url)
+    gateway = MediaGateway(config(tmp_path), database)
+    playback = PlaybackSession(
+        id="playback-id",
+        telegram_user_id=123,
+        catalogue_payload={},
+        episode=1,
+        media_url="https://cdn.example/master.m3u8",
+        media_headers={},
+        media_kind="hls",
+        source_name="Test",
+        expires_at=utcnow() + timedelta(minutes=10),
+    )
+    # A nearly 2 MB input of one-character URIs previously amplified into a
+    # response hundreds of megabytes large after signing every resource.
+    repeats = (MAX_PLAYLIST_INPUT_BYTES - len(b"#EXTM3U\n")) // len(b"x\n")
+    upstream = FakeResponse(
+        b"#EXTM3U\n" + (b"x\n" * repeats),
+        "https://cdn.example/path/master.m3u8",
+    )
+    assert MAX_PLAYLIST_REFERENCES < repeats
+
+    with pytest.raises(web.HTTPBadGateway) as error:
+        await gateway._playlist_response(playback, upstream, str(upstream.url))
+
+    assert "too many resources" in error.value.text
+    assert upstream.released
+
+
+async def test_hls_rewrite_enforces_output_size_limit(tmp_path: Path) -> None:
+    database = Database(config(tmp_path).database_url)
+    gateway = MediaGateway(config(tmp_path), database)
+    playback = PlaybackSession(
+        id="playback-id",
+        telegram_user_id=123,
+        catalogue_payload={},
+        episode=1,
+        media_url="https://cdn.example/master.m3u8",
+        media_headers={},
+        media_kind="hls",
+        source_name="Test",
+        expires_at=utcnow() + timedelta(minutes=10),
+    )
+    gateway.tokens.create = lambda *_args: "t" * MAX_PLAYLIST_TOKEN_LENGTH
+    upstream = FakeResponse(
+        b"#EXTM3U\n" + (b"x\n" * 600),
+        "https://cdn.example/path/master.m3u8",
+    )
+
+    with pytest.raises(web.HTTPBadGateway) as error:
+        await gateway._playlist_response(playback, upstream, str(upstream.url))
+
+    assert "response size limit" in error.value.text
+    assert upstream.released

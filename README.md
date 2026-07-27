@@ -272,6 +272,11 @@ anistream-admin deny 123456789
 anistream-admin list
 ```
 
+`TELEGRAM_ALLOWED_USERS` is an initial seed only. Once an ID exists in the
+database, restarting the service never changes its stored allow/deny state.
+In particular, `anistream-admin deny` remains effective even if that ID is
+still present in the environment variable.
+
 A prospective user can send `/id` to the bot in a private chat before being
 whitelisted. The bot returns only that user's numeric Telegram ID and a native
 copy button. Send the supplied number to the administrator, who can then run
@@ -372,7 +377,8 @@ through the neutral core as a stable code and user-facing label.
 - Cookies are `HttpOnly`, `Secure`, `SameSite=None`, and `__Host-` scoped in
   production so Telegram's embedded cross-site WebView can send them only over
   HTTPS.
-- Mutating API requests require both an origin check and a CSRF token.
+- Playback preparation and every mutating API request require both an origin
+  check and a CSRF token; the initial playback route accepts POST only.
 - Provider text is inserted with `textContent`, never interpreted as HTML.
 - SQLAlchemy parameterizes database operations.
 - Provider and resolver HTTP connections pin validated public DNS answers to
@@ -380,9 +386,14 @@ through the neutral core as a stable code and user-facing label.
 - Environment proxies are disabled on SSRF-sensitive clients.
 - The final aiohttp gateway validates and pins every media and redirect
   destination independently.
-- HLS child resources use encrypted, playback-bound, expiring URLs.
+- HLS child resources use encrypted, playback-bound, expiring URLs. Playlist
+  input, rewritten output, URI length, and resource count are independently
+  bounded to prevent response amplification.
 - Removing a user from the whitelist revokes sessions and cast access at the
-  next authorization boundary.
+  next authorization boundary, and a restart cannot undo a persisted denial.
+- Provider-backed bot actions and Mini App playback preparation are rate
+  limited per Telegram user. A shared fail-fast capacity limit prevents
+  unbounded provider thread and socket work.
 - Unlisted users can invoke only the exact `/id` command in a private chat;
   callbacks, other commands, launch tickets, and Mini App authentication remain
   blocked.

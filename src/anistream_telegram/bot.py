@@ -23,6 +23,7 @@ from aiogram.types import (
 from anistream_telegram.config import Config
 from anistream_telegram.core import CoreService
 from anistream_telegram.database import Database
+from anistream_telegram.limits import CapacityExceeded, SlidingWindowLimiter
 
 
 LOGGER = logging.getLogger(__name__)
@@ -190,6 +191,7 @@ class BotHandlers:
         self.config = config
         self.database = database
         self.core = core
+        self.provider_limiter = SlidingWindowLimiter(10, 60)
         self.router = Router(name="anistream")
         self.public_router = Router(name="anistream-public")
         self.protected_router = Router(name="anistream-protected")
@@ -470,6 +472,15 @@ class BotHandlers:
                 panel_message_id=panel.message_id,
             )
             return
+        if not await self.provider_limiter.allow(str(message.from_user.id)):
+            await state.clear()
+            await self._edit_flow_panel(
+                message,
+                flow_data,
+                "⚠ Too many provider requests.\n\nPlease wait a minute and try again.",
+                main_keyboard(),
+            )
+            return
         await state.clear()
         status = await self._edit_flow_panel(
             message,
@@ -477,7 +488,16 @@ class BotHandlers:
             f"🔎 Searching for “{query}”…",
         )
         try:
-            results, errors = await self.core.search(query)
+            results, errors = await self.core.search(
+                query,
+                actor_key=message.from_user.id,
+            )
+        except CapacityExceeded:
+            await status.edit_text(
+                "⌛ Another provider request is already running.\n\nPlease try again shortly.",
+                reply_markup=main_keyboard(),
+            )
+            return
         except Exception:
             LOGGER.exception("Provider search failed")
             await status.edit_text(
@@ -646,6 +666,12 @@ class BotHandlers:
         )
 
     async def select_result(self, callback: CallbackQuery) -> None:
+        if not await self.provider_limiter.allow(str(callback.from_user.id)):
+            await callback.answer(
+                "Too many provider requests. Please wait a minute.",
+                show_alert=True,
+            )
+            return
         await callback.answer()
         parts = (callback.data or "").split(":")
         search_selection_id: str | None = None
@@ -680,7 +706,17 @@ class BotHandlers:
         if callback.message:
             await callback.message.edit_text("⏳ Loading seasons and languages…")
         try:
-            variants = await self.core.variants(payload["provider_id"], payload["url"])
+            variants = await self.core.variants(
+                payload["provider_id"],
+                payload["url"],
+                actor_key=callback.from_user.id,
+            )
+        except CapacityExceeded:
+            await self._error(
+                callback,
+                "Another provider request is already running. Please try again shortly.",
+            )
+            return
         except Exception:
             LOGGER.exception("Variant loading failed")
             await self._error(callback, "This catalogue could not be loaded.")
@@ -765,6 +801,12 @@ class BotHandlers:
         await self._render_variants(callback, selection_id, payload)
 
     async def select_variant(self, callback: CallbackQuery) -> None:
+        if not await self.provider_limiter.allow(str(callback.from_user.id)):
+            await callback.answer(
+                "Too many provider requests. Please wait a minute.",
+                show_alert=True,
+            )
+            return
         await callback.answer()
         parts = (callback.data or "").split(":")
         variant_selection_id: str | None = None
@@ -814,7 +856,14 @@ class BotHandlers:
             catalogue = await self.core.catalogue(
                 str(variant["provider_id"]),
                 str(variant["url"]),
+                actor_key=callback.from_user.id,
             )
+        except CapacityExceeded:
+            await self._error(
+                callback,
+                "Another provider request is already running. Please try again shortly.",
+            )
+            return
         except Exception:
             LOGGER.exception("Catalogue loading failed")
             await self._error(callback, "The episode list could not be loaded.")

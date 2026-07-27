@@ -39,6 +39,25 @@ async def test_whitelist_and_one_time_launch_ticket(tmp_path: Path) -> None:
         await database.close()
 
 
+async def test_bootstrap_does_not_reenable_a_revoked_user(tmp_path: Path) -> None:
+    path = tmp_path / "db.sqlite"
+    database = await database_at(path)
+    try:
+        await database.bootstrap_allowed_user(123)
+        assert await database.is_allowed(123) is True
+        await database.set_allowed(123, False)
+        assert await database.is_allowed(123) is False
+    finally:
+        await database.close()
+
+    restarted = Database(f"sqlite+aiosqlite:///{path.as_posix()}")
+    try:
+        await restarted.initialize((123,))
+        assert await restarted.is_allowed(123) is False
+    finally:
+        await restarted.close()
+
+
 async def test_autoplay_defaults_on_and_persists_per_user(tmp_path: Path) -> None:
     path = tmp_path / "db.sqlite"
     database = await database_at(path)

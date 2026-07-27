@@ -217,3 +217,34 @@ def test_sync_http_client_limits_provider_response_size(
     client = HttpClient(max_response_bytes=64 * 1024)
     with pytest.raises(requests.exceptions.RequestException, match="size limit"):
         client.get("https://provider.example/catalogue")
+
+
+@responses.activate
+def test_sync_http_client_limits_terminal_redirect_response_size() -> None:
+    responses.add(
+        responses.GET,
+        "https://provider.example/redirect",
+        body=b"x" * (70 * 1024),
+        status=302,
+        headers={"Location": "https://provider.example/next"},
+    )
+    client = HttpClient(max_response_bytes=64 * 1024, max_redirects=0)
+
+    with pytest.raises(requests.exceptions.RequestException, match="size limit"):
+        client.get("https://provider.example/redirect")
+
+
+@responses.activate
+def test_sync_http_client_preserves_small_terminal_redirect_response() -> None:
+    responses.add(
+        responses.GET,
+        "https://provider.example/redirect",
+        body=b"redirect unavailable",
+        status=302,
+    )
+    client = HttpClient(max_response_bytes=64 * 1024)
+
+    response = client.get("https://provider.example/redirect")
+
+    assert response.status_code == 302
+    assert response.content == b"redirect unavailable"

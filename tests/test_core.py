@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import asyncio
+import threading
+
+import pytest
+
 from anistream.models import Catalogue, EmbedCandidate, Episode, MediaLanguage
 from anistream_telegram.core import (
     CoreService,
     catalogue_from_payload,
     catalogue_payload,
 )
+from anistream_telegram.limits import CapacityExceeded, CapacityLimiter
 
 
 def test_catalogue_round_trip_preserves_provider_candidates() -> None:
@@ -46,3 +52,28 @@ def test_registered_providers_receive_stable_anonymous_aliases() -> None:
     assert service._with_provider_alias(
         {"provider_id": service.providers.providers[0].id}
     )["provider_alias"] == "Provider 1"
+
+
+async def test_core_rejects_concurrent_provider_work_for_same_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = CoreService()
+    service.provider_capacity = CapacityLimiter(total_limit=1, per_key_limit=1)
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_search(query: str):
+        started.set()
+        release.wait(timeout=5)
+        return [], []
+
+    monkeypatch.setattr(service.providers, "search", blocking_search)
+    first = asyncio.create_task(service.search("first", actor_key=123))
+    try:
+        assert await asyncio.to_thread(started.wait, 2) is True
+        with pytest.raises(CapacityExceeded):
+            await service.search("second", actor_key=123)
+    finally:
+        release.set()
+
+    assert await first == ([], [])
