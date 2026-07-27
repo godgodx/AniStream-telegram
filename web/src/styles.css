@@ -26,7 +26,8 @@ body {
 }
 
 button,
-video {
+video,
+select {
   font: inherit;
 }
 
@@ -214,6 +215,54 @@ video {
   text-align: center;
 }
 
+.stream-controls {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.stream-controls[hidden],
+.stream-controls label[hidden] {
+  display: none;
+}
+
+.stream-controls label {
+  min-width: 0;
+  padding: 10px 12px 12px;
+  border: 1px solid color-mix(in srgb, var(--tg-theme-hint-color, #9ba4b5) 18%, transparent);
+  border-radius: 14px;
+  background: var(--tg-theme-secondary-bg-color, #151b27);
+}
+
+.stream-controls label > span {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--tg-theme-hint-color, #9ba4b5);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.stream-controls select {
+  width: 100%;
+  min-height: 40px;
+  padding: 7px 10px;
+  border: 1px solid color-mix(in srgb, var(--tg-theme-button-color, #8b5cf6) 32%, transparent);
+  border-radius: 10px;
+  outline: none;
+  color: var(--tg-theme-text-color, #f5f7fb);
+  background: color-mix(in srgb, var(--tg-theme-bg-color, #0c1018) 82%, black);
+  color-scheme: dark;
+  cursor: pointer;
+}
+
+.stream-controls select:focus-visible {
+  border-color: var(--tg-theme-button-color, #8b5cf6);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--tg-theme-button-color, #8b5cf6) 24%, transparent);
+}
+
 .loading {
   position: absolute;
   z-index: 3;
@@ -317,6 +366,10 @@ video {
 
   .episode-controls {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .stream-controls {
+    grid-template-columns: 1fr;
   }
 
   #autoplay-status {

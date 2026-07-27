@@ -59,6 +59,21 @@
         <button id="next" type="button">Next episode →</button>
       </section>
 
+      <section id="stream-controls" class="stream-controls" aria-label="Playback options" hidden>
+        <label id="quality-control" hidden>
+          <span>Quality</span>
+          <select id="quality-picker" aria-label="Video quality"></select>
+        </label>
+        <label id="audio-control" hidden>
+          <span>Audio</span>
+          <select id="audio-picker" aria-label="Audio language"></select>
+        </label>
+        <label id="subtitle-control" hidden>
+          <span>Subtitles</span>
+          <select id="subtitle-picker" aria-label="Subtitle language"></select>
+        </label>
+      </section>
+
       <section class="details">
         <div>
           <span class="label">Episode</span>

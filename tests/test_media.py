@@ -116,3 +116,39 @@ async def test_cast_hls_playlist_propagates_grant_and_cors(tmp_path: Path) -> No
     assert "cast=cast-grant" in response.text
     assert response.headers["Access-Control-Allow-Origin"] == "*"
     assert "Range" in response.headers["Access-Control-Allow-Headers"]
+
+
+async def test_hls_audio_and_subtitle_tracks_are_rewritten(tmp_path: Path) -> None:
+    database = Database(config(tmp_path).database_url)
+    gateway = MediaGateway(config(tmp_path), database)
+    playback = PlaybackSession(
+        id="playback-id",
+        telegram_user_id=123,
+        catalogue_payload={},
+        episode=1,
+        media_url="https://cdn.example/master.m3u8",
+        media_headers={},
+        media_kind="hls",
+        source_name="Test",
+        expires_at=utcnow() + timedelta(minutes=10),
+    )
+    upstream = FakeResponse(
+        (
+            b"#EXTM3U\n"
+            b'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",'
+            b'URI="audio/en.m3u8"\n'
+            b'#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="French",'
+            b'URI="subs/fr.m3u8"\n'
+            b'#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1920x1080,'
+            b'AUDIO="audio",SUBTITLES="subs"\n'
+            b"video/1080p.m3u8\n"
+        ),
+        "https://cdn.example/path/master.m3u8",
+    )
+
+    response = await gateway._playlist_response(playback, upstream, str(upstream.url))
+
+    assert "audio/en.m3u8" not in response.text
+    assert "subs/fr.m3u8" not in response.text
+    assert "video/1080p.m3u8" not in response.text
+    assert len(re.findall(r"/media/playback-id/resource", response.text)) == 3

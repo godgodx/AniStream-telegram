@@ -17,6 +17,13 @@ const episodePickerShell = document.querySelector("#episode-picker-shell");
 const episodePicker = document.querySelector("#episode-picker");
 const castButton = document.querySelector("#cast");
 const castStatus = document.querySelector("#cast-status");
+const streamControls = document.querySelector("#stream-controls");
+const qualityControl = document.querySelector("#quality-control");
+const qualityPicker = document.querySelector("#quality-picker");
+const audioControl = document.querySelector("#audio-control");
+const audioPicker = document.querySelector("#audio-picker");
+const subtitleControl = document.querySelector("#subtitle-control");
+const subtitlePicker = document.querySelector("#subtitle-picker");
 
 let csrfToken = "";
 let playbackId = "";
@@ -27,6 +34,9 @@ let lastSavedAt = 0;
 let lastSavedPlaybackId = "";
 let completed = false;
 let changingEpisode = false;
+let preferredQualityHeight = 0;
+let preferredAudio = "";
+let preferredSubtitle = "";
 
 let googleCastReady = false;
 let castContext = null;
@@ -135,11 +145,129 @@ function googleCastConnected() {
   );
 }
 
+function option(value, label) {
+  const item = document.createElement("option");
+  item.value = String(value);
+  item.textContent = label;
+  return item;
+}
+
+function trackLabel(track, fallback) {
+  return (
+    String(track?.name || track?.label || track?.lang || track?.language || "").trim() ||
+    fallback
+  );
+}
+
+function refreshStreamControls() {
+  streamControls.hidden =
+    qualityControl.hidden && audioControl.hidden && subtitleControl.hidden;
+}
+
+function resetStreamControls() {
+  qualityControl.hidden = true;
+  audioControl.hidden = true;
+  subtitleControl.hidden = true;
+  qualityPicker.replaceChildren();
+  audioPicker.replaceChildren();
+  subtitlePicker.replaceChildren();
+  refreshStreamControls();
+}
+
+function updateQualityOptions(levels = []) {
+  const usable = levels
+    .map((level, index) => ({ level, index }))
+    .filter(({ level }) => Number(level?.height) > 0 || Number(level?.bitrate) > 0);
+  if (usable.length <= 1 || !hls) {
+    qualityControl.hidden = true;
+    refreshStreamControls();
+    return;
+  }
+  const options = document.createDocumentFragment();
+  options.append(option("-1", "Auto"));
+  for (const { level, index } of usable) {
+    const height = Number(level.height) || 0;
+    const bitrate = Math.round((Number(level.bitrate) || 0) / 1000);
+    const label = height ? `${height}p` : `${bitrate} kbps`;
+    options.append(option(index, label));
+  }
+  qualityPicker.replaceChildren(options);
+  const preferred = usable.find(
+    ({ level }) => Number(level.height) === preferredQualityHeight,
+  );
+  qualityPicker.value = preferred ? String(preferred.index) : "-1";
+  hls.currentLevel = preferred ? preferred.index : -1;
+  qualityControl.hidden = false;
+  refreshStreamControls();
+}
+
+function updateAudioOptions(tracks = [], native = false) {
+  if (tracks.length <= 1) {
+    audioControl.hidden = true;
+    refreshStreamControls();
+    return;
+  }
+  const options = document.createDocumentFragment();
+  let selectedIndex = 0;
+  tracks.forEach((track, index) => {
+    const label = trackLabel(track, `Audio ${index + 1}`);
+    options.append(option(index, label));
+    if (preferredAudio && label === preferredAudio) selectedIndex = index;
+  });
+  audioPicker.replaceChildren(options);
+  audioPicker.value = String(selectedIndex);
+  if (native) {
+    tracks.forEach((track, index) => {
+      track.enabled = index === selectedIndex;
+    });
+  } else if (hls) {
+    hls.audioTrack = selectedIndex;
+  }
+  preferredAudio = trackLabel(tracks[selectedIndex], `Audio ${selectedIndex + 1}`);
+  audioControl.hidden = false;
+  refreshStreamControls();
+}
+
+function updateSubtitleOptions(tracks = [], native = false) {
+  if (!tracks.length) {
+    subtitleControl.hidden = true;
+    refreshStreamControls();
+    return;
+  }
+  const options = document.createDocumentFragment();
+  options.append(option("-1", "Off"));
+  let selectedIndex = -1;
+  tracks.forEach((track, index) => {
+    const label = trackLabel(track, `Subtitles ${index + 1}`);
+    options.append(option(index, label));
+    if (preferredSubtitle && label === preferredSubtitle) selectedIndex = index;
+  });
+  subtitlePicker.replaceChildren(options);
+  subtitlePicker.value = String(selectedIndex);
+  if (native) {
+    tracks.forEach((track, index) => {
+      track.mode = index === selectedIndex ? "showing" : "disabled";
+    });
+  } else if (hls) {
+    hls.subtitleTrack = selectedIndex;
+  }
+  subtitleControl.hidden = false;
+  refreshStreamControls();
+}
+
+function updateNativeTrackOptions() {
+  const audioTracks = video.audioTracks ? Array.from(video.audioTracks) : [];
+  const textTracks = video.textTracks ? Array.from(video.textTracks) : [];
+  updateAudioOptions(audioTracks, true);
+  updateSubtitleOptions(textTracks, true);
+}
+
 function teardownPlayer() {
   playerEvents?.abort();
   playerEvents = null;
   hls?.destroy();
   hls = null;
+  resetStreamControls();
   video.pause();
   video.removeAttribute("src");
   video.load();
@@ -221,6 +349,24 @@ function attachPlayer(info, { autoplay = false } = {}) {
     });
     hls.loadSource(streamUrl);
     hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
+      updateQualityOptions(data.levels || hls.levels || []);
+      updateAudioOptions(hls.audioTracks || []);
+      updateSubtitleOptions(hls.subtitleTracks || []);
+    });
+    hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, (_, data) => {
+      updateAudioOptions(data.audioTracks || hls.audioTracks || []);
+    });
+    hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, (_, data) => {
+      updateSubtitleOptions(data.subtitleTracks || hls.subtitleTracks || []);
+    });
+    hls.on(Hls.Events.LEVEL_SWITCHED, (_, data) => {
+      if (hls.autoLevelEnabled) {
+        qualityPicker.value = "-1";
+      } else if (Number.isInteger(data.level)) {
+        qualityPicker.value = String(data.level);
+      }
+    });
     hls.on(Hls.Events.ERROR, (_, data) => {
       if (data.fatal && !changingEpisode) {
         showError("The stream stopped. Try another episode or reopen it from the bot.");
@@ -242,6 +388,9 @@ function attachPlayer(info, { autoplay = false } = {}) {
         video.currentTime = info.start_position;
       }
       resumeApplied = true;
+      if (!useHls || !Hls?.isSupported()) {
+        updateNativeTrackOptions();
+      }
       loading.hidden = true;
       if (autoplay && !googleCastConnected()) {
         void video.play().catch(() => {
@@ -600,6 +749,52 @@ episodePicker.addEventListener("change", () => {
   if (currentInfo && target !== currentInfo.episode) {
     void changeEpisode(target, { autoplay: true });
   }
+});
+
+qualityPicker.addEventListener("change", () => {
+  if (!hls) return;
+  const level = Number(qualityPicker.value);
+  if (!Number.isInteger(level) || level < -1 || level >= hls.levels.length) return;
+  hls.currentLevel = level;
+  preferredQualityHeight =
+    level >= 0 ? Number(hls.levels[level]?.height) || 0 : 0;
+});
+
+audioPicker.addEventListener("change", () => {
+  const index = Number(audioPicker.value);
+  if (!Number.isInteger(index) || index < 0) return;
+  if (hls && index < hls.audioTracks.length) {
+    hls.audioTrack = index;
+    preferredAudio = trackLabel(hls.audioTracks[index], `Audio ${index + 1}`);
+    return;
+  }
+  const tracks = video.audioTracks ? Array.from(video.audioTracks) : [];
+  if (index >= tracks.length) return;
+  tracks.forEach((track, trackIndex) => {
+    track.enabled = trackIndex === index;
+  });
+  preferredAudio = trackLabel(tracks[index], `Audio ${index + 1}`);
+});
+
+subtitlePicker.addEventListener("change", () => {
+  const index = Number(subtitlePicker.value);
+  if (!Number.isInteger(index) || index < -1) return;
+  if (hls) {
+    if (index >= hls.subtitleTracks.length) return;
+    hls.subtitleTrack = index;
+    preferredSubtitle =
+      index >= 0
+        ? trackLabel(hls.subtitleTracks[index], `Subtitles ${index + 1}`)
+        : "";
+    return;
+  }
+  const tracks = video.textTracks ? Array.from(video.textTracks) : [];
+  if (index >= tracks.length) return;
+  tracks.forEach((track, trackIndex) => {
+    track.mode = trackIndex === index ? "showing" : "disabled";
+  });
+  preferredSubtitle =
+    index >= 0 ? trackLabel(tracks[index], `Subtitles ${index + 1}`) : "";
 });
 
 castButton.addEventListener("click", async () => {

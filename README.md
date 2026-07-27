@@ -7,7 +7,7 @@
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![Telegram Mini App](https://img.shields.io/badge/Telegram-Mini%20App-26A5E4?logo=telegram&logoColor=white)](https://core.telegram.org/bots/webapps)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Providers: 2](https://img.shields.io/badge/providers-2-7c3aed)](#supported-providers)
+[![Providers: 3](https://img.shields.io/badge/providers-3-7c3aed)](#supported-providers)
 
 </div>
 
@@ -57,6 +57,9 @@ workflow.
 - **Series controls** — move to the previous, next, or any specific episode and
   optionally start the next episode after normal completion. Autoplay is enabled
   by default and stored per Telegram account.
+- **Adaptive playback controls** — HLS streams expose quality, audio-language,
+  and subtitle selectors when the upstream playlist actually supplies those
+  choices. Single-quality MP4 streams keep the controls hidden.
 - **TV playback** — expose Google Cast, AirPlay, or Remote Playback when the
   current Telegram client or external browser supports it.
 - **Hardened outbound networking** — block credentials, unsafe ports,
@@ -72,20 +75,25 @@ workflow.
 | --- | :---: | :---: | :---: | :---: | :---: |
 | [Anime-Sama](https://anime-sama.to/) | Yes | Yes | — | Yes | Yes |
 | [French Stream](https://french-stream.one/) | Yes | Yes | Yes | Yes | Yes |
+| [CineHD](https://cinehd.app/) | Yes | Yes | Yes | Yes | Yes |
 
 Anime-Sama exposes provider-native variants such as VF and VOSTFR. French
 Stream exposes movie and series variants including French/VF, VOSTFR,
 TrueFrench/VFF, VFQ, and VO/VOSTENG when supplied by the selected title.
+CineHD is intentionally limited to a small compatible subset of its current
+French (France) and English (US) readers. Titles or seasons without one of
+those verified reader routes are omitted instead of opening a known-broken
+source. Reader availability remains title-dependent.
 
 These integration names are documented for maintainers, but the Telegram
 interface exposes only stable aliases based on registration order:
-`Provider 1`, `Provider 2`, and so on. Long titles are shortened before the
+`Provider 1`, `Provider 2`, `Provider 3`, and so on. Long titles are shortened before the
 alias, so the provider choice always remains visible.
 
 The resolver layer recognizes direct media plus embeds served through
 Embed4me, Sendvid, Sibnet, Vidmoly, Vidzy, OneUpload, Uqload, Smoothpre,
-Movearnpre, Mivalyo, and Dingtezuni. Third-party availability can change
-without notice.
+Movearnpre, Mivalyo, Dingtezuni, and the narrow Frembed reader redirects used
+by the CineHD integration. Third-party availability can change without notice.
 
 ## Requirements
 
@@ -232,6 +240,12 @@ when the page closes. Series expose an episode selector plus previous/next
 controls. They advance automatically after the current episode finishes when
 the user's per-account autoplay setting is enabled.
 
+For HLS masters, the player also discovers available renditions, alternate
+audio tracks, and subtitle tracks after the manifest loads. Quality defaults
+to adaptive mode. Audio and subtitle controls appear only when selectable
+tracks exist; unsupported native HLS implementations and single-file MP4
+sources continue to use their platform controls.
+
 ### TV playback
 
 The Cast button chooses the best mechanism available:
@@ -287,7 +301,9 @@ Important configuration:
 not provider catalogue pages. When empty, public media hosts are accepted while
 private and reserved addresses remain blocked. After representative production
 plays, inventory every master, rendition, key, and segment hostname before
-enforcing a strict list.
+enforcing a strict list. CineHD's compatible reader currently resolves through
+Uqload-family embed hosts, but the final CDN hostname must still be inventoried
+from successful production playback before enabling the strict allowlist.
 
 Runtime databases, environment files, cookies, generated frontend assets,
 virtual environments, and caches are ignored by Git. Treat `.env` and the
