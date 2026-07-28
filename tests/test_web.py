@@ -102,6 +102,13 @@ def test_mini_app_defers_saved_resume_until_media_is_seekable() -> None:
     assert script.index("loading.hidden = true;", script.index("const finishPlayerReady")) < (
         script.index("if (playerReadyHandled) return;", script.index("const finishPlayerReady"))
     )
+    pagehide = script.index('window.addEventListener("pagehide"')
+    assert script.index("if (event.persisted) return;", pagehide) < script.index(
+        "hls?.destroy()",
+        pagehide,
+    )
+    assert 'window.addEventListener("pageshow"' in script
+    assert "resumeAfterBfcacheRestore" in script
     assert 'api("/api/session")' in script
 
 

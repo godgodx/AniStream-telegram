@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 from sqlalchemy import event, select
 from sqlalchemy.dialects import postgresql
 
-from anistream_telegram.database import Database, SchemaMigration
+from anistream_telegram.database import (
+    POSTGRES_MIGRATION_LOCK_ID,
+    Database,
+    SchemaMigration,
+    acquire_schema_migration_lock,
+)
 
 
 def catalogue() -> dict:
@@ -59,6 +66,20 @@ async def test_schema_versions_are_recorded_and_idempotent(tmp_path: Path) -> No
             ) == [1, 2, 3, 4]
     finally:
         await database.close()
+
+
+def test_postgresql_migrations_take_a_transaction_advisory_lock() -> None:
+    statements: list[str] = []
+    connection = SimpleNamespace(
+        dialect=SimpleNamespace(name="postgresql"),
+        exec_driver_sql=statements.append,
+    )
+
+    acquire_schema_migration_lock(connection)
+
+    assert statements == [
+        f"SELECT pg_advisory_xact_lock({POSTGRES_MIGRATION_LOCK_ID})"
+    ]
 
 
 async def test_whitelist_and_one_time_launch_ticket(tmp_path: Path) -> None:
@@ -541,12 +562,85 @@ async def test_old_playback_generation_cannot_overwrite_new_player(
         await database.close()
 
 
+async def test_stale_player_cannot_recreate_a_removed_continue_entry(
+    tmp_path: Path,
+) -> None:
+    database = await database_at(tmp_path / "db.sqlite")
+    try:
+        playback = await database.create_playback(
+            123,
+            catalogue(),
+            6,
+            media_url="https://cdn.example/old.mp4",
+            media_headers={},
+            media_kind="mp4",
+            source_name="Old",
+            ttl_seconds=600,
+        )
+        await database.record_progress(
+            123,
+            catalogue(),
+            6,
+            300,
+            1500,
+            False,
+        )
+        assert await database.remove_from_continue_watching(
+            123,
+            catalogue(),
+        )
+
+        accepted = await database.record_progress(
+            123,
+            catalogue(),
+            6,
+            400,
+            1500,
+            False,
+            observed_at_ms=4_000,
+            event_sequence=2,
+            playback_id=playback.id,
+            playback_generation=playback.generation,
+        )
+
+        assert accepted is False
+        assert await database.continue_watching(123) == []
+    finally:
+        await database.close()
+
+
 def test_progress_locks_active_generation_for_the_postgresql_transaction() -> None:
     statement = Database._active_playback_for_update(123, "identity")
     sql = str(statement.compile(dialect=postgresql.dialect()))
 
     assert "FROM active_playbacks" in sql
     assert "FOR UPDATE" in sql
+
+
+async def test_progress_uses_the_remove_restart_lock_order() -> None:
+    statements: list[str] = []
+
+    class RecordingSession:
+        async def scalar(self, statement: Any) -> Any:
+            sql = str(statement.compile(dialect=postgresql.dialect()))
+            statements.append(sql)
+            if "FROM watch_states" in sql:
+                return SimpleNamespace()
+            return None
+
+    state, active = await Database._lock_playback_progress_scope(
+        RecordingSession(),  # type: ignore[arg-type]
+        123,
+        "identity",
+    )
+
+    assert state is not None
+    assert active is None
+    assert len(statements) == 2
+    assert "FROM watch_states" in statements[0]
+    assert "FOR UPDATE" in statements[0]
+    assert "FROM active_playbacks" in statements[1]
+    assert "FOR UPDATE" in statements[1]
 
 
 async def test_remove_continue_entry_is_user_scoped_and_clears_episode_progress(

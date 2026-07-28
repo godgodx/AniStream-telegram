@@ -56,6 +56,7 @@ let nextPrefetchRetryAt = 0;
 let localResumePending = false;
 let localResumeTarget = 0;
 let playerRecoveryState = null;
+let resumeAfterBfcacheRestore = false;
 
 performance.mark?.("anistream-init");
 
@@ -1666,7 +1667,13 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 
-window.addEventListener("pagehide", () => {
+window.addEventListener("pagehide", (event) => {
+  resumeAfterBfcacheRestore = Boolean(
+    event.persisted &&
+      (googleCastConnected()
+        ? remotePlayer?.isMediaLoaded && !remotePlayer?.isPaused
+        : !video.paused),
+  );
   if (!completed) {
     if (googleCastConnected() && remotePlayer?.isMediaLoaded) {
       if (
@@ -1686,9 +1693,45 @@ window.addEventListener("pagehide", () => {
       void saveProgress(true, false, null, null, playbackId, true);
     }
   }
+  // BFCache freezes and later restores this exact page. Destroying HLS or its
+  // AbortController here leaves a visible but inert player after back/forward.
+  if (event.persisted) return;
   if (castProgressTimer) window.clearInterval(castProgressTimer);
+  castProgressTimer = null;
   playerEvents?.abort();
+  playerEvents = null;
   hls?.destroy();
+  hls = null;
+});
+
+window.addEventListener("pageshow", (event) => {
+  if (!event.persisted) return;
+  void refreshAutoplayPreference();
+  if (!currentInfo || googleCastConnected()) return;
+
+  const resume = reliablePlaybackPosition();
+  const hlsExpected = currentInfo.kind === "hls" && Hls?.isSupported();
+  if (!playerEvents || (hlsExpected && !hls)) {
+    attachPlayer(
+      { ...currentInfo, start_position: resume.position },
+      { autoplay: resumeAfterBfcacheRestore },
+    );
+    return;
+  }
+  if (hlsExpected && hls) {
+    try {
+      hls.startLoad(Math.max(0, resume.position));
+    } catch {
+      attachPlayer(
+        { ...currentInfo, start_position: resume.position },
+        { autoplay: resumeAfterBfcacheRestore },
+      );
+      return;
+    }
+  }
+  if (resumeAfterBfcacheRestore) {
+    void video.play().catch(() => {});
+  }
 });
 
 resetStreamControls();

@@ -355,6 +355,34 @@ async def test_cancelled_resolver_workers_are_terminated_and_reaped(
         await service.close()
 
 
+async def test_close_waits_for_resolver_owners_before_closing_processes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = CoreService()
+    monkeypatch.setattr(
+        core_module,
+        "_resolver_process_entry",
+        _blocking_resolver_process,
+    )
+    resolution = asyncio.create_task(
+        service._resolve_candidate("https://cdn.example/video.mp4")
+    )
+    for _ in range(100):
+        if service._resolver_processes:
+            break
+        await asyncio.sleep(0.01)
+    assert service._resolver_processes
+
+    await service.close()
+
+    with pytest.raises(asyncio.CancelledError):
+        await resolution
+    assert service._resolver_processes == set()
+    assert service._resolver_tasks == set()
+    with pytest.raises(RuntimeError, match="closing"):
+        await service._resolve_candidate("https://cdn.example/video.mp4")
+
+
 class ProbeResponse:
     def __init__(
         self,

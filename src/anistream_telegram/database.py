@@ -279,6 +279,16 @@ SCHEMA_MIGRATIONS = (
     (3, "active playback generations"),
     (4, "per-playback progress cursors"),
 )
+POSTGRES_MIGRATION_LOCK_ID = 4_712_958_475_264_321_857
+
+
+def acquire_schema_migration_lock(connection: Any) -> None:
+    """Serialize schema adoption across concurrently starting PostgreSQL replicas."""
+
+    if connection.dialect.name == "postgresql":
+        connection.exec_driver_sql(
+            f"SELECT pg_advisory_xact_lock({POSTGRES_MIGRATION_LOCK_ID})"
+        )
 
 
 def apply_schema_migrations(connection: Any) -> None:
@@ -289,6 +299,7 @@ def apply_schema_migrations(connection: Any) -> None:
     also makes a fresh database current in one pass.
     """
 
+    acquire_schema_migration_lock(connection)
     SchemaMigration.__table__.create(connection, checkfirst=True)
     applied = set(
         connection.execute(select(SchemaMigration.version)).scalars()
@@ -1013,6 +1024,39 @@ class Database:
             .with_for_update()
         )
 
+    @staticmethod
+    def _watch_state_for_update(
+        user_id: int,
+        identity: str,
+    ) -> Any:
+        return (
+            select(WatchState)
+            .where(
+                WatchState.telegram_user_id == user_id,
+                WatchState.identity_hash == identity,
+            )
+            .with_for_update()
+        )
+
+    @classmethod
+    async def _lock_playback_progress_scope(
+        cls,
+        session: AsyncSession,
+        user_id: int,
+        identity: str,
+    ) -> tuple[WatchState | None, ActivePlayback | None]:
+        """Lock progress rows in the same order as remove/restart operations."""
+
+        state = await session.scalar(
+            cls._watch_state_for_update(user_id, identity)
+        )
+        if state is None:
+            return None, None
+        active = await session.scalar(
+            cls._active_playback_for_update(user_id, identity)
+        )
+        return state, active
+
     async def record_progress(
         self,
         user_id: int,
@@ -1034,16 +1078,37 @@ class Database:
         episode = max(1, min(total, int(episode)))
         now = utcnow()
         async with self.sessions.begin() as session:
+            state_insert = self._insert_do_nothing(
+                session,
+                WatchState,
+                {
+                    "telegram_user_id": user_id,
+                    "provider_id": provider_id,
+                    "catalogue_url": catalogue_url,
+                    "identity_hash": identity,
+                    "catalogue_payload": catalogue_payload,
+                    "next_episode": episode,
+                    "last_played_episode": episode,
+                    "status": "in_progress",
+                    "updated_at": now,
+                },
+                ("telegram_user_id", "identity_hash"),
+            ).returning(WatchState.id)
+            inserted_state = (await session.scalar(state_insert)) is not None
+            state: WatchState | None
             if playback_id is not None:
-                # Keep the active generation stable until the progress write
-                # commits. Without this row lock PostgreSQL can interleave a
-                # newer playback activation after this check but before the
-                # old player's EpisodeProgress update.
-                active = await session.scalar(
-                    self._active_playback_for_update(user_id, identity)
+                # remove/restart lock WatchState before deleting
+                # ActivePlayback. Use the same order here to avoid a
+                # PostgreSQL deadlock while retaining the generation lock
+                # until the progress transaction commits.
+                state, active = await self._lock_playback_progress_scope(
+                    session,
+                    user_id,
+                    identity,
                 )
                 if (
-                    active is None
+                    state is None
+                    or active is None
                     or active.playback_id != playback_id
                     or (
                         playback_generation is not None
@@ -1051,33 +1116,16 @@ class Database:
                     )
                     or active.episode != episode
                 ):
+                    # A stale player may race just after "remove". If this
+                    # transaction provisionally recreated the missing state,
+                    # undo it before accepting the rejection.
+                    if inserted_state and state is not None:
+                        await session.delete(state)
                     return False
-            await session.execute(
-                self._insert_do_nothing(
-                    session,
-                    WatchState,
-                    {
-                        "telegram_user_id": user_id,
-                        "provider_id": provider_id,
-                        "catalogue_url": catalogue_url,
-                        "identity_hash": identity,
-                        "catalogue_payload": catalogue_payload,
-                        "next_episode": episode,
-                        "last_played_episode": episode,
-                        "status": "in_progress",
-                        "updated_at": now,
-                    },
-                    ("telegram_user_id", "identity_hash"),
+            else:
+                state = await session.scalar(
+                    self._watch_state_for_update(user_id, identity)
                 )
-            )
-            state = await session.scalar(
-                select(WatchState)
-                .where(
-                    WatchState.telegram_user_id == user_id,
-                    WatchState.identity_hash == identity,
-                )
-                .with_for_update()
-            )
             if state is None:  # pragma: no cover - insert/select invariant.
                 raise RuntimeError("watch state could not be created")
 
@@ -1284,12 +1332,7 @@ class Database:
         _, _, identity = self.catalogue_identity(catalogue_payload)
         async with self.sessions.begin() as session:
             state = await session.scalar(
-                select(WatchState)
-                .where(
-                    WatchState.telegram_user_id == user_id,
-                    WatchState.identity_hash == identity,
-                )
-                .with_for_update()
+                self._watch_state_for_update(user_id, identity)
             )
             if state is None:
                 return False
@@ -1322,12 +1365,7 @@ class Database:
         _, _, identity = self.catalogue_identity(catalogue_payload)
         async with self.sessions.begin() as session:
             state = await session.scalar(
-                select(WatchState)
-                .where(
-                    WatchState.telegram_user_id == user_id,
-                    WatchState.identity_hash == identity,
-                )
-                .with_for_update()
+                self._watch_state_for_update(user_id, identity)
             )
             if state is None:
                 return False

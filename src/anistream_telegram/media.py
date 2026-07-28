@@ -36,6 +36,7 @@ from anistream_telegram.source_health import SourceHealthTracker
 
 LOGGER = logging.getLogger(__name__)
 RANGE_PATTERN = re.compile(r"^bytes=\d*-\d*$")
+CONTENT_RANGE_PATTERN = re.compile(r"^bytes\s+(\d+)-(\d+)/(?:\d+|\*)$", re.IGNORECASE)
 URI_ATTRIBUTE = re.compile(r'URI="([^"]+)"')
 PLAYLIST_TYPES = {
     "application/vnd.apple.mpegurl",
@@ -61,6 +62,41 @@ PLAYBACK_SESSION_IDLE_SECONDS = 30
 PROBE_MEDIA_BYTES = 64 * 1024
 COLD_HLS_PROBE_SECONDS = 4.0
 TRANSIENT_UPSTREAM_STATUSES = {502, 503, 504}
+
+
+def expected_stream_bytes(status: int, headers: Any) -> int | None:
+    """Return the exact advertised body size, rejecting contradictory headers."""
+
+    content_length: int | None = None
+    raw_length = str(headers.get("Content-Length", "")).strip()
+    if raw_length:
+        try:
+            content_length = int(raw_length)
+        except ValueError as exc:
+            raise ValueError("invalid upstream Content-Length") from exc
+        if not 0 <= content_length <= 9_223_372_036_854_775_807:
+            raise ValueError("invalid upstream Content-Length")
+
+    range_length: int | None = None
+    raw_range = str(headers.get("Content-Range", "")).strip()
+    if raw_range:
+        match = CONTENT_RANGE_PATTERN.fullmatch(raw_range)
+        if match is None:
+            raise ValueError("invalid upstream Content-Range")
+        start, end = (int(value) for value in match.groups())
+        if end < start:
+            raise ValueError("invalid upstream Content-Range")
+        range_length = end - start + 1
+    elif status == 206:
+        raise ValueError("partial upstream response is missing Content-Range")
+
+    if (
+        content_length is not None
+        and range_length is not None
+        and content_length != range_length
+    ):
+        raise ValueError("upstream length headers disagree")
+    return content_length if content_length is not None else range_length
 
 
 @dataclass(slots=True)
@@ -545,6 +581,12 @@ class MediaGateway:
                 )
                 try:
                     if upstream.status not in {200, 206}:
+                        failed_url = str(upstream.url or target)
+                        self.source_health.observe(
+                            failed_url,
+                            latency_seconds=time.monotonic() - request_started,
+                            success=False,
+                        )
                         raise web.HTTPBadGateway(
                             text=f"Upstream media returned HTTP {upstream.status}"
                         )
@@ -716,6 +758,15 @@ class MediaGateway:
         request_started: float | None = None,
         measure_startup: bool = True,
     ) -> web.StreamResponse:
+        try:
+            expected_bytes = expected_stream_bytes(
+                upstream.status,
+                upstream.headers,
+            )
+        except ValueError as exc:
+            raise web.HTTPBadGateway(
+                text="Upstream media returned invalid length metadata"
+            ) from exc
         headers: dict[str, str] = {
             "Cache-Control": "private, max-age=30",
             "X-Content-Type-Options": "nosniff",
@@ -779,13 +830,25 @@ class MediaGateway:
                     break
         finally:
             upstream.release()
-        if first_resource and target_url:
+        if (
+            not client_disconnected
+            and expected_bytes is not None
+            and transferred != expected_bytes
+        ):
+            upstream_failed = True
+            LOGGER.info(
+                "Upstream body length mismatch playback=%s expected=%s received=%s",
+                playback_id,
+                expected_bytes,
+                transferred,
+            )
+        if target_url and (first_resource or upstream_failed):
             finished = time.monotonic()
-            if client_disconnected:
-                # A seek/source switch is not evidence that the CDN failed.
-                # Let the next actual segment become the startup measurement.
+            if first_resource and (client_disconnected or upstream_failed):
+                # A failed/abandoned first segment must not consume the only
+                # startup measurement for this playback.
                 self._first_resource_seen.pop(playback_id, None)
-            else:
+            if not client_disconnected:
                 self.source_health.observe(
                     target_url,
                     latency_seconds=(
@@ -806,7 +869,12 @@ class MediaGateway:
                     finished - transfer_started,
                     not upstream_failed,
                 )
-        if not client_disconnected:
+        if upstream_failed and not client_disconnected:
+            # Headers may already have reached Caddy/browser. Closing the
+            # response instead of emitting a clean EOF makes the advertised
+            # length mismatch visible so HLS can retry the segment.
+            response.force_close()
+        elif not client_disconnected:
             try:
                 await response.write_eof()
             except (ConnectionResetError, asyncio.CancelledError):

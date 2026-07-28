@@ -223,6 +223,9 @@ class CoreService:
         # by the four-request provider admission limit.
         self._resolver_slots = asyncio.Semaphore(RESOLVER_PROCESS_LIMIT)
         self._resolver_processes: set[Any] = set()
+        self._resolver_tasks: set[asyncio.Task[Any]] = set()
+        self._resolver_closing = False
+        self._resolver_close_lock = asyncio.Lock()
         self.provider_capacity = CapacityLimiter(
             total_limit=4,
             per_key_limit=1,
@@ -237,45 +240,70 @@ class CoreService:
         self._async_probe = probe
 
     async def close(self) -> None:
-        for process in tuple(self._resolver_processes):
-            self._stop_resolver_process(process)
-        self._resolver_processes.clear()
+        async with self._resolver_close_lock:
+            self._resolver_closing = True
+            current = asyncio.current_task()
+            tasks = tuple(
+                task
+                for task in self._resolver_tasks
+                if task is not current and not task.done()
+            )
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            # Resolver coroutines own their Process objects and close them in
+            # finally. Only reap an orphan after every owner has finished.
+            for process in tuple(self._resolver_processes):
+                self._stop_resolver_process(process)
+            self._resolver_processes.clear()
 
     async def _resolve_candidate(self, url: str) -> ResolvedMedia:
-        async with self._resolver_slots:
-            receive, send = self._resolver_context.Pipe(duplex=False)
-            process = self._resolver_context.Process(
-                target=_resolver_process_entry,
-                args=(
-                    send,
-                    url,
-                    self._resolver_user_agent,
-                    self._resolver_cookie,
-                ),
-                name="anistream-resolver",
-                daemon=True,
-            )
-            try:
-                process.start()
-                send.close()
-                self._resolver_processes.add(process)
-                while process.is_alive():
-                    await asyncio.sleep(0.02)
-                if process.exitcode != 0:
-                    raise RuntimeError(
-                        f"resolver worker exited with code {process.exitcode}"
-                    )
-                if not receive.poll(0.1):
-                    raise RuntimeError("resolver worker returned no result")
-                result = receive.recv()
-                if result[0] == "ok":
-                    return result[1]
-                raise RuntimeError(f"{result[1]}: {result[2]}")
-            finally:
-                send.close()
-                receive.close()
-                self._stop_resolver_process(process)
-                self._resolver_processes.discard(process)
+        owner = asyncio.current_task()
+        if owner is None:  # pragma: no cover - coroutine task invariant.
+            raise RuntimeError("resolver must run inside an asyncio task")
+        self._resolver_tasks.add(owner)
+        try:
+            if self._resolver_closing:
+                raise RuntimeError("resolver service is closing")
+            async with self._resolver_slots:
+                if self._resolver_closing:
+                    raise RuntimeError("resolver service is closing")
+                receive, send = self._resolver_context.Pipe(duplex=False)
+                process = self._resolver_context.Process(
+                    target=_resolver_process_entry,
+                    args=(
+                        send,
+                        url,
+                        self._resolver_user_agent,
+                        self._resolver_cookie,
+                    ),
+                    name="anistream-resolver",
+                    daemon=True,
+                )
+                try:
+                    process.start()
+                    send.close()
+                    self._resolver_processes.add(process)
+                    while process.is_alive():
+                        await asyncio.sleep(0.02)
+                    if process.exitcode != 0:
+                        raise RuntimeError(
+                            f"resolver worker exited with code {process.exitcode}"
+                        )
+                    if not receive.poll(0.1):
+                        raise RuntimeError("resolver worker returned no result")
+                    result = receive.recv()
+                    if result[0] == "ok":
+                        return result[1]
+                    raise RuntimeError(f"{result[1]}: {result[2]}")
+                finally:
+                    send.close()
+                    receive.close()
+                    self._stop_resolver_process(process)
+                    self._resolver_processes.discard(process)
+        finally:
+            self._resolver_tasks.discard(owner)
 
     @staticmethod
     def _stop_resolver_process(process: Any) -> None:

@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import re
+import time
 from contextlib import AsyncExitStack
 from datetime import timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+import anistream_telegram.media as media_module
 from anistream_telegram.config import Config
 from anistream_telegram.database import Database, PlaybackSession, utcnow
 from anistream_telegram.media import (
@@ -20,6 +23,7 @@ from anistream_telegram.media import (
     MAX_REQUESTS_PER_PLAYBACK_SESSION,
     PLAYBACK_SESSION_IDLE_SECONDS,
     MediaGateway,
+    expected_stream_bytes,
 )
 from anistream.models import ResolvedMedia
 
@@ -54,6 +58,55 @@ class ProbeResponse(FakeResponse):
         super().__init__(body, url)
         self.status = status
         self.headers = {"Content-Type": content_type}
+
+
+class StreamingContent:
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = list(chunks)
+
+    async def read(self, _maximum: int) -> bytes:
+        return self.chunks.pop(0) if self.chunks else b""
+
+
+class StreamingUpstream:
+    def __init__(
+        self,
+        *,
+        status: int,
+        headers: dict[str, str],
+        chunks: list[bytes],
+        url: str = "https://cdn.example/segment.ts",
+    ) -> None:
+        self.status = status
+        self.headers = headers
+        self.content = StreamingContent(chunks)
+        self.url = url
+        self.released = False
+
+    def release(self) -> None:
+        self.released = True
+
+
+class DownstreamResponse:
+    def __init__(self, status: int, headers: dict[str, str]) -> None:
+        self.status = status
+        self.headers = headers
+        self.writes: list[bytes] = []
+        self.prepared = False
+        self.eof = False
+        self.force_closed = False
+
+    async def prepare(self, _request) -> None:
+        self.prepared = True
+
+    async def write(self, chunk: bytes) -> None:
+        self.writes.append(chunk)
+
+    async def write_eof(self) -> None:
+        self.eof = True
+
+    def force_close(self) -> None:
+        self.force_closed = True
 
 
 async def test_stream_limit_counts_sessions_not_hls_requests(tmp_path: Path) -> None:
@@ -97,6 +150,96 @@ async def test_idle_playback_session_slots_are_released(tmp_path: Path) -> None:
 
     async with gateway._stream_slot(123, "web:third"):
         pass
+
+
+def test_expected_stream_bytes_rejects_contradictory_range_metadata() -> None:
+    assert expected_stream_bytes(
+        206,
+        {
+            "Content-Length": "100",
+            "Content-Range": "bytes 200-299/1000",
+        },
+    ) == 100
+    with pytest.raises(ValueError, match="disagree"):
+        expected_stream_bytes(
+            206,
+            {
+                "Content-Length": "99",
+                "Content-Range": "bytes 200-299/1000",
+            },
+        )
+
+
+async def test_truncated_segment_is_force_closed_and_penalized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    health = SimpleNamespace(observe=Mock())
+    gateway = MediaGateway(
+        config(tmp_path),
+        Database(config(tmp_path).database_url),
+        health,
+    )
+    upstream = StreamingUpstream(
+        status=200,
+        headers={"Content-Length": "10", "Content-Type": "video/mp2t"},
+        chunks=[b"abc", b""],
+    )
+    # Failures must affect health even after startup already consumed its
+    # first-resource measurement.
+    gateway._first_resource_seen["playback-id"] = time.monotonic()
+    downstream = DownstreamResponse(200, {})
+    monkeypatch.setattr(
+        media_module.web,
+        "StreamResponse",
+        lambda *, status, headers: downstream,
+    )
+
+    response = await gateway._stream_response(
+        SimpleNamespace(),
+        upstream,  # type: ignore[arg-type]
+        playback_id="playback-id",
+        target_url=str(upstream.url),
+        request_started=time.monotonic(),
+    )
+
+    assert response is downstream
+    assert downstream.writes == [b"abc"]
+    assert downstream.force_closed is True
+    assert downstream.eof is False
+    assert upstream.released is True
+    assert health.observe.call_args.kwargs["success"] is False
+
+
+async def test_final_503_penalizes_source_health(
+    tmp_path: Path,
+) -> None:
+    health = SimpleNamespace(observe=Mock())
+    gateway = MediaGateway(
+        config(tmp_path),
+        Database(config(tmp_path).database_url),
+        health,
+    )
+    upstream = StreamingUpstream(
+        status=503,
+        headers={},
+        chunks=[],
+    )
+    gateway.upstream.request = AsyncMock(return_value=upstream)
+
+    with pytest.raises(web.HTTPBadGateway) as error:
+        await gateway._serve_target(
+            SimpleNamespace(headers={}),
+            123,
+            SimpleNamespace(id="playback-id", media_headers={}),
+            str(upstream.url),
+            force_playlist=False,
+            session_key="web:test",
+        )
+
+    assert "503" in error.value.text
+    assert upstream.released is True
+    assert health.observe.call_args.kwargs["success"] is False
 
 
 def config(tmp_path: Path) -> Config:
