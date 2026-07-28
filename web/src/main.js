@@ -26,6 +26,9 @@ const streamControls = document.querySelector("#stream-controls");
 const qualityPicker = document.querySelector("#quality-picker");
 const audioPicker = document.querySelector("#audio-picker");
 const subtitlePicker = document.querySelector("#subtitle-picker");
+const NEXT_PREFETCH_WINDOW_SECONDS = 5 * 60;
+const PREFETCH_EXPIRY_MARGIN_MS = 30_000;
+const PREFETCH_RETRY_DELAY_MS = 60_000;
 
 let csrfToken = "";
 let playbackId = "";
@@ -42,10 +45,13 @@ let preferredAudio = "";
 let preferredSubtitle = "";
 let streamControlsExpanded = false;
 let prefetchedNext = null;
+let prefetchedNextExpiresAt = 0;
 let nextPrefetchPromise = null;
 let nextPrefetchKey = "";
 let prefetchGeneration = 0;
 let nextPrefetchRetryAt = 0;
+let localResumePending = false;
+let localResumeTarget = 0;
 
 let googleCastReady = false;
 let castContext = null;
@@ -182,8 +188,7 @@ async function api(path, options = {}) {
   return response.json();
 }
 
-async function saveProgress(
-  force = false,
+function progressSnapshot(
   isComplete = false,
   positionOverride = null,
   durationOverride = null,
@@ -193,9 +198,37 @@ async function saveProgress(
     positionOverride === null ? video.currentTime : Number(positionOverride);
   const durationValue =
     durationOverride === null ? video.duration : Number(durationOverride);
-  if (!targetPlaybackId || !Number.isFinite(positionValue)) {
-    return false;
+  if (
+    !targetPlaybackId ||
+    !Number.isFinite(positionValue) ||
+    (targetPlaybackId === playbackId &&
+      positionOverride === null &&
+      localResumePending)
+  ) {
+    return null;
   }
+  return {
+    playback_id: targetPlaybackId,
+    position: Math.max(0, positionValue || 0),
+    duration: Number.isFinite(durationValue) ? Math.max(0, durationValue) : 0,
+    completed: isComplete,
+  };
+}
+
+async function saveProgress(
+  force = false,
+  isComplete = false,
+  positionOverride = null,
+  durationOverride = null,
+  targetPlaybackId = playbackId,
+) {
+  const snapshot = progressSnapshot(
+    isComplete,
+    positionOverride,
+    durationOverride,
+    targetPlaybackId,
+  );
+  if (!snapshot) return false;
   const now = Date.now();
   if (
     !force &&
@@ -206,21 +239,41 @@ async function saveProgress(
   }
   lastSavedAt = now;
   lastSavedPlaybackId = targetPlaybackId;
-  const body = JSON.stringify({
-    playback_id: targetPlaybackId,
-    position: Math.max(0, positionValue || 0),
-    duration: Number.isFinite(durationValue) ? Math.max(0, durationValue) : 0,
-    completed: isComplete,
-  });
   try {
     await api("/api/progress", {
       method: "POST",
-      body,
+      body: JSON.stringify(snapshot),
       keepalive: force,
     });
     return true;
   } catch {
     // A transient progress failure must never interrupt playback.
+    return false;
+  }
+}
+
+function sendProgressBeacon(
+  positionOverride = null,
+  durationOverride = null,
+  targetPlaybackId = playbackId,
+) {
+  if (!csrfToken || typeof navigator.sendBeacon !== "function") return false;
+  const snapshot = progressSnapshot(
+    false,
+    positionOverride,
+    durationOverride,
+    targetPlaybackId,
+  );
+  if (!snapshot) return false;
+  try {
+    return navigator.sendBeacon(
+      "/api/progress/beacon",
+      new Blob(
+        [JSON.stringify({ ...snapshot, csrf_token: csrfToken })],
+        { type: "application/json" },
+      ),
+    );
+  } catch {
     return false;
   }
 }
@@ -237,6 +290,7 @@ function episodePrefetchKey(info) {
 function invalidateNextPrefetch() {
   prefetchGeneration += 1;
   prefetchedNext = null;
+  prefetchedNextExpiresAt = 0;
   nextPrefetchPromise = null;
   nextPrefetchKey = "";
   nextPrefetchRetryAt = 0;
@@ -254,6 +308,13 @@ function connectionAllowsPrefetch() {
   );
 }
 
+function prefetchedNextIsFresh() {
+  return (
+    prefetchedNext !== null &&
+    prefetchedNextExpiresAt > Date.now() + PREFETCH_EXPIRY_MARGIN_MS
+  );
+}
+
 async function startNextPrefetch(info = currentInfo) {
   if (
     !info?.has_next ||
@@ -266,7 +327,7 @@ async function startNextPrefetch(info = currentInfo) {
   const key = episodePrefetchKey(info);
   if (!key) return null;
   if (nextPrefetchKey === key) {
-    if (prefetchedNext) return prefetchedNext;
+    if (prefetchedNextIsFresh()) return prefetchedNext;
     if (nextPrefetchPromise) return nextPrefetchPromise;
     if (Date.now() < nextPrefetchRetryAt) return null;
   }
@@ -274,6 +335,7 @@ async function startNextPrefetch(info = currentInfo) {
   invalidateNextPrefetch();
   const generation = prefetchGeneration;
   nextPrefetchKey = key;
+  const requestedAt = Date.now();
   const request = api("/api/playback/prefetch", {
     method: "POST",
     body: JSON.stringify({
@@ -283,13 +345,20 @@ async function startNextPrefetch(info = currentInfo) {
   })
     .then((prepared) => {
       if (generation === prefetchGeneration && nextPrefetchKey === key) {
+        const ttlSeconds = Math.max(
+          0,
+          Number(prepared.prepared_ttl_seconds) || 0,
+        );
         prefetchedNext = prepared;
+        // Measure from request start so network latency can only shorten,
+        // never accidentally extend, the server-side expiration.
+        prefetchedNextExpiresAt = requestedAt + ttlSeconds * 1000;
       }
       return prepared;
     })
     .catch(() => {
       if (generation === prefetchGeneration && nextPrefetchKey === key) {
-        nextPrefetchRetryAt = Date.now() + 30_000;
+        nextPrefetchRetryAt = Date.now() + PREFETCH_RETRY_DELAY_MS;
       }
       return null;
     })
@@ -315,7 +384,7 @@ function maybePrefetchNext(
     !Number.isFinite(currentDuration) ||
     currentDuration < 60 ||
     currentPosition < 30 ||
-    currentDuration - currentPosition > 120
+    currentDuration - currentPosition > NEXT_PREFETCH_WINDOW_SECONDS
   ) {
     return;
   }
@@ -328,11 +397,17 @@ async function preparedNextEpisode(targetEpisode) {
   }
   const key = episodePrefetchKey(currentInfo);
   if (!key || nextPrefetchKey !== key) return null;
-  if (prefetchedNext) return prefetchedNext;
+  if (prefetchedNextIsFresh()) return prefetchedNext;
+  if (prefetchedNext) {
+    invalidateNextPrefetch();
+    return null;
+  }
   if (nextPrefetchPromise) {
     await nextPrefetchPromise;
   }
-  return nextPrefetchKey === key ? prefetchedNext : null;
+  return nextPrefetchKey === key && prefetchedNextIsFresh()
+    ? prefetchedNext
+    : null;
 }
 
 function googleCastConnected() {
@@ -487,6 +562,8 @@ function teardownPlayer() {
   hls = null;
   resetStreamControls();
   video.pause();
+  localResumePending = false;
+  localResumeTarget = 0;
   video.removeAttribute("src");
   video.load();
   updatePictureInPictureUi();
@@ -595,6 +672,12 @@ function attachPlayer(info, { autoplay = false } = {}) {
   const options = { signal: events.signal };
   const streamUrl = info.stream_url;
   const useHls = info.kind === "hls";
+  const requestedPosition = Number(info.start_position);
+  localResumeTarget =
+    Number.isFinite(requestedPosition) && requestedPosition > 0
+      ? requestedPosition
+      : 0;
+  localResumePending = localResumeTarget > 0;
 
   if (useHls && Hls?.isSupported()) {
     hls = new Hls({
@@ -635,38 +718,101 @@ function attachPlayer(info, { autoplay = false } = {}) {
     video.src = streamUrl;
   }
 
-  let resumeApplied = false;
+  const resumeRangeEnd = () => {
+    const duration = Number(video.duration);
+    if (duration === Number.POSITIVE_INFINITY) return duration;
+    let end = Number.isFinite(duration) && duration > 0 ? duration : 0;
+    for (let index = 0; index < video.seekable.length; index += 1) {
+      const candidate = Number(video.seekable.end(index));
+      if (Number.isFinite(candidate)) end = Math.max(end, candidate);
+    }
+    return end;
+  };
+
+  const applyResumePosition = ({ restartIfOutOfRange = false } = {}) => {
+    if (!localResumePending || playbackId !== info.playback_id) return true;
+    const end = resumeRangeEnd();
+    if (end !== Number.POSITIVE_INFINITY && end <= localResumeTarget + 5) {
+      if (!restartIfOutOfRange || !Number.isFinite(end) || end <= 0) {
+        return false;
+      }
+      localResumePending = false;
+      localResumeTarget = 0;
+      video.currentTime = 0;
+      progress.textContent = formatTime(0);
+      return true;
+    }
+    try {
+      video.currentTime = localResumeTarget;
+    } catch {
+      return false;
+    }
+    progress.textContent = formatTime(localResumeTarget);
+    localResumePending = false;
+    return true;
+  };
+
+  let playerReadyHandled = false;
+  const finishPlayerReady = () => {
+    if (
+      playerReadyHandled ||
+      localResumePending ||
+      video.readyState < HTMLMediaElement.HAVE_METADATA
+    ) {
+      return;
+    }
+    playerReadyHandled = true;
+    loading.hidden = true;
+    updatePictureInPictureUi();
+    if (autoplay && !googleCastConnected()) {
+      void video.play().catch(() => {
+        setCastStatus("Tap play to start the next episode.");
+      });
+    }
+  };
+
   video.addEventListener(
     "loadedmetadata",
     () => {
-      if (!resumeApplied) {
-        const requestedPosition = Number(info.start_position);
-        const targetPosition =
-          Number.isFinite(requestedPosition) &&
-          requestedPosition > 0 &&
-          requestedPosition < video.duration - 5
-            ? requestedPosition
-            : 0;
-        video.currentTime = targetPosition;
-        progress.textContent = formatTime(targetPosition);
-      }
-      resumeApplied = true;
+      applyResumePosition();
       if (!useHls || !Hls?.isSupported()) {
         updateNativeTrackOptions();
       }
-      loading.hidden = true;
-      updatePictureInPictureUi();
-      if (autoplay && !googleCastConnected()) {
-        void video.play().catch(() => {
-          setCastStatus("Tap play to start the next episode.");
-        });
-      }
+      finishPlayerReady();
+    },
+    options,
+  );
+  video.addEventListener(
+    "durationchange",
+    () => {
+      applyResumePosition();
+      finishPlayerReady();
+    },
+    options,
+  );
+  video.addEventListener(
+    "progress",
+    () => {
+      applyResumePosition();
+      finishPlayerReady();
+    },
+    options,
+  );
+  video.addEventListener(
+    "canplay",
+    () => {
+      applyResumePosition({ restartIfOutOfRange: true });
+      finishPlayerReady();
     },
     options,
   );
   video.addEventListener(
     "timeupdate",
     () => {
+      if (localResumePending) {
+        applyResumePosition();
+        if (localResumePending) return;
+      }
       progress.textContent = formatTime(video.currentTime);
       void saveProgress(false, false);
       maybePrefetchNext(info);
@@ -1255,13 +1401,20 @@ document.addEventListener("visibilitychange", () => {
   }
   if (completed) return;
   if (googleCastConnected() && remotePlayer?.isMediaLoaded) {
-    void saveProgress(
-      true,
-      false,
-      remotePlayer.currentTime,
-      remotePlayer.duration,
-    );
-  } else {
+    if (
+      !sendProgressBeacon(
+        remotePlayer.currentTime,
+        remotePlayer.duration,
+      )
+    ) {
+      void saveProgress(
+        true,
+        false,
+        remotePlayer.currentTime,
+        remotePlayer.duration,
+      );
+    }
+  } else if (!sendProgressBeacon()) {
     void saveProgress(true, false);
   }
 });
@@ -1269,13 +1422,20 @@ document.addEventListener("visibilitychange", () => {
 window.addEventListener("pagehide", () => {
   if (!completed) {
     if (googleCastConnected() && remotePlayer?.isMediaLoaded) {
-      void saveProgress(
-        true,
-        false,
-        remotePlayer.currentTime,
-        remotePlayer.duration,
-      );
-    } else {
+      if (
+        !sendProgressBeacon(
+          remotePlayer.currentTime,
+          remotePlayer.duration,
+        )
+      ) {
+        void saveProgress(
+          true,
+          false,
+          remotePlayer.currentTime,
+          remotePlayer.duration,
+        );
+      }
+    } else if (!sendProgressBeacon()) {
       void saveProgress(true, false);
     }
   }

@@ -243,18 +243,22 @@ encrypted playback-bound URLs, validates redirects, and relays ranges without
 exposing provider credentials.
 
 Progress is saved periodically, on pause, when Telegram hides the Mini App, and
-when the page closes. Series expose an episode selector plus previous/next
+when the page closes. Hide and close events use a same-origin authenticated
+beacon so iOS can finish queuing the final position while its Telegram WebView
+is being destroyed. Series expose an episode selector plus previous/next
 controls. They advance automatically after the current episode finishes when
 the user's per-account autoplay setting is enabled.
 
-During the final two minutes of a series episode, the Mini App may prepare the
-next episode in a short-lived user-bound session. Preparation performs source
-resolution and validation but does not update Continue Watching, episode
-progress, or the active web session. Those values change only when the user
-presses Next or autoplay actually advances. The current numbered source is
-preferred for the next episode; if it is missing or broken, normal source
-fallback selects the first working alternative. Changing source invalidates
-any stale client-side preparation.
+During the final five minutes of a series episode, the Mini App may prepare the
+next episode in a ten-minute user-bound session. The client tracks that
+server-side lifetime with a safety margin and refreshes an expired preparation
+if playback is still inside the preload window. Preparation performs source
+resolution and validation but does not read or update the target episode's
+position, Continue Watching, or the active web session. The latest saved
+position is read only when the user presses Next or autoplay actually advances.
+The current numbered source is preferred for the next episode; if it is missing
+or broken, normal source fallback selects the first working alternative.
+Changing source invalidates any stale client-side preparation.
 
 When an episode exposes multiple supported players, **Change source** moves to
 the next numbered source while preserving the saved position. Sources remain

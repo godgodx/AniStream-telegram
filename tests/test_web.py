@@ -51,8 +51,28 @@ def test_mini_app_exposes_dynamic_hls_track_controls() -> None:
     assert 'api("/api/playback/activate"' in script
     assert "changeSource(Number(sourcePicker.value))" in script
     assert "`Source ${index + 1}`" in script
-    assert "video.currentTime = targetPosition" in script
-    assert "currentDuration - currentPosition > 120" in script
+    assert "NEXT_PREFETCH_WINDOW_SECONDS = 5 * 60" in script
+    assert (
+        "currentDuration - currentPosition > NEXT_PREFETCH_WINDOW_SECONDS"
+        in script
+    )
+    assert "prefetchedNextIsFresh()" in script
+    assert "PREFETCH_EXPIRY_MARGIN_MS = 30_000" in script
+    assert "PREFETCH_RETRY_DELAY_MS = 60_000" in script
+
+
+def test_mini_app_defers_saved_resume_until_media_is_seekable() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    script = (project_root / "web" / "src" / "main.js").read_text(encoding="utf-8")
+
+    assert "localResumePending" in script
+    assert "resumeRangeEnd" in script
+    assert '"durationchange"' in script
+    assert '"canplay"' in script
+    assert "restartIfOutOfRange: true" in script
+    assert "positionOverride === null" in script
+    assert 'navigator.sendBeacon(' in script
+    assert '"/api/progress/beacon"' in script
 
 
 def test_mini_app_exposes_cross_browser_picture_in_picture() -> None:
@@ -424,6 +444,7 @@ async def test_next_episode_prefetch_does_not_change_memory_until_activation(
         assert prepared_response.status == 200
         prepared = await prepared_response.json()
         assert prepared["prepared"] is True
+        assert prepared["prepared_ttl_seconds"] == 600
         assert prepared["episode"] == 4
         assert prepared["source_index"] == 1
         assert core.requests == [
@@ -443,6 +464,17 @@ async def test_next_episode_prefetch_does_not_change_memory_until_activation(
         assert unchanged_session.payload["episode"] == 3
         assert unchanged_session.payload["source_index"] == 1
 
+        # A target episode may gain newer progress after it was prepared (for
+        # example from another active client). Activation must read that value
+        # now rather than trusting the stale prefetch response.
+        await database.record_progress(
+            123,
+            catalogue(),
+            4,
+            222.0,
+            1500.0,
+            False,
+        )
         activated_response = await client.post(
             "/api/playback/activate",
             headers=headers,
@@ -452,13 +484,13 @@ async def test_next_episode_prefetch_does_not_change_memory_until_activation(
         activated = await activated_response.json()
         assert activated["episode"] == 4
         assert activated["source_index"] == 1
-        assert activated["start_position"] == 0.0
+        assert activated["start_position"] == 222.0
         assert core.calls == 1
 
         updated = (await database.continue_watching(123))[0]
         assert updated["last_played_episode"] == 4
         assert updated["resume_episode"] == 4
-        assert updated["position"] == 0.0
+        assert updated["position"] == 222.0
         updated_session = await database.get_web_session(raw_session)
         assert updated_session is not None
         assert updated_session.payload["episode"] == 4
@@ -612,6 +644,110 @@ async def test_playback_without_saved_progress_forces_zero_start(
 
         assert response.status == 200
         assert (await response.json())["start_position"] == 0.0
+    finally:
+        await client.close()
+        await database.close()
+
+
+async def test_paused_progress_is_returned_after_reopening_player(
+    tmp_path: Path,
+) -> None:
+    settings = config(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize(settings.allowed_users)
+    first_session, first_csrf = await database.create_web_session(
+        123,
+        {
+            "catalogue": catalogue(),
+            "episode": 3,
+            "start_position": 0,
+        },
+        ttl_seconds=600,
+    )
+    media = MediaGateway(settings, database)
+    app = web.Application(middlewares=[error_boundary, security_headers])
+    app[CONFIG_KEY] = settings
+    WebRoutes(settings, database, FakeCore(), media).register(app)  # type: ignore[arg-type]
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        first_headers = {
+            "Origin": settings.public_origin,
+            "X-CSRF-Token": first_csrf,
+            "Cookie": f"{settings.cookie_name}={first_session}",
+        }
+        first_playback = await client.post("/api/playback", headers=first_headers)
+        assert first_playback.status == 200
+        first_payload = await first_playback.json()
+        assert first_payload["start_position"] == 0.0
+
+        rejected = await client.post(
+            "/api/progress/beacon",
+            headers={
+                "Origin": settings.public_origin,
+                "Cookie": f"{settings.cookie_name}={first_session}",
+            },
+            json={
+                "playback_id": first_payload["playback_id"],
+                "position": 331.0,
+                "duration": 1440.0,
+                "completed": False,
+            },
+        )
+        assert rejected.status == 403
+
+        cross_origin = await client.post(
+            "/api/progress/beacon",
+            headers={
+                "Origin": "https://evil.example",
+                "Cookie": f"{settings.cookie_name}={first_session}",
+            },
+            json={
+                "playback_id": first_payload["playback_id"],
+                "position": 331.0,
+                "duration": 1440.0,
+                "completed": False,
+                "csrf_token": first_csrf,
+            },
+        )
+        assert cross_origin.status == 403
+
+        paused = await client.post(
+            "/api/progress/beacon",
+            headers={
+                "Origin": settings.public_origin,
+                "Cookie": f"{settings.cookie_name}={first_session}",
+            },
+            json={
+                "playback_id": first_payload["playback_id"],
+                "position": 331.0,
+                "duration": 1440.0,
+                "completed": False,
+                "csrf_token": first_csrf,
+            },
+        )
+        assert paused.status == 200
+        assert await database.episode_position(123, catalogue(), 3) == 331.0
+
+        reopened_session, reopened_csrf = await database.create_web_session(
+            123,
+            {
+                "catalogue": catalogue(),
+                "episode": 3,
+                "start_position": 331.0,
+            },
+            ttl_seconds=600,
+        )
+        reopened = await client.post(
+            "/api/playback",
+            headers={
+                "Origin": settings.public_origin,
+                "X-CSRF-Token": reopened_csrf,
+                "Cookie": f"{settings.cookie_name}={reopened_session}",
+            },
+        )
+        assert reopened.status == 200
+        assert (await reopened.json())["start_position"] == 331.0
     finally:
         await client.close()
         await database.close()

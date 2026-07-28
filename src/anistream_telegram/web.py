@@ -27,6 +27,7 @@ from anistream_telegram.security import (
 
 LOGGER = logging.getLogger(__name__)
 CONFIG_KEY = web.AppKey("config", Config)
+PREPARED_PLAYBACK_TTL_SECONDS = 10 * 60
 
 
 class WebRoutes:
@@ -92,6 +93,7 @@ class WebRoutes:
         app.router.add_post("/api/playback/prefetch", self.prefetch_next)
         app.router.add_post("/api/playback/activate", self.activate_prefetch)
         app.router.add_post("/api/progress", self.progress)
+        app.router.add_post("/api/progress/beacon", self.progress_beacon)
         app.router.add_post("/api/cast", self.cast)
         app.router.add_post("/api/logout", self.logout)
         app.router.add_get("/media/{playback_id}/master", self.media.master)
@@ -282,7 +284,7 @@ class WebRoutes:
             min(source_count - 1, int(getattr(media, "source_index", 0))),
         )
         ttl_seconds = (
-            min(300, self.config.playback_ttl_seconds)
+            min(PREPARED_PLAYBACK_TTL_SECONDS, self.config.playback_ttl_seconds)
             if prepared
             else self.config.playback_ttl_seconds
         )
@@ -511,18 +513,12 @@ class WebRoutes:
             preferred_source_index = (
                 self._source_index(session.payload.get("source_index")) or 0
             )
-        stored_position = await self.database.saved_episode_position(
-            session.telegram_user_id,
-            catalogue,
-            target_episode,
-        )
-        start_position = 0.0 if stored_position is None else stored_position
         response_payload = await self._prepare_episode(
             session,
             catalogue,
             target_episode,
             total,
-            start_position,
+            0.0,
             preferred_source_index=preferred_source_index,
             fallback_from_preferred=True,
             record_progress=False,
@@ -530,6 +526,10 @@ class WebRoutes:
             actor_key=f"prefetch:{session.telegram_user_id}",
         )
         response_payload["prepared"] = True
+        response_payload["prepared_ttl_seconds"] = min(
+            PREPARED_PLAYBACK_TTL_SECONDS,
+            self.config.playback_ttl_seconds,
+        )
         return web.json_response(response_payload)
 
     async def activate_prefetch(self, request: web.Request) -> web.Response:
@@ -616,6 +616,31 @@ class WebRoutes:
         if not await self.progress_limiter.allow(str(session.telegram_user_id)):
             raise web.HTTPTooManyRequests(text="Progress updates are too frequent")
         payload = await self._json(request)
+        return web.json_response(
+            await self._record_progress_payload(session, payload)
+        )
+
+    async def progress_beacon(self, request: web.Request) -> web.Response:
+        session = await self._authenticated(request)
+        self._check_origin(request)
+        payload = await self._json(request)
+        supplied = str(payload.pop("csrf_token", ""))
+        if not supplied or not __import__("hmac").compare_digest(
+            supplied,
+            session.csrf_token,
+        ):
+            raise web.HTTPForbidden(text="CSRF validation failed")
+        if not await self.progress_limiter.allow(str(session.telegram_user_id)):
+            raise web.HTTPTooManyRequests(text="Progress updates are too frequent")
+        return web.json_response(
+            await self._record_progress_payload(session, payload)
+        )
+
+    async def _record_progress_payload(
+        self,
+        session: WebSession,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
         playback_id = str(payload.get("playback_id", ""))
         playback = await self.database.get_playback(
             playback_id,
@@ -650,7 +675,7 @@ class WebRoutes:
             duration,
             completed,
         )
-        return web.json_response({"ok": True, "completed": completed})
+        return {"ok": True, "completed": completed}
 
     async def cast(self, request: web.Request) -> web.Response:
         session = await self._authenticated(request)
