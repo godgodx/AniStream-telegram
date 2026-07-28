@@ -98,6 +98,10 @@ def test_mini_app_defers_saved_resume_until_media_is_seekable() -> None:
     assert "hls.recoverMediaError()" in script
     assert "recoverFatalPlayback" in script
     assert "nextUntriedSource" in script
+    assert "Hls.Events.FRAG_BUFFERED" in script
+    assert script.index("loading.hidden = true;", script.index("const finishPlayerReady")) < (
+        script.index("if (playerReadyHandled) return;", script.index("const finishPlayerReady"))
+    )
     assert 'api("/api/session")' in script
 
 

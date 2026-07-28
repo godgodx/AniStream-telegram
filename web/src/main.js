@@ -782,6 +782,9 @@ function attachPlayer(
     hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, (_, data) => {
       updateSubtitleOptions(data.subtitleTracks || hls.subtitleTracks || []);
     });
+    hls.on(Hls.Events.FRAG_BUFFERED, () => {
+      finishPlayerReady();
+    });
     hls.on(Hls.Events.LEVEL_SWITCHED, (_, data) => {
       if (hls.autoLevelEnabled) {
         qualityPicker.value = "-1";
@@ -835,14 +838,17 @@ function attachPlayer(
   let playerReadyHandled = false;
   const finishPlayerReady = () => {
     if (
-      playerReadyHandled ||
       localResumePending ||
       video.readyState < HTMLMediaElement.HAVE_METADATA
     ) {
       return;
     }
-    playerReadyHandled = true;
+    // Recovery can display the overlay after the initial ready event. Always
+    // settle that UI state again; only timing/autoplay side effects are
+    // one-shot for this player attachment.
     loading.hidden = true;
+    if (playerReadyHandled) return;
+    playerReadyHandled = true;
     performance.mark?.("anistream-player-ready");
     try {
       performance.measure?.(

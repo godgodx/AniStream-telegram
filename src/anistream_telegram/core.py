@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import threading
+import multiprocessing
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import replace
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
+from multiprocessing.connection import Connection
 from typing import Any
 from urllib.parse import urlparse
 
@@ -30,6 +30,54 @@ from anistream_telegram.source_health import SourceHealthTracker
 LOGGER = logging.getLogger(__name__)
 PREPARATION_DEADLINE_SECONDS = 24.0
 CANDIDATE_DEADLINE_SECONDS = 8.0
+RESOLVER_PROCESS_LIMIT = 2
+
+
+def _send_resolver_result(
+    connection: Connection,
+    result: tuple[Any, ...],
+) -> None:
+    try:
+        connection.send(result)
+    except (BrokenPipeError, EOFError, OSError):
+        # The parent already reached its deadline and closed the pipe.
+        pass
+
+
+def _resolver_process_entry(
+    connection: Connection,
+    url: str,
+    user_agent: str,
+    cookie: str,
+) -> None:
+    """Resolve one embed in a disposable process.
+
+    Synchronous resolver code can be blocked below Python's cancellation
+    boundary (notably in DNS or a provider parser). A process gives the parent
+    a worker it can actually terminate when the preparation deadline expires.
+    """
+
+    try:
+        http = HttpClient(
+            user_agent=user_agent,
+            cookie=cookie,
+            cookie_hosts={"anime-sama.to", "www.anime-sama.to"},
+            timeout=(3.0, 5.0),
+            retry_total=0,
+        )
+        media = ResolverRegistry(default_resolvers(http)).resolve(url)
+        _send_resolver_result(connection, ("ok", media))
+    except BaseException as exc:
+        _send_resolver_result(
+            connection,
+            (
+                "error",
+                type(exc).__name__,
+                str(exc)[:1000],
+            )
+        )
+    finally:
+        connection.close()
 
 
 def search_result_payload(item: SearchResult) -> dict[str, Any]:
@@ -139,8 +187,9 @@ class CoreService:
         source_health: SourceHealthTracker | None = None,
     ) -> None:
         cookie = f"cf_clearance={cf_clearance}" if cf_clearance else ""
+        resolved_user_agent = user_agent or DEFAULT_USER_AGENT
         self.http = HttpClient(
-            user_agent=user_agent or DEFAULT_USER_AGENT,
+            user_agent=resolved_user_agent,
             cookie=cookie,
             cookie_hosts={"anime-sama.to", "www.anime-sama.to"},
         )
@@ -154,7 +203,7 @@ class CoreService:
         # discovery must fail over quickly. A dead embed/media host must not
         # hold the Mini App request open until the reverse proxy returns 504.
         media_http = HttpClient(
-            user_agent=user_agent or DEFAULT_USER_AGENT,
+            user_agent=resolved_user_agent,
             cookie=cookie,
             cookie_hosts={"anime-sama.to", "www.anime-sama.to"},
             timeout=(3.0, 5.0),
@@ -166,12 +215,14 @@ class CoreService:
         self._async_probe: (
             Callable[[ResolvedMedia, bool], Awaitable[Any]] | None
         ) = None
-        self._resolver_executor = ThreadPoolExecutor(
-            max_workers=4,
-            thread_name_prefix="anistream-resolver",
-        )
-        self._resolver_jobs = 0
-        self._resolver_jobs_lock = threading.Lock()
+        self._resolver_user_agent = resolved_user_agent
+        self._resolver_cookie = cookie
+        self._resolver_context = multiprocessing.get_context("spawn")
+        # A single user can only prepare once concurrently. Two isolated
+        # resolvers still serve separate users without multiplying VPS memory
+        # by the four-request provider admission limit.
+        self._resolver_slots = asyncio.Semaphore(RESOLVER_PROCESS_LIMIT)
+        self._resolver_processes: set[Any] = set()
         self.provider_capacity = CapacityLimiter(
             total_limit=4,
             per_key_limit=1,
@@ -186,24 +237,68 @@ class CoreService:
         self._async_probe = probe
 
     async def close(self) -> None:
-        self._resolver_executor.shutdown(wait=False, cancel_futures=True)
+        for process in tuple(self._resolver_processes):
+            self._stop_resolver_process(process)
+        self._resolver_processes.clear()
 
     async def _resolve_candidate(self, url: str) -> ResolvedMedia:
-        with self._resolver_jobs_lock:
-            if self._resolver_jobs >= 4:
-                raise RuntimeError("resolver worker capacity is exhausted")
-            self._resolver_jobs += 1
-        future: Future[ResolvedMedia] = self._resolver_executor.submit(
-            self.resolvers.resolve,
-            url,
-        )
+        async with self._resolver_slots:
+            receive, send = self._resolver_context.Pipe(duplex=False)
+            process = self._resolver_context.Process(
+                target=_resolver_process_entry,
+                args=(
+                    send,
+                    url,
+                    self._resolver_user_agent,
+                    self._resolver_cookie,
+                ),
+                name="anistream-resolver",
+                daemon=True,
+            )
+            try:
+                process.start()
+                send.close()
+                self._resolver_processes.add(process)
+                while process.is_alive():
+                    await asyncio.sleep(0.02)
+                if process.exitcode != 0:
+                    raise RuntimeError(
+                        f"resolver worker exited with code {process.exitcode}"
+                    )
+                if not receive.poll(0.1):
+                    raise RuntimeError("resolver worker returned no result")
+                result = receive.recv()
+                if result[0] == "ok":
+                    return result[1]
+                raise RuntimeError(f"{result[1]}: {result[2]}")
+            finally:
+                send.close()
+                receive.close()
+                self._stop_resolver_process(process)
+                self._resolver_processes.discard(process)
 
-        def finished(_: Future[ResolvedMedia]) -> None:
-            with self._resolver_jobs_lock:
-                self._resolver_jobs = max(0, self._resolver_jobs - 1)
+    @staticmethod
+    def _stop_resolver_process(process: Any) -> None:
+        """Stop and reap a resolver worker without leaving an occupied slot."""
 
-        future.add_done_callback(finished)
-        return await asyncio.wrap_future(future)
+        try:
+            pid = process.pid
+        except ValueError:
+            return
+        if pid is None:
+            return
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=0.5)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=0.5)
+        else:
+            process.join(timeout=0)
+        try:
+            process.close()
+        except ValueError:
+            pass
 
     def provider_alias(self, provider_id: str) -> str:
         return self._provider_aliases.get(str(provider_id), "Provider")

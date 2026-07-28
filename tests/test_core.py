@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
+import anistream_telegram.core as core_module
 from anistream.models import (
     Catalogue,
     EmbedCandidate,
@@ -22,6 +24,11 @@ from anistream_telegram.core import (
     catalogue_payload,
 )
 from anistream_telegram.limits import CapacityExceeded, CapacityLimiter
+
+
+def _blocking_resolver_process(connection, *_args) -> None:
+    connection.close()
+    time.sleep(60)
 
 
 def test_catalogue_round_trip_preserves_provider_candidates() -> None:
@@ -156,17 +163,16 @@ async def test_core_prepares_the_requested_supported_source(
         )
     )
     monkeypatch.setattr(service.resolvers, "supports", lambda _url: True)
-    monkeypatch.setattr(
-        service.resolvers,
-        "resolve",
-        lambda url: ResolvedMedia(
+    async def resolve(url: str) -> ResolvedMedia:
+        return ResolvedMedia(
             f"{url}/video.mp4",
             url,
             "Test resolver",
             {},
             "mp4",
-        ),
-    )
+        )
+
+    monkeypatch.setattr(service, "_resolve_candidate", resolve)
     monkeypatch.setattr(
         service.probe,
         "probe",
@@ -218,7 +224,7 @@ async def test_core_automatic_source_fallback_checks_each_candidate_once(
 
     monkeypatch.setattr(service.resolvers, "supports", lambda _url: True)
 
-    def resolve(url: str) -> ResolvedMedia:
+    async def resolve(url: str) -> ResolvedMedia:
         calls.append(url)
         if url.endswith("/broken"):
             raise RuntimeError("source unavailable")
@@ -230,7 +236,7 @@ async def test_core_automatic_source_fallback_checks_each_candidate_once(
             "mp4",
         )
 
-    monkeypatch.setattr(service.resolvers, "resolve", resolve)
+    monkeypatch.setattr(service, "_resolve_candidate", resolve)
     monkeypatch.setattr(
         service.probe,
         "probe",
@@ -279,7 +285,7 @@ async def test_core_prefers_the_same_source_then_falls_back_for_next_episode(
     calls: list[str] = []
     monkeypatch.setattr(service.resolvers, "supports", lambda _url: True)
 
-    def resolve(url: str) -> ResolvedMedia:
+    async def resolve(url: str) -> ResolvedMedia:
         calls.append(url)
         if url.endswith("/broken"):
             raise RuntimeError("source unavailable")
@@ -291,7 +297,7 @@ async def test_core_prefers_the_same_source_then_falls_back_for_next_episode(
             "mp4",
         )
 
-    monkeypatch.setattr(service.resolvers, "resolve", resolve)
+    monkeypatch.setattr(service, "_resolve_candidate", resolve)
     monkeypatch.setattr(
         service.probe,
         "probe",
@@ -311,6 +317,42 @@ async def test_core_prefers_the_same_source_then_falls_back_for_next_episode(
         "https://video.example/embed/working",
     ]
     assert media.source_index == 0
+
+
+async def test_cancelled_resolver_workers_are_terminated_and_reaped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = CoreService()
+    original_target = core_module._resolver_process_entry
+    monkeypatch.setattr(
+        core_module,
+        "_resolver_process_entry",
+        _blocking_resolver_process,
+    )
+    try:
+        # Reproduce more cancellations than the old four-thread pool could
+        # survive. Each deadline must leave no live or reserved worker behind.
+        for _ in range(5):
+            with pytest.raises(TimeoutError):
+                async with asyncio.timeout(0.05):
+                    await service._resolve_candidate(
+                        "https://cdn.example/video.mp4"
+                    )
+            assert service._resolver_processes == set()
+
+        monkeypatch.setattr(
+            core_module,
+            "_resolver_process_entry",
+            original_target,
+        )
+        media = await asyncio.wait_for(
+            service._resolve_candidate("https://cdn.example/video.mp4"),
+            timeout=10,
+        )
+        assert media.url == "https://cdn.example/video.mp4"
+        assert service._resolver_processes == set()
+    finally:
+        await service.close()
 
 
 class ProbeResponse:

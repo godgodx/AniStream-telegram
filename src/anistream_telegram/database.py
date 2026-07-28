@@ -999,6 +999,20 @@ class Database:
         ).hexdigest()
         return provider_id, catalogue_url, identity
 
+    @staticmethod
+    def _active_playback_for_update(
+        user_id: int,
+        identity: str,
+    ) -> Any:
+        return (
+            select(ActivePlayback)
+            .where(
+                ActivePlayback.telegram_user_id == user_id,
+                ActivePlayback.identity_hash == identity,
+            )
+            .with_for_update()
+        )
+
     async def record_progress(
         self,
         user_id: int,
@@ -1021,12 +1035,12 @@ class Database:
         now = utcnow()
         async with self.sessions.begin() as session:
             if playback_id is not None:
-                active = await session.get(
-                    ActivePlayback,
-                    {
-                        "telegram_user_id": user_id,
-                        "identity_hash": identity,
-                    },
+                # Keep the active generation stable until the progress write
+                # commits. Without this row lock PostgreSQL can interleave a
+                # newer playback activation after this check but before the
+                # old player's EpisodeProgress update.
+                active = await session.scalar(
+                    self._active_playback_for_update(user_id, identity)
                 )
                 if (
                     active is None

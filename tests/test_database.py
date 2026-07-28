@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 
 from sqlalchemy import event, select
+from sqlalchemy.dialects import postgresql
 
 from anistream_telegram.database import Database, SchemaMigration
 
@@ -538,6 +539,14 @@ async def test_old_playback_generation_cannot_overwrite_new_player(
         assert await database.episode_position(123, catalogue(), 6) == 600
     finally:
         await database.close()
+
+
+def test_progress_locks_active_generation_for_the_postgresql_transaction() -> None:
+    statement = Database._active_playback_for_update(123, "identity")
+    sql = str(statement.compile(dialect=postgresql.dialect()))
+
+    assert "FROM active_playbacks" in sql
+    assert "FOR UPDATE" in sql
 
 
 async def test_remove_continue_entry_is_user_scoped_and_clears_episode_progress(
