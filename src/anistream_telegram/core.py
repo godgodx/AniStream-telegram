@@ -28,8 +28,8 @@ from anistream_telegram.source_health import SourceHealthTracker
 
 
 LOGGER = logging.getLogger(__name__)
-PREPARATION_DEADLINE_SECONDS = 24.0
-CANDIDATE_DEADLINE_SECONDS = 8.0
+PREPARATION_DEADLINE_SECONDS = 40.0
+CANDIDATE_DEADLINE_SECONDS = 12.0
 RESOLVER_PROCESS_LIMIT = 2
 
 
@@ -422,7 +422,22 @@ class CoreService:
                         fallback_from_preferred,
                     )
             except TimeoutError as exc:
+                self._forget_episode_health(payload, episode_number)
                 raise RuntimeError("source preparation deadline exceeded") from exc
+
+    def _forget_episode_health(
+        self,
+        payload: dict[str, Any],
+        episode_number: int,
+    ) -> None:
+        try:
+            catalogue = catalogue_from_payload(payload)
+            episode = catalogue.episodes[episode_number - 1]
+        except (IndexError, KeyError, TypeError, ValueError):
+            return
+        self.source_health.forget_urls(
+            [candidate.url for candidate in episode.candidates]
+        )
 
     async def _prepare_media(
         self,
@@ -530,5 +545,8 @@ class CoreService:
             "selected source failed: "
             if preferred_source_index is not None and not fallback_from_preferred
             else "all sources failed: "
+        )
+        self.source_health.forget_urls(
+            [candidate.url for candidate in supported]
         )
         raise RuntimeError(prefix + "; ".join(errors))

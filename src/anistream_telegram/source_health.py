@@ -74,6 +74,22 @@ class SourceHealthTracker:
         ranked.sort(key=lambda item: (item[0], item[1]))
         return [index for _, index in ranked]
 
+    def forget_urls(self, urls: list[str]) -> None:
+        """Forget candidates after a complete preparation failure."""
+
+        candidates = {source_host(url) for url in urls}
+        candidates.discard("")
+        with self._lock:
+            media_hosts = {
+                binding[0]
+                for candidate in candidates
+                if (binding := self._bindings.get(candidate)) is not None
+            }
+            for host in candidates | media_hosts:
+                self._health.pop(host, None)
+            for candidate in candidates:
+                self._bindings.pop(candidate, None)
+
     def observe(
         self,
         url: str,

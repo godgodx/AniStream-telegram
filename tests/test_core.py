@@ -492,3 +492,66 @@ def test_media_probe_uses_a_small_mp4_range() -> None:
     assert result.prefetched_playlist == b""
     headers = http.get.call_args.kwargs["headers"]
     assert headers["Range"] == f"bytes=0-{MP4_PROBE_BYTES - 1}"
+
+
+def _two_source_payload() -> dict:
+    return catalogue_payload(
+        Catalogue(
+            provider_id="provider",
+            provider_name="Provider",
+            title="Title",
+            url="https://provider.example/title",
+            season="Movie",
+            language=MediaLanguage("vf", "VF"),
+            episodes=(
+                Episode(
+                    1,
+                    (
+                        EmbedCandidate("Player 1", "https://one.example/embed"),
+                        EmbedCandidate("Player 2", "https://two.example/embed"),
+                    ),
+                ),
+            ),
+        )
+    )
+
+
+async def test_complete_source_failure_forgets_poisoned_ranking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = CoreService()
+    payload = _two_source_payload()
+    urls = ["https://one.example/embed", "https://two.example/embed"]
+    service.source_health.observe(urls[0], latency_seconds=8.0, success=False)
+    assert service.source_health.rank_urls(urls) == [1, 0]
+    monkeypatch.setattr(service.resolvers, "supports", lambda _url: True)
+
+    async def reject(_url: str) -> ResolvedMedia:
+        raise RuntimeError("unavailable")
+
+    monkeypatch.setattr(service, "_resolve_candidate", reject)
+    with pytest.raises(RuntimeError, match="all sources failed"):
+        await service.prepare_media(payload, 1)
+
+    assert service.source_health.rank_urls(urls) == [0, 1]
+
+
+async def test_global_preparation_timeout_forgets_poisoned_ranking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = CoreService()
+    payload = _two_source_payload()
+    urls = ["https://one.example/embed", "https://two.example/embed"]
+    service.source_health.observe(urls[0], latency_seconds=8.0, success=False)
+    monkeypatch.setattr(service.resolvers, "supports", lambda _url: True)
+    monkeypatch.setattr(core_module, "PREPARATION_DEADLINE_SECONDS", 0.01)
+
+    async def stall(_url: str) -> ResolvedMedia:
+        await asyncio.sleep(1)
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(service, "_resolve_candidate", stall)
+    with pytest.raises(RuntimeError, match="deadline exceeded"):
+        await service.prepare_media(payload, 1)
+
+    assert service.source_health.rank_urls(urls) == [0, 1]
