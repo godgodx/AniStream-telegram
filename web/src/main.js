@@ -10,6 +10,7 @@ const episode = document.querySelector("#episode");
 const source = document.querySelector("#source");
 const progress = document.querySelector("#progress");
 const fullscreen = document.querySelector("#fullscreen");
+const pictureInPictureButton = document.querySelector("#picture-in-picture");
 const previous = document.querySelector("#previous");
 const next = document.querySelector("#next");
 const autoplayStatus = document.querySelector("#autoplay-status");
@@ -77,6 +78,87 @@ function showError(message) {
 
 function setCastStatus(message) {
   castStatus.textContent = message;
+}
+
+function standardPictureInPictureSupported() {
+  return (
+    document.pictureInPictureEnabled === true &&
+    typeof video.requestPictureInPicture === "function"
+  );
+}
+
+function webkitPictureInPictureSupported() {
+  return (
+    typeof video.webkitSupportsPresentationMode === "function" &&
+    typeof video.webkitSetPresentationMode === "function" &&
+    video.webkitSupportsPresentationMode("picture-in-picture")
+  );
+}
+
+function pictureInPictureActive() {
+  return (
+    document.pictureInPictureElement === video ||
+    video.webkitPresentationMode === "picture-in-picture"
+  );
+}
+
+function remotePlaybackActive() {
+  return (
+    googleCastConnected() ||
+    video.remote?.state === "connected" ||
+    video.webkitCurrentPlaybackTargetIsWireless === true
+  );
+}
+
+function updatePictureInPictureUi() {
+  const supported =
+    standardPictureInPictureSupported() ||
+    webkitPictureInPictureSupported();
+  const active = pictureInPictureActive();
+  const unavailable =
+    !active &&
+    (video.readyState === HTMLMediaElement.HAVE_NOTHING ||
+      remotePlaybackActive());
+  pictureInPictureButton.hidden = !supported;
+  pictureInPictureButton.disabled = !supported || unavailable;
+  pictureInPictureButton.classList.toggle("is-active", active);
+  pictureInPictureButton.setAttribute("aria-pressed", String(active));
+  pictureInPictureButton.setAttribute(
+    "aria-label",
+    active ? "Exit picture-in-picture" : "Enter picture-in-picture",
+  );
+  pictureInPictureButton.title = active
+    ? "Return video to AniStream"
+    : remotePlaybackActive()
+      ? "Picture-in-picture is unavailable while casting"
+      : "Watch in a floating window";
+}
+
+async function togglePictureInPicture() {
+  if (pictureInPictureActive()) {
+    if (
+      document.pictureInPictureElement === video &&
+      typeof document.exitPictureInPicture === "function"
+    ) {
+      await document.exitPictureInPicture();
+    } else if (typeof video.webkitSetPresentationMode === "function") {
+      video.webkitSetPresentationMode("inline");
+    }
+    return;
+  }
+  if (remotePlaybackActive()) {
+    setCastStatus("Stop casting before opening picture-in-picture.");
+    return;
+  }
+  if (standardPictureInPictureSupported()) {
+    await video.requestPictureInPicture();
+    return;
+  }
+  if (webkitPictureInPictureSupported()) {
+    video.webkitSetPresentationMode("picture-in-picture");
+    return;
+  }
+  throw new Error("Picture-in-picture is not supported in this browser.");
 }
 
 async function api(path, options = {}) {
@@ -407,6 +489,7 @@ function teardownPlayer() {
   video.pause();
   video.removeAttribute("src");
   video.load();
+  updatePictureInPictureUi();
 }
 
 function updateEpisodePicker(info) {
@@ -572,6 +655,7 @@ function attachPlayer(info, { autoplay = false } = {}) {
         updateNativeTrackOptions();
       }
       loading.hidden = true;
+      updatePictureInPictureUi();
       if (autoplay && !googleCastConnected()) {
         void video.play().catch(() => {
           setCastStatus("Tap play to start the next episode.");
@@ -628,6 +712,7 @@ function attachPlayer(info, { autoplay = false } = {}) {
     },
     options,
   );
+  updatePictureInPictureUi();
 }
 
 async function loadCurrentOnGoogleCast(
@@ -765,6 +850,7 @@ function initializeGoogleCast() {
       ) {
         setupRemoteCastController();
         castButton.disabled = false;
+        updatePictureInPictureUi();
         void loadCurrentOnGoogleCast();
       } else if (event.sessionState === states.SESSION_ENDED) {
         if (remotePlayer && currentInfo) {
@@ -778,6 +864,7 @@ function initializeGoogleCast() {
           }
         }
         setCastStatus("Cast disconnected.");
+        updatePictureInPictureUi();
       }
     },
   );
@@ -801,8 +888,14 @@ function setupCast() {
 
   if (hasRemotePlayback) {
     video.remote.onconnecting = () => setCastStatus("Connecting to the TV…");
-    video.remote.onconnect = () => setCastStatus("Playing on the TV.");
-    video.remote.ondisconnect = () => setCastStatus("Remote playback disconnected.");
+    video.remote.onconnect = () => {
+      setCastStatus("Playing on the TV.");
+      updatePictureInPictureUi();
+    };
+    video.remote.ondisconnect = () => {
+      setCastStatus("Remote playback disconnected.");
+      updatePictureInPictureUi();
+    };
     video.remote
       .watchAvailability((available) => {
         if (!googleCastReady && !hasAirPlay) {
@@ -1117,6 +1210,32 @@ castButton.addEventListener("click", async () => {
   }
 });
 
+pictureInPictureButton.addEventListener("click", async () => {
+  try {
+    clearError();
+    await togglePictureInPicture();
+  } catch (reason) {
+    showError(
+      reason instanceof Error
+        ? reason.message
+        : "Picture-in-picture could not be opened.",
+    );
+  } finally {
+    updatePictureInPictureUi();
+  }
+});
+
+video.addEventListener("enterpictureinpicture", updatePictureInPictureUi);
+video.addEventListener("leavepictureinpicture", updatePictureInPictureUi);
+video.addEventListener(
+  "webkitpresentationmodechanged",
+  updatePictureInPictureUi,
+);
+video.addEventListener(
+  "webkitcurrentplaybacktargetiswirelesschanged",
+  updatePictureInPictureUi,
+);
+
 fullscreen.addEventListener("click", async () => {
   try {
     if (telegram?.requestFullscreen) {
@@ -1166,4 +1285,5 @@ window.addEventListener("pagehide", () => {
 });
 
 resetStreamControls();
+updatePictureInPictureUi();
 void initialize();

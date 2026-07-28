@@ -274,6 +274,12 @@ source; unavailable selectors are disabled and labelled instead of silently
 disappearing. Unsupported native HLS implementations and single-file MP4
 sources continue to use their platform controls.
 
+When the browser exposes Picture-in-Picture, the player shows a matching
+floating-window button beside Cast and fullscreen. It uses the standard web API
+on compatible desktop browsers and WebKit presentation mode on Safari/iOS. The
+button is hidden when the host WebView does not expose either API and is
+temporarily disabled while the stream is playing on a remote device.
+
 ### TV playback
 
 The Cast button chooses the best mechanism available:

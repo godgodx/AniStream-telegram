@@ -430,13 +430,18 @@ video {
   }
 
   .header-actions {
-    gap: 6px;
+    gap: 5px;
   }
 
   .icon-button {
-    width: 38px;
-    height: 38px;
-    flex-basis: 38px;
+    width: 36px;
+    height: 36px;
+    flex-basis: 36px;
+  }
+
+  .icon-button svg {
+    width: 20px;
+    height: 20px;
   }
 
   .toolbar-picker select {

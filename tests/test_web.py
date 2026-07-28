@@ -55,6 +55,21 @@ def test_mini_app_exposes_dynamic_hls_track_controls() -> None:
     assert "currentDuration - currentPosition > 120" in script
 
 
+def test_mini_app_exposes_cross_browser_picture_in_picture() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    html = (project_root / "web" / "index.html").read_text(encoding="utf-8")
+    script = (project_root / "web" / "src" / "main.js").read_text(encoding="utf-8")
+
+    assert 'id="picture-in-picture"' in html
+    assert 'aria-pressed="false"' in html
+    assert "video.requestPictureInPicture()" in script
+    assert 'video.webkitSetPresentationMode("picture-in-picture")' in script
+    assert "document.exitPictureInPicture()" in script
+    assert '"enterpictureinpicture"' in script
+    assert '"webkitpresentationmodechanged"' in script
+    assert "remotePlaybackActive()" in script
+
+
 def test_episode_picker_is_outside_native_video_controls() -> None:
     project_root = Path(__file__).resolve().parents[1]
     html = (project_root / "web" / "index.html").read_text(encoding="utf-8")
