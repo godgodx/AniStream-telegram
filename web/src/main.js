@@ -16,7 +16,8 @@ const autoplayStatus = document.querySelector("#autoplay-status");
 const playbackToolbar = document.querySelector("#playback-toolbar");
 const episodePickerShell = document.querySelector("#episode-picker-shell");
 const episodePicker = document.querySelector("#episode-picker");
-const changeSourceButton = document.querySelector("#change-source");
+const sourcePickerShell = document.querySelector("#source-picker-shell");
+const sourcePicker = document.querySelector("#source-picker");
 const castButton = document.querySelector("#cast");
 const castStatus = document.querySelector("#cast-status");
 const playbackOptionsButton = document.querySelector("#playback-options");
@@ -35,7 +36,6 @@ let lastSavedPlaybackId = "";
 let completed = false;
 let changingEpisode = false;
 let changingSource = false;
-let sourceCursor = 0;
 let preferredQualityHeight = 0;
 let preferredAudio = "";
 let preferredSubtitle = "";
@@ -322,8 +322,10 @@ function updateEpisodePicker(info) {
 }
 
 function updatePlaybackToolbar() {
-  playbackToolbar.hidden =
-    episodePickerShell.hidden && changeSourceButton.hidden;
+  const visiblePickers =
+    Number(!episodePickerShell.hidden) + Number(!sourcePickerShell.hidden);
+  playbackToolbar.hidden = visiblePickers === 0;
+  playbackToolbar.classList.toggle("is-single", visiblePickers === 1);
 }
 
 function updateSourceUi(info) {
@@ -332,13 +334,23 @@ function updateSourceUi(info) {
     0,
     Math.min(sourceCount - 1, Number(info.source_index) || 0),
   );
-  sourceCursor = sourceIndex;
-  changeSourceButton.hidden = sourceCount <= 1;
-  changeSourceButton.disabled = changingSource;
-  changeSourceButton.textContent =
-    `Change source (${sourceIndex + 1}/${sourceCount})`;
-  changeSourceButton.title =
-    `Currently using source ${sourceIndex + 1} of ${sourceCount}`;
+  if (sourceCount <= 1) {
+    sourcePickerShell.hidden = true;
+    sourcePicker.disabled = true;
+    sourcePicker.replaceChildren();
+    updatePlaybackToolbar();
+    return;
+  }
+  if (sourcePicker.options.length !== sourceCount) {
+    const options = document.createDocumentFragment();
+    for (let index = 0; index < sourceCount; index += 1) {
+      options.append(option(index, `Source ${index + 1}`));
+    }
+    sourcePicker.replaceChildren(options);
+  }
+  sourcePicker.value = String(sourceIndex);
+  sourcePicker.disabled = changingSource;
+  sourcePickerShell.hidden = false;
   updatePlaybackToolbar();
 }
 
@@ -360,7 +372,10 @@ function updateEpisodeUi(info) {
   title.textContent = info.title;
   subtitle.textContent = [info.season, info.language].filter(Boolean).join(" · ");
   episode.textContent = `${info.episode} / ${info.total_episodes}`;
-  source.textContent = info.source;
+  source.textContent =
+    Number(info.source_count) > 1
+      ? `Source ${Number(info.source_index) + 1}`
+      : info.source;
   progress.textContent = formatTime(info.start_position);
   previous.disabled = !info.has_previous;
   next.disabled = !info.has_next;
@@ -745,7 +760,7 @@ async function changeEpisode(targetEpisode, { autoplay = false } = {}) {
   }
 }
 
-async function changeSource() {
+async function changeSource(targetSourceIndex) {
   if (
     changingSource ||
     changingEpisode ||
@@ -755,13 +770,21 @@ async function changeSource() {
     return;
   }
   const sourceCount = Number(currentInfo.source_count);
-  const targetSource = (sourceCursor + 1) % sourceCount;
-  sourceCursor = targetSource;
+  const targetSource = Number(targetSourceIndex);
+  if (
+    !Number.isInteger(targetSource) ||
+    targetSource < 0 ||
+    targetSource >= sourceCount ||
+    targetSource === Number(currentInfo.source_index)
+  ) {
+    sourcePicker.value = String(currentInfo.source_index);
+    return;
+  }
   const wasPlaying = googleCastConnected()
     ? Boolean(remotePlayer?.isMediaLoaded && !remotePlayer.isPaused)
     : !video.paused;
   changingSource = true;
-  changeSourceButton.disabled = true;
+  sourcePicker.disabled = true;
   clearError();
   loading.hidden = false;
   status.textContent = `Preparing source ${targetSource + 1}...`;
@@ -802,12 +825,12 @@ async function changeSource() {
     }
     showError(
       reason instanceof Error
-        ? `${reason.message} Tap Change source again to try another one.`
-        : "This source is unavailable. Tap Change source again.",
+        ? `${reason.message} Choose another source or try again.`
+        : "This source is unavailable. Choose another source or try again.",
     );
   } finally {
     changingSource = false;
-    changeSourceButton.disabled = false;
+    updateSourceUi(currentInfo);
   }
 }
 
@@ -880,8 +903,8 @@ episodePicker.addEventListener("change", () => {
   }
 });
 
-changeSourceButton.addEventListener("click", () => {
-  void changeSource();
+sourcePicker.addEventListener("change", () => {
+  void changeSource(Number(sourcePicker.value));
 });
 
 playbackOptionsButton.addEventListener("click", () => {

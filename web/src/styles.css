@@ -124,9 +124,9 @@ video {
 }
 
 .playback-toolbar {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   align-items: stretch;
-  justify-content: space-between;
   gap: 10px;
   margin-bottom: 12px;
 }
@@ -135,22 +135,27 @@ video {
   display: none;
 }
 
-.episode-picker {
+.playback-toolbar.is-single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.toolbar-picker {
   position: relative;
   display: block;
-  width: min(220px, 100%);
+  width: 100%;
+  min-width: 0;
   color: #fff;
 }
 
-.episode-picker[hidden] {
+.toolbar-picker[hidden] {
   display: none;
 }
 
-.episode-picker select {
+.toolbar-picker select {
   width: 100%;
-  min-height: 46px;
+  height: 52px;
   appearance: none;
-  padding: 9px 38px 9px 14px;
+  padding: 10px 42px 10px 16px;
   border: 1px solid color-mix(in srgb, var(--tg-theme-button-color, #8b5cf6) 42%, transparent);
   border-radius: 14px;
   outline: none;
@@ -164,45 +169,19 @@ video {
   color-scheme: dark;
 }
 
-.episode-picker select:focus-visible {
+.toolbar-picker select:focus-visible {
   border-color: var(--tg-theme-button-color, #8b5cf6);
   box-shadow:
     0 0 0 3px color-mix(in srgb, var(--tg-theme-button-color, #8b5cf6) 30%, transparent),
     0 8px 24px rgb(0 0 0 / 28%);
 }
 
-.episode-picker select:disabled {
+.toolbar-picker select:disabled {
   cursor: wait;
   opacity: 0.68;
 }
 
-.source-button {
-  min-height: 46px;
-  padding: 9px 16px;
-  border: 1px solid color-mix(in srgb, var(--tg-theme-button-color, #8b5cf6) 42%, transparent);
-  border-radius: 14px;
-  color: var(--tg-theme-button-text-color, #fff);
-  background: var(--tg-theme-button-color, #7c3aed);
-  box-shadow: 0 10px 28px rgb(0 0 0 / 18%);
-  cursor: pointer;
-  font-weight: 700;
-}
-
-.source-button::before {
-  margin-right: 7px;
-  content: "\21C4";
-}
-
-.source-button[hidden] {
-  display: none;
-}
-
-.source-button:disabled {
-  cursor: wait;
-  opacity: 0.68;
-}
-
-.episode-picker-chevron {
+.toolbar-picker-chevron {
   position: absolute;
   top: 50%;
   right: 15px;
@@ -417,16 +396,8 @@ video {
     border-radius: 14px;
   }
 
-  .episode-picker {
-    width: min(190px, 100%);
-  }
-
   .playback-toolbar {
     margin-bottom: 10px;
-  }
-
-  .source-button {
-    flex: 1 1 auto;
   }
 
   .episode-controls {
@@ -468,13 +439,14 @@ video {
     flex-basis: 38px;
   }
 
-  .playback-toolbar {
-    flex-wrap: wrap;
+  .toolbar-picker select {
+    padding-right: 34px;
+    padding-left: 12px;
+    font-size: clamp(0.86rem, 4vw, 1rem);
   }
 
-  .episode-picker,
-  .source-button {
-    width: 100%;
+  .toolbar-picker-chevron {
+    right: 13px;
   }
 
   .episode-controls {

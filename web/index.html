@@ -48,14 +48,16 @@
       </header>
 
       <div id="playback-toolbar" class="playback-toolbar" hidden>
-        <label id="episode-picker-shell" class="episode-picker" hidden>
+        <label id="episode-picker-shell" class="toolbar-picker" hidden>
           <span class="visually-hidden">Choose an episode</span>
           <select id="episode-picker" aria-label="Choose an episode"></select>
-          <span class="episode-picker-chevron" aria-hidden="true"></span>
+          <span class="toolbar-picker-chevron" aria-hidden="true"></span>
         </label>
-        <button id="change-source" class="source-button" type="button" hidden>
-          Change source
-        </button>
+        <label id="source-picker-shell" class="toolbar-picker" hidden>
+          <span class="visually-hidden">Choose a source</span>
+          <select id="source-picker" aria-label="Choose a source"></select>
+          <span class="toolbar-picker-chevron" aria-hidden="true"></span>
+        </label>
       </div>
 
       <section class="player-card" aria-label="Video player">

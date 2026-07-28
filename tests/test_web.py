@@ -35,7 +35,8 @@ def test_mini_app_exposes_dynamic_hls_track_controls() -> None:
     assert 'id="quality-picker"' in html
     assert 'id="audio-picker"' in html
     assert 'id="subtitle-picker"' in html
-    assert 'id="change-source"' in html
+    assert 'id="source-picker-shell"' in html
+    assert 'id="source-picker"' in html
     assert "Hls.Events.AUDIO_TRACKS_UPDATED" in script
     assert "Hls.Events.SUBTITLE_TRACKS_UPDATED" in script
     assert "hls.currentLevel = level" in script
@@ -43,6 +44,8 @@ def test_mini_app_exposes_dynamic_hls_track_controls() -> None:
     assert "streamControlsExpanded = !streamControlsExpanded" in script
     assert 'api("/api/playback", { method: "POST" })' in script
     assert 'api("/api/playback/source"' in script
+    assert "changeSource(Number(sourcePicker.value))" in script
+    assert "`Source ${index + 1}`" in script
     assert "video.currentTime = targetPosition" in script
 
 
