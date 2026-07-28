@@ -37,6 +37,8 @@ let hls = null;
 let playerEvents = null;
 let lastSavedAt = 0;
 let lastSavedPlaybackId = "";
+let progressEventSequence = 0;
+let lastProgressObservation = null;
 let completed = false;
 let changingEpisode = false;
 let changingSource = false;
@@ -188,12 +190,18 @@ async function api(path, options = {}) {
   return response.json();
 }
 
-function progressSnapshot(
-  isComplete = false,
+function progressObservation(
   positionOverride = null,
   durationOverride = null,
   targetPlaybackId = playbackId,
+  preferCached = false,
 ) {
+  if (
+    preferCached &&
+    lastProgressObservation?.playback_id === targetPlaybackId
+  ) {
+    return { ...lastProgressObservation };
+  }
   const positionValue =
     positionOverride === null ? video.currentTime : Number(positionOverride);
   const durationValue =
@@ -207,10 +215,50 @@ function progressSnapshot(
   ) {
     return null;
   }
-  return {
+  const previous =
+    lastProgressObservation?.playback_id === targetPlaybackId
+      ? lastProgressObservation
+      : null;
+  // Telegram's iOS WebView can reset currentTime to exactly zero while the
+  // player is being detached. Preserve the last real observation in that
+  // narrow case instead of converting a close event into a restart.
+  if (
+    positionValue <= 0.25 &&
+    Number(previous?.position) >= 5 &&
+    !video.ended
+  ) {
+    return { ...previous };
+  }
+  const observation = {
     playback_id: targetPlaybackId,
     position: Math.max(0, positionValue || 0),
     duration: Number.isFinite(durationValue) ? Math.max(0, durationValue) : 0,
+    observed_at_ms: Date.now(),
+  };
+  if (targetPlaybackId === playbackId) {
+    lastProgressObservation = observation;
+  }
+  return { ...observation };
+}
+
+function progressSnapshot(
+  isComplete = false,
+  positionOverride = null,
+  durationOverride = null,
+  targetPlaybackId = playbackId,
+  preferCached = false,
+) {
+  const observation = progressObservation(
+    positionOverride,
+    durationOverride,
+    targetPlaybackId,
+    preferCached,
+  );
+  if (!observation) return null;
+  progressEventSequence += 1;
+  return {
+    ...observation,
+    event_sequence: progressEventSequence,
     completed: isComplete,
   };
 }
@@ -221,12 +269,14 @@ async function saveProgress(
   positionOverride = null,
   durationOverride = null,
   targetPlaybackId = playbackId,
+  preferCached = false,
 ) {
   const snapshot = progressSnapshot(
     isComplete,
     positionOverride,
     durationOverride,
     targetPlaybackId,
+    preferCached,
   );
   if (!snapshot) return false;
   const now = Date.now();
@@ -263,6 +313,7 @@ function sendProgressBeacon(
     positionOverride,
     durationOverride,
     targetPlaybackId,
+    positionOverride === null,
   );
   if (!snapshot) return false;
   try {
@@ -644,6 +695,13 @@ function updateEpisodeUi(info) {
   completed = false;
   lastSavedAt = 0;
   lastSavedPlaybackId = "";
+  const initialPosition = Math.max(0, Number(info.start_position) || 0);
+  lastProgressObservation = {
+    playback_id: info.playback_id,
+    position: initialPosition,
+    duration: 0,
+    observed_at_ms: Date.now(),
+  };
   title.textContent = info.title;
   subtitle.textContent = [info.season, info.language].filter(Boolean).join(" · ");
   episode.textContent = `${info.episode} / ${info.total_episodes}`;
@@ -651,7 +709,7 @@ function updateEpisodeUi(info) {
     Number(info.source_count) > 1
       ? `Source ${Number(info.source_index) + 1}`
       : info.source;
-  progress.textContent = formatTime(info.start_position);
+  progress.textContent = formatTime(initialPosition);
   previous.disabled = !info.has_previous;
   next.disabled = !info.has_next;
   updateEpisodePicker(info);
@@ -1415,7 +1473,7 @@ document.addEventListener("visibilitychange", () => {
       );
     }
   } else if (!sendProgressBeacon()) {
-    void saveProgress(true, false);
+    void saveProgress(true, false, null, null, playbackId, true);
   }
 });
 
@@ -1436,7 +1494,7 @@ window.addEventListener("pagehide", () => {
         );
       }
     } else if (!sendProgressBeacon()) {
-      void saveProgress(true, false);
+      void saveProgress(true, false, null, null, playbackId, true);
     }
   }
   if (castProgressTimer) window.clearInterval(castProgressTimer);

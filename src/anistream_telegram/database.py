@@ -211,6 +211,26 @@ class EpisodeProgress(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
 
 
+class EpisodeProgressCursor(Base):
+    """Latest accepted client observation for one episode.
+
+    Keeping ordering metadata separately avoids altering the existing
+    episode_progress table on deployed PostgreSQL databases. create_all()
+    creates this table during the normal application startup.
+    """
+
+    __tablename__ = "episode_progress_cursors"
+
+    watch_state_id: Mapped[int] = mapped_column(
+        ForeignKey("watch_states.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    episode: Mapped[int] = mapped_column(Integer, primary_key=True)
+    observed_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    event_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
 class Database:
     def __init__(self, url: str) -> None:
         connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
@@ -727,7 +747,12 @@ class Database:
         position: float,
         duration: float,
         completed: bool,
-    ) -> None:
+        *,
+        observed_at_ms: int | None = None,
+        event_sequence: int | None = None,
+    ) -> bool:
+        if (observed_at_ms is None) != (event_sequence is None):
+            raise ValueError("progress ordering metadata must be supplied together")
         provider_id, catalogue_url, identity = self.catalogue_identity(catalogue_payload)
         total = max(1, int(catalogue_payload.get("total_episodes", 1)))
         episode = max(1, min(total, int(episode)))
@@ -753,6 +778,35 @@ class Database:
                 )
                 session.add(state)
                 await session.flush()
+
+            if observed_at_ms is not None and event_sequence is not None:
+                cursor = await session.scalar(
+                    select(EpisodeProgressCursor)
+                    .where(
+                        EpisodeProgressCursor.watch_state_id == state.id,
+                        EpisodeProgressCursor.episode == episode,
+                    )
+                    .with_for_update()
+                )
+                incoming_order = (observed_at_ms, event_sequence)
+                if cursor is not None and incoming_order <= (
+                    cursor.observed_at_ms,
+                    cursor.event_sequence,
+                ):
+                    return False
+                if cursor is None:
+                    cursor = EpisodeProgressCursor(
+                        watch_state_id=state.id,
+                        episode=episode,
+                        observed_at_ms=observed_at_ms,
+                        event_sequence=event_sequence,
+                    )
+                    session.add(cursor)
+                else:
+                    cursor.observed_at_ms = observed_at_ms
+                    cursor.event_sequence = event_sequence
+                    cursor.updated_at = now
+
             state.catalogue_payload = catalogue_payload
             state.last_played_episode = episode
             state.updated_at = now
@@ -780,6 +834,7 @@ class Database:
             # point again, even if that episode was completed in the past.
             progress.completed = completed
             progress.updated_at = now
+            return True
 
     async def continue_watching(
         self,

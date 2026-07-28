@@ -210,6 +210,50 @@ async def test_positions_are_stored_per_episode(tmp_path: Path) -> None:
         await database.close()
 
 
+async def test_stale_progress_event_cannot_overwrite_newer_position(
+    tmp_path: Path,
+) -> None:
+    database = await database_at(tmp_path / "db.sqlite")
+    try:
+        assert await database.record_progress(
+            123,
+            catalogue(),
+            6,
+            331.0,
+            1435.0,
+            False,
+            observed_at_ms=2_000,
+            event_sequence=2,
+        )
+        assert not await database.record_progress(
+            123,
+            catalogue(),
+            6,
+            0.0,
+            1435.0,
+            False,
+            observed_at_ms=1_000,
+            event_sequence=3,
+        )
+        assert await database.episode_position(123, catalogue(), 6) == 331.0
+
+        # A genuinely newer backward seek must still be accepted; ordering is
+        # based on the observation, never on taking the maximum position.
+        assert await database.record_progress(
+            123,
+            catalogue(),
+            6,
+            120.0,
+            1435.0,
+            False,
+            observed_at_ms=3_000,
+            event_sequence=4,
+        )
+        assert await database.episode_position(123, catalogue(), 6) == 120.0
+    finally:
+        await database.close()
+
+
 async def test_skip_forward_then_rewind_resumes_last_interrupted_episode(
     tmp_path: Path,
 ) -> None:

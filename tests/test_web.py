@@ -73,6 +73,11 @@ def test_mini_app_defers_saved_resume_until_media_is_seekable() -> None:
     assert "positionOverride === null" in script
     assert 'navigator.sendBeacon(' in script
     assert '"/api/progress/beacon"' in script
+    assert "lastProgressObservation" in script
+    assert "observed_at_ms: Date.now()" in script
+    assert "event_sequence: progressEventSequence" in script
+    assert "positionValue <= 0.25" in script
+    assert "playbackId, true" in script
 
 
 def test_mini_app_exposes_cross_browser_picture_in_picture() -> None:
@@ -723,10 +728,33 @@ async def test_paused_progress_is_returned_after_reopening_player(
                 "position": 331.0,
                 "duration": 1440.0,
                 "completed": False,
+                "observed_at_ms": 2_000,
+                "event_sequence": 2,
                 "csrf_token": first_csrf,
             },
         )
         assert paused.status == 200
+        assert (await paused.json())["accepted"] is True
+        assert await database.episode_position(123, catalogue(), 3) == 331.0
+
+        stale_close = await client.post(
+            "/api/progress/beacon",
+            headers={
+                "Origin": settings.public_origin,
+                "Cookie": f"{settings.cookie_name}={first_session}",
+            },
+            json={
+                "playback_id": first_payload["playback_id"],
+                "position": 0.0,
+                "duration": 1440.0,
+                "completed": False,
+                "observed_at_ms": 1_000,
+                "event_sequence": 3,
+                "csrf_token": first_csrf,
+            },
+        )
+        assert stale_close.status == 200
+        assert (await stale_close.json())["accepted"] is False
         assert await database.episode_position(123, catalogue(), 3) == 331.0
 
         reopened_session, reopened_csrf = await database.create_web_session(

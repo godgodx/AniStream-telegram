@@ -667,15 +667,39 @@ class WebRoutes:
         completed = reported_complete or (
             duration >= 60 and position / max(duration, 1) >= 0.95
         )
-        await self.database.record_progress(
+        observed_at_raw = payload.get("observed_at_ms")
+        event_sequence_raw = payload.get("event_sequence")
+        if (observed_at_raw is None) != (event_sequence_raw is None):
+            raise web.HTTPBadRequest(text="Progress ordering metadata is incomplete")
+        observed_at_ms: int | None = None
+        event_sequence: int | None = None
+        if observed_at_raw is not None and event_sequence_raw is not None:
+            if (
+                isinstance(observed_at_raw, bool)
+                or isinstance(event_sequence_raw, bool)
+                or not isinstance(observed_at_raw, int)
+                or not isinstance(event_sequence_raw, int)
+                or observed_at_raw < 0
+                or event_sequence_raw < 0
+                or observed_at_raw > 9_007_199_254_740_991
+                or event_sequence_raw > 9_007_199_254_740_991
+            ):
+                raise web.HTTPBadRequest(
+                    text="Progress ordering metadata is invalid"
+                )
+            observed_at_ms = observed_at_raw
+            event_sequence = event_sequence_raw
+        accepted = await self.database.record_progress(
             session.telegram_user_id,
             dict(playback.catalogue_payload),
             playback.episode,
             position,
             duration,
             completed,
+            observed_at_ms=observed_at_ms,
+            event_sequence=event_sequence,
         )
-        return {"ok": True, "completed": completed}
+        return {"ok": True, "accepted": accepted, "completed": completed}
 
     async def cast(self, request: web.Request) -> web.Response:
         session = await self._authenticated(request)
