@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-from urllib.parse import urlparse
+from dataclasses import replace
 from typing import Any
+from urllib.parse import urlparse
 
 from anistream.models import (
     Catalogue,
@@ -200,24 +201,54 @@ class CoreService:
         episode_number: int,
         *,
         actor_key: object = "internal",
+        preferred_source_index: int | None = None,
     ) -> ResolvedMedia:
         async with self.provider_capacity.slot(str(actor_key)):
             return await asyncio.to_thread(
                 self._prepare_media_sync,
                 payload,
                 episode_number,
+                preferred_source_index,
             )
 
     def _prepare_media_sync(
         self,
         payload: dict[str, Any],
         episode_number: int,
+        preferred_source_index: int | None = None,
     ) -> ResolvedMedia:
         catalogue = catalogue_from_payload(payload)
         if not 1 <= episode_number <= len(catalogue.episodes):
             raise ValueError("episode is outside the catalogue")
-        plan = self.planner.plan(catalogue, [episode_number])
         episode = catalogue.episodes[episode_number - 1]
+        supported = [
+            candidate
+            for candidate in episode.candidates
+            if self.resolvers.supports(candidate.url)
+        ]
+        if not supported:
+            raise RuntimeError("all sources failed: no supported source")
+
+        if preferred_source_index is not None:
+            if not 0 <= preferred_source_index < len(supported):
+                raise ValueError("source is outside the available range")
+            candidate = supported[preferred_source_index]
+            try:
+                media = self.resolvers.resolve(candidate.url)
+                probe = self.probe.probe(media)
+                if not probe.valid:
+                    raise ValueError(probe.detail)
+                return replace(
+                    media,
+                    source_index=preferred_source_index,
+                    source_count=len(supported),
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"selected source failed: {candidate.player}: {exc}"
+                ) from exc
+
+        plan = self.planner.plan(catalogue, [episode_number])
         errors: list[str] = []
         for candidate in plan.routes.get(episode_number, list(episode.candidates)):
             try:
@@ -227,7 +258,12 @@ class CoreService:
                     probe = self.probe.probe(media)
                     if not probe.valid:
                         raise ValueError(probe.detail)
-                return media
+                source_index = supported.index(candidate)
+                return replace(
+                    media,
+                    source_index=source_index,
+                    source_count=len(supported),
+                )
             except Exception as exc:
                 errors.append(f"{candidate.player}: {exc}")
         raise RuntimeError("all sources failed: " + "; ".join(errors))

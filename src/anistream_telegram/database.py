@@ -673,6 +673,19 @@ class Database:
         catalogue_payload: dict[str, Any],
         episode: int,
     ) -> float:
+        value = await self.saved_episode_position(
+            user_id,
+            catalogue_payload,
+            episode,
+        )
+        return float(value or 0.0)
+
+    async def saved_episode_position(
+        self,
+        user_id: int,
+        catalogue_payload: dict[str, Any],
+        episode: int,
+    ) -> float | None:
         _, _, identity = self.catalogue_identity(catalogue_payload)
         async with self.sessions() as session:
             value = await session.scalar(
@@ -684,7 +697,7 @@ class Database:
                     EpisodeProgress.episode == episode,
                 )
             )
-            return float(value or 0.0)
+            return None if value is None else float(value)
 
     async def cleanup(self) -> None:
         now = utcnow()

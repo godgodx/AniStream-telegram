@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from contextlib import AsyncExitStack
 from datetime import timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -14,6 +15,8 @@ from anistream_telegram.media import (
     MAX_PLAYLIST_INPUT_BYTES,
     MAX_PLAYLIST_REFERENCES,
     MAX_PLAYLIST_TOKEN_LENGTH,
+    MAX_REQUESTS_PER_PLAYBACK_SESSION,
+    PLAYBACK_SESSION_IDLE_SECONDS,
     MediaGateway,
 )
 
@@ -34,6 +37,49 @@ class FakeResponse:
 
     def release(self) -> None:
         self.released = True
+
+
+async def test_stream_limit_counts_sessions_not_hls_requests(tmp_path: Path) -> None:
+    gateway = MediaGateway(config(tmp_path), Database(config(tmp_path).database_url))
+
+    async with AsyncExitStack() as stack:
+        for _ in range(4):
+            await stack.enter_async_context(gateway._stream_slot(123, "web:first"))
+        await stack.enter_async_context(gateway._stream_slot(123, "web:second"))
+
+        with pytest.raises(web.HTTPTooManyRequests) as error:
+            async with gateway._stream_slot(123, "web:third"):
+                pass
+        assert "playback sessions" in error.value.text
+
+
+async def test_stream_limit_keeps_per_session_request_backpressure(
+    tmp_path: Path,
+) -> None:
+    gateway = MediaGateway(config(tmp_path), Database(config(tmp_path).database_url))
+
+    async with AsyncExitStack() as stack:
+        for _ in range(MAX_REQUESTS_PER_PLAYBACK_SESSION):
+            await stack.enter_async_context(gateway._stream_slot(123, "web:first"))
+
+        with pytest.raises(web.HTTPTooManyRequests) as error:
+            async with gateway._stream_slot(123, "web:first"):
+                pass
+        assert "media requests" in error.value.text
+
+
+async def test_idle_playback_session_slots_are_released(tmp_path: Path) -> None:
+    gateway = MediaGateway(config(tmp_path), Database(config(tmp_path).database_url))
+
+    async with gateway._stream_slot(123, "web:first"):
+        pass
+    async with gateway._stream_slot(123, "web:second"):
+        pass
+    for activity in gateway._active[123].values():
+        activity.last_seen -= PLAYBACK_SESSION_IDLE_SECONDS + 1
+
+    async with gateway._stream_slot(123, "web:third"):
+        pass
 
 
 def config(tmp_path: Path) -> Config:
@@ -76,6 +122,7 @@ async def test_hls_playlist_urls_are_opaque_and_bound(tmp_path: Path) -> None:
     upstream = FakeResponse(
         (
             b"#EXTM3U\n"
+            b"#EXT-X-START:TIME-OFFSET=120.0\n"
             b'#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n'
             b"#EXTINF:10,\nsegment-001.ts\n"
         ),
@@ -84,6 +131,7 @@ async def test_hls_playlist_urls_are_opaque_and_bound(tmp_path: Path) -> None:
     response = await gateway._playlist_response(playback, upstream, str(upstream.url))
     assert upstream.released
     assert "cdn.example" not in response.text
+    assert "#EXT-X-START" not in response.text
     assert "segment-001.ts" not in response.text
     assert 'URI="/media/playback-id/resource?t=' in response.text
 

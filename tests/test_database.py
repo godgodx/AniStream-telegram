@@ -144,6 +144,7 @@ async def test_rewatch_does_not_move_continuation_backwards(tmp_path: Path) -> N
 async def test_positions_are_stored_per_episode(tmp_path: Path) -> None:
     database = await database_at(tmp_path / "db.sqlite")
     try:
+        assert await database.saved_episode_position(123, catalogue(), 2) is None
         await database.record_progress(123, catalogue(), 2, 88.5, 1500, False)
         entries = await database.continue_watching(123)
         assert entries[0]["next_episode"] == 2
@@ -151,6 +152,10 @@ async def test_positions_are_stored_per_episode(tmp_path: Path) -> None:
         entries = await database.continue_watching(123)
         assert entries[0]["next_episode"] == 4
         assert entries[0]["resume_episode"] == 4
+        assert (
+            await database.saved_episode_position(123, catalogue(), 2)
+            == 88.5
+        )
         assert await database.episode_position(123, catalogue(), 2) == 88.5
         assert await database.episode_position(123, catalogue(), 4) == 240.0
     finally:

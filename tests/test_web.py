@@ -35,12 +35,15 @@ def test_mini_app_exposes_dynamic_hls_track_controls() -> None:
     assert 'id="quality-picker"' in html
     assert 'id="audio-picker"' in html
     assert 'id="subtitle-picker"' in html
+    assert 'id="change-source"' in html
     assert "Hls.Events.AUDIO_TRACKS_UPDATED" in script
     assert "Hls.Events.SUBTITLE_TRACKS_UPDATED" in script
     assert "hls.currentLevel = level" in script
     assert '"Unavailable"' in script
     assert "streamControlsExpanded = !streamControlsExpanded" in script
     assert 'api("/api/playback", { method: "POST" })' in script
+    assert 'api("/api/playback/source"' in script
+    assert "video.currentTime = targetPosition" in script
 
 
 def test_episode_picker_is_outside_native_video_controls() -> None:
@@ -56,6 +59,7 @@ def test_episode_picker_is_outside_native_video_controls() -> None:
 class FakeCore:
     def __init__(self) -> None:
         self.calls = 0
+        self.requests: list[dict] = []
 
     async def prepare_media(
         self,
@@ -63,13 +67,24 @@ class FakeCore:
         episode: int,
         *,
         actor_key: object = "internal",
+        preferred_source_index: int | None = None,
     ) -> SimpleNamespace:
         self.calls += 1
+        source_index = preferred_source_index or 0
+        self.requests.append(
+            {
+                "episode": episode,
+                "actor_key": actor_key,
+                "source_index": source_index,
+            }
+        )
         return SimpleNamespace(
-            url=f"https://cdn.example/episode-{episode}.mp4",
+            url=f"https://cdn.example/episode-{episode}-source-{source_index}.mp4",
             headers={"Referer": "https://provider.example/"},
             kind="mp4",
             resolver_name="Test resolver",
+            source_index=source_index,
+            source_count=2,
         )
 
 
@@ -316,6 +331,125 @@ async def test_playback_and_session_expose_current_autoplay_setting(
         )
         assert playback_response.status == 200
         assert (await playback_response.json())["autoplay_enabled"] is False
+    finally:
+        await client.close()
+        await database.close()
+
+
+async def test_playback_without_saved_progress_forces_zero_start(
+    tmp_path: Path,
+) -> None:
+    settings = config(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize(settings.allowed_users)
+    raw_session, csrf = await database.create_web_session(
+        123,
+        {
+            "catalogue": catalogue(),
+            "episode": 3,
+            "start_position": 900,
+        },
+        ttl_seconds=600,
+    )
+    media = MediaGateway(settings, database)
+    app = web.Application(middlewares=[error_boundary, security_headers])
+    app[CONFIG_KEY] = settings
+    WebRoutes(settings, database, FakeCore(), media).register(app)  # type: ignore[arg-type]
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.post(
+            "/api/playback",
+            headers={
+                "Origin": settings.public_origin,
+                "X-CSRF-Token": csrf,
+                "Cookie": f"{settings.cookie_name}={raw_session}",
+            },
+        )
+
+        assert response.status == 200
+        assert (await response.json())["start_position"] == 0.0
+    finally:
+        await client.close()
+        await database.close()
+
+
+async def test_source_change_keeps_saved_progress_and_selects_requested_source(
+    tmp_path: Path,
+) -> None:
+    settings = config(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize(settings.allowed_users)
+    await database.record_progress(123, catalogue(), 3, 125.5, 1500, False)
+    raw_session, csrf = await database.create_web_session(
+        123,
+        {
+            "catalogue": catalogue(),
+            "episode": 3,
+            "start_position": 125.5,
+        },
+        ttl_seconds=600,
+    )
+    current = await database.create_playback(
+        123,
+        catalogue(),
+        3,
+        media_url="https://cdn.example/episode-3-source-0.mp4",
+        media_headers={},
+        media_kind="mp4",
+        source_name="Test resolver",
+        ttl_seconds=600,
+    )
+    core = FakeCore()
+    media = MediaGateway(settings, database)
+    app = web.Application(middlewares=[error_boundary, security_headers])
+    app[CONFIG_KEY] = settings
+    WebRoutes(settings, database, core, media).register(app)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        rejected = await client.post(
+            "/api/playback/source",
+            headers={
+                "Cookie": f"{settings.cookie_name}={raw_session}",
+            },
+            json={
+                "playback_id": current.id,
+                "source_index": 1,
+            },
+        )
+        assert rejected.status == 403
+        assert core.calls == 0
+
+        response = await client.post(
+            "/api/playback/source",
+            headers={
+                "Origin": settings.public_origin,
+                "X-CSRF-Token": csrf,
+                "Cookie": f"{settings.cookie_name}={raw_session}",
+            },
+            json={
+                "playback_id": current.id,
+                "source_index": 1,
+            },
+        )
+
+        assert response.status == 200
+        payload = await response.json()
+        assert payload["source_index"] == 1
+        assert payload["source_count"] == 2
+        assert payload["has_alternative_source"] is True
+        assert payload["start_position"] == 125.5
+        assert core.requests == [
+            {
+                "episode": 3,
+                "actor_key": 123,
+                "source_index": 1,
+            }
+        ]
+        updated = await database.get_web_session(raw_session)
+        assert updated is not None
+        assert updated.payload["source_index"] == 1
     finally:
         await client.close()
         await database.close()

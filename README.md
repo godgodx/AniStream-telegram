@@ -236,6 +236,12 @@ when the page closes. Series expose an episode selector plus previous/next
 controls. They advance automatically after the current episode finishes when
 the user's per-account autoplay setting is enabled.
 
+When an episode exposes multiple supported players, **Change source** moves to
+the next numbered source while preserving the saved position. Sources remain
+anonymous in the UI. A title with no stored per-episode progress is explicitly
+started at `0:00`; upstream HLS start offsets are ignored so provider or WebView
+state cannot move a new playback forward.
+
 For HLS masters, the player also discovers available renditions, alternate
 audio tracks, and subtitle tracks after the manifest loads. Quality defaults
 to adaptive mode. The playback-options panel remains accessible for every
@@ -294,7 +300,7 @@ Important configuration:
 | `TELEGRAM_ALLOWED_USERS` | Initial numeric Telegram ID whitelist |
 | `SESSION_TTL_SECONDS` | Authenticated Mini App session lifetime |
 | `PLAYBACK_TTL_SECONDS` | Media session lifetime |
-| `MAX_STREAMS_PER_USER` | Concurrent gateway stream limit |
+| `MAX_STREAMS_PER_USER` | Concurrent Mini App/cast playback-session limit |
 | `MEDIA_ALLOWED_HOSTS` | Optional strict media/CDN hostname allowlist |
 | `ANIME_SAMA_USER_AGENT` | Optional provider-specific browser user agent |
 | `ANIME_SAMA_CF_CLEARANCE` | Optional private Cloudflare clearance value |
@@ -394,6 +400,10 @@ through the neutral core as a stable code and user-facing label.
 - Provider-backed bot actions and Mini App playback preparation are rate
   limited per Telegram user. A shared fail-fast capacity limit prevents
   unbounded provider thread and socket work.
+- Media concurrency is counted by distinct Mini App/cast playback session,
+  rather than by individual HLS segment. Each session still has an internal
+  request cap, so adaptive video, audio, and subtitles can load concurrently
+  without removing anti-abuse backpressure.
 - Unlisted users can invoke only the exact `/id` command in a private chat;
   callbacks, other commands, launch tickets, and Mini App authentication remain
   blocked.

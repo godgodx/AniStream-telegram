@@ -72,6 +72,8 @@ class ResolvedMedia:
     resolver_name: str
     headers: Mapping[str, str] = field(default_factory=dict)
     kind: str = "unknown"
+    source_index: int = 0
+    source_count: int = 1
 
 
 @dataclass(slots=True)

@@ -47,11 +47,16 @@
         </div>
       </header>
 
-      <label id="episode-picker-shell" class="episode-picker" hidden>
-        <span class="visually-hidden">Choose an episode</span>
-        <select id="episode-picker" aria-label="Choose an episode"></select>
-        <span class="episode-picker-chevron" aria-hidden="true"></span>
-      </label>
+      <div id="playback-toolbar" class="playback-toolbar" hidden>
+        <label id="episode-picker-shell" class="episode-picker" hidden>
+          <span class="visually-hidden">Choose an episode</span>
+          <select id="episode-picker" aria-label="Choose an episode"></select>
+          <span class="episode-picker-chevron" aria-hidden="true"></span>
+        </label>
+        <button id="change-source" class="source-button" type="button" hidden>
+          Change source
+        </button>
+      </div>
 
       <section class="player-card" aria-label="Video player">
         <video

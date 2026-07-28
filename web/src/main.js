@@ -13,8 +13,10 @@ const fullscreen = document.querySelector("#fullscreen");
 const previous = document.querySelector("#previous");
 const next = document.querySelector("#next");
 const autoplayStatus = document.querySelector("#autoplay-status");
+const playbackToolbar = document.querySelector("#playback-toolbar");
 const episodePickerShell = document.querySelector("#episode-picker-shell");
 const episodePicker = document.querySelector("#episode-picker");
+const changeSourceButton = document.querySelector("#change-source");
 const castButton = document.querySelector("#cast");
 const castStatus = document.querySelector("#cast-status");
 const playbackOptionsButton = document.querySelector("#playback-options");
@@ -32,6 +34,8 @@ let lastSavedAt = 0;
 let lastSavedPlaybackId = "";
 let completed = false;
 let changingEpisode = false;
+let changingSource = false;
+let sourceCursor = 0;
 let preferredQualityHeight = 0;
 let preferredAudio = "";
 let preferredSubtitle = "";
@@ -296,6 +300,7 @@ function updateEpisodePicker(info) {
     episodePickerShell.hidden = true;
     episodePicker.disabled = true;
     episodePicker.replaceChildren();
+    updatePlaybackToolbar();
     return;
   }
 
@@ -313,6 +318,28 @@ function updateEpisodePicker(info) {
   episodePicker.value = String(info.episode);
   episodePicker.disabled = changingEpisode;
   episodePickerShell.hidden = false;
+  updatePlaybackToolbar();
+}
+
+function updatePlaybackToolbar() {
+  playbackToolbar.hidden =
+    episodePickerShell.hidden && changeSourceButton.hidden;
+}
+
+function updateSourceUi(info) {
+  const sourceCount = Math.max(1, Number(info.source_count) || 1);
+  const sourceIndex = Math.max(
+    0,
+    Math.min(sourceCount - 1, Number(info.source_index) || 0),
+  );
+  sourceCursor = sourceIndex;
+  changeSourceButton.hidden = sourceCount <= 1;
+  changeSourceButton.disabled = changingSource;
+  changeSourceButton.textContent =
+    `Change source (${sourceIndex + 1}/${sourceCount})`;
+  changeSourceButton.title =
+    `Currently using source ${sourceIndex + 1} of ${sourceCount}`;
+  updatePlaybackToolbar();
 }
 
 function updateAutoplayUi(info) {
@@ -338,6 +365,7 @@ function updateEpisodeUi(info) {
   previous.disabled = !info.has_previous;
   next.disabled = !info.has_next;
   updateEpisodePicker(info);
+  updateSourceUi(info);
   updateAutoplayUi(info);
 }
 
@@ -385,7 +413,7 @@ function attachPlayer(info, { autoplay = false } = {}) {
       }
     });
     hls.on(Hls.Events.ERROR, (_, data) => {
-      if (data.fatal && !changingEpisode) {
+      if (data.fatal && !changingEpisode && !changingSource) {
         showError("The stream stopped. Try another episode or reopen it from the bot.");
       }
     });
@@ -397,12 +425,16 @@ function attachPlayer(info, { autoplay = false } = {}) {
   video.addEventListener(
     "loadedmetadata",
     () => {
-      if (
-        !resumeApplied &&
-        info.start_position > 0 &&
-        info.start_position < video.duration - 5
-      ) {
-        video.currentTime = info.start_position;
+      if (!resumeApplied) {
+        const requestedPosition = Number(info.start_position);
+        const targetPosition =
+          Number.isFinite(requestedPosition) &&
+          requestedPosition > 0 &&
+          requestedPosition < video.duration - 5
+            ? requestedPosition
+            : 0;
+        video.currentTime = targetPosition;
+        progress.textContent = formatTime(targetPosition);
       }
       resumeApplied = true;
       if (!useHls || !Hls?.isSupported()) {
@@ -428,7 +460,12 @@ function attachPlayer(info, { autoplay = false } = {}) {
   video.addEventListener(
     "pause",
     () => {
-      if (!video.ended && !changingEpisode && !googleCastConnected()) {
+      if (
+        !video.ended &&
+        !changingEpisode &&
+        !changingSource &&
+        !googleCastConnected()
+      ) {
         void saveProgress(true, false);
       }
     },
@@ -453,7 +490,7 @@ function attachPlayer(info, { autoplay = false } = {}) {
   video.addEventListener(
     "error",
     () => {
-      if (!changingEpisode) {
+      if (!changingEpisode && !changingSource) {
         showError("This source cannot be played right now. Try another episode.");
       }
     },
@@ -461,7 +498,10 @@ function attachPlayer(info, { autoplay = false } = {}) {
   );
 }
 
-async function loadCurrentOnGoogleCast(info = currentInfo) {
+async function loadCurrentOnGoogleCast(
+  info = currentInfo,
+  positionOverride = null,
+) {
   if (!info || !googleCastReady || castLoadInFlight) return;
   const session = castContext?.getCurrentSession?.();
   if (!session) return;
@@ -482,9 +522,13 @@ async function loadCurrentOnGoogleCast(info = currentInfo) {
     mediaInfo.metadata = metadata;
     const request = new window.chrome.cast.media.LoadRequest(mediaInfo);
     request.autoplay = true;
+    const requestedPosition =
+      positionOverride === null ? video.currentTime : Number(positionOverride);
     request.currentTime = Math.max(
       0,
-      Number.isFinite(video.currentTime) ? video.currentTime : info.start_position,
+      Number.isFinite(requestedPosition)
+        ? requestedPosition
+        : Number(info.start_position) || 0,
     );
     await session.loadMedia(request);
     video.pause();
@@ -502,6 +546,7 @@ async function handleRemoteCastFinished() {
   if (
     castEndHandled ||
     changingEpisode ||
+    changingSource ||
     !currentInfo ||
     !remotePlayer
   ) {
@@ -552,6 +597,7 @@ function setupRemoteCastController() {
       googleCastConnected() &&
       remotePlayer?.isMediaLoaded &&
       !changingEpisode &&
+      !changingSource &&
       currentInfo
     ) {
       void saveProgress(
@@ -649,7 +695,7 @@ function setupCast() {
 }
 
 async function changeEpisode(targetEpisode, { autoplay = false } = {}) {
-  if (changingEpisode || !currentInfo) return;
+  if (changingEpisode || changingSource || !currentInfo) return;
   const target = Number(targetEpisode);
   if (
     !Number.isInteger(target) ||
@@ -685,7 +731,7 @@ async function changeEpisode(targetEpisode, { autoplay = false } = {}) {
     });
     attachPlayer(info, { autoplay: autoplay && !googleCastConnected() });
     if (googleCastConnected()) {
-      await loadCurrentOnGoogleCast(info);
+      await loadCurrentOnGoogleCast(info, info.start_position);
     }
   } catch (reason) {
     showError(
@@ -696,6 +742,72 @@ async function changeEpisode(targetEpisode, { autoplay = false } = {}) {
   } finally {
     changingEpisode = false;
     updateEpisodePicker(currentInfo);
+  }
+}
+
+async function changeSource() {
+  if (
+    changingSource ||
+    changingEpisode ||
+    !currentInfo ||
+    Number(currentInfo.source_count) <= 1
+  ) {
+    return;
+  }
+  const sourceCount = Number(currentInfo.source_count);
+  const targetSource = (sourceCursor + 1) % sourceCount;
+  sourceCursor = targetSource;
+  const wasPlaying = googleCastConnected()
+    ? Boolean(remotePlayer?.isMediaLoaded && !remotePlayer.isPaused)
+    : !video.paused;
+  changingSource = true;
+  changeSourceButton.disabled = true;
+  clearError();
+  loading.hidden = false;
+  status.textContent = `Preparing source ${targetSource + 1}...`;
+  try {
+    if (googleCastConnected() && remotePlayer?.isMediaLoaded) {
+      await saveProgress(
+        true,
+        false,
+        remotePlayer.currentTime,
+        remotePlayer.duration,
+      );
+      if (!remotePlayer.isPaused) {
+        remoteController?.playOrPause();
+      }
+    } else {
+      await saveProgress(true, false);
+      video.pause();
+    }
+    const info = await api("/api/playback/source", {
+      method: "POST",
+      body: JSON.stringify({
+        playback_id: currentInfo.playback_id,
+        source_index: targetSource,
+      }),
+    });
+    attachPlayer(info, { autoplay: wasPlaying && !googleCastConnected() });
+    if (googleCastConnected()) {
+      await loadCurrentOnGoogleCast(info, info.start_position);
+    }
+  } catch (reason) {
+    loading.hidden = true;
+    if (wasPlaying) {
+      if (googleCastConnected() && remotePlayer?.isPaused) {
+        remoteController?.playOrPause();
+      } else if (!googleCastConnected()) {
+        void video.play().catch(() => {});
+      }
+    }
+    showError(
+      reason instanceof Error
+        ? `${reason.message} Tap Change source again to try another one.`
+        : "This source is unavailable. Tap Change source again.",
+    );
+  } finally {
+    changingSource = false;
+    changeSourceButton.disabled = false;
   }
 }
 
@@ -766,6 +878,10 @@ episodePicker.addEventListener("change", () => {
   if (currentInfo && target !== currentInfo.episode) {
     void changeEpisode(target, { autoplay: true });
   }
+});
+
+changeSourceButton.addEventListener("click", () => {
+  void changeSource();
 });
 
 playbackOptionsButton.addEventListener("click", () => {

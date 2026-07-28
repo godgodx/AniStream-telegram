@@ -8,6 +8,7 @@ import socket
 import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, urljoin
 
@@ -16,7 +17,7 @@ from aiohttp import ClientResponse, web
 from aiohttp.abc import AbstractResolver
 
 from anistream_telegram.config import Config
-from anistream_telegram.database import Database, PlaybackSession
+from anistream_telegram.database import Database, PlaybackSession, token_hash
 from anistream_telegram.security import (
     AuthenticationError,
     OpaqueMediaToken,
@@ -49,6 +50,14 @@ MAX_PLAYLIST_OUTPUT_BYTES = 4_000_000
 MAX_PLAYLIST_REFERENCES = 8_192
 MAX_PLAYLIST_URI_LENGTH = 8_192
 MAX_PLAYLIST_TOKEN_LENGTH = 8_192
+MAX_REQUESTS_PER_PLAYBACK_SESSION = 12
+PLAYBACK_SESSION_IDLE_SECONDS = 30
+
+
+@dataclass(slots=True)
+class PlaybackActivity:
+    active_requests: int
+    last_seen: float
 
 
 class SafeResolver(AbstractResolver):
@@ -169,7 +178,7 @@ class MediaGateway:
         self.database = database
         self.tokens = OpaqueMediaToken(config.session_secret)
         self.upstream = UpstreamClient(config)
-        self._active: dict[int, int] = defaultdict(int)
+        self._active: dict[int, dict[str, PlaybackActivity]] = defaultdict(dict)
         self._active_lock = asyncio.Lock()
 
     async def start(self) -> None:
@@ -185,13 +194,13 @@ class MediaGateway:
         self,
         request: web.Request,
         playback_id: str,
-    ) -> tuple[int, PlaybackSession, str]:
+    ) -> tuple[int, PlaybackSession, str, str]:
         cast_token = request.query.get("cast", "")
         if cast_token:
             playback = await self.database.get_cast_playback(cast_token, playback_id)
             if playback is None:
                 raise web.HTTPForbidden(text="Cast session is unavailable")
-            return playback.telegram_user_id, playback, cast_token
+            return playback.telegram_user_id, playback, cast_token, "cast"
         raw_session = request.cookies.get(self.config.cookie_name, "")
         session = await self.database.get_web_session(raw_session)
         if session is None:
@@ -199,25 +208,55 @@ class MediaGateway:
         playback = await self.database.get_playback(playback_id, session.telegram_user_id)
         if playback is None:
             raise web.HTTPForbidden(text="Playback session is unavailable")
-        return session.telegram_user_id, playback, ""
+        return (
+            session.telegram_user_id,
+            playback,
+            "",
+            f"web:{token_hash(raw_session)}",
+        )
 
     @asynccontextmanager
-    async def _stream_slot(self, user_id: int):
+    async def _stream_slot(self, user_id: int, session_key: str):
         async with self._active_lock:
-            if self._active[user_id] >= self.config.max_streams_per_user:
+            now = time.monotonic()
+            sessions = self._active[user_id]
+            stale = [
+                key
+                for key, activity in sessions.items()
+                if activity.active_requests == 0
+                and now - activity.last_seen >= PLAYBACK_SESSION_IDLE_SECONDS
+            ]
+            for key in stale:
+                sessions.pop(key, None)
+            activity = sessions.get(session_key)
+            if (
+                activity is None
+                and len(sessions) >= self.config.max_streams_per_user
+            ):
                 raise web.HTTPTooManyRequests(
-                    text="Too many simultaneous streams for this account"
+                    text="Too many simultaneous playback sessions for this account"
                 )
-            self._active[user_id] += 1
+            if activity is None:
+                activity = PlaybackActivity(active_requests=0, last_seen=now)
+                sessions[session_key] = activity
+            if activity.active_requests >= MAX_REQUESTS_PER_PLAYBACK_SESSION:
+                raise web.HTTPTooManyRequests(
+                    text="Too many simultaneous media requests for this playback session"
+                )
+            activity.active_requests += 1
+            activity.last_seen = now
         try:
             yield
         finally:
             async with self._active_lock:
-                self._active[user_id] = max(0, self._active[user_id] - 1)
+                activity = self._active.get(user_id, {}).get(session_key)
+                if activity is not None:
+                    activity.active_requests = max(0, activity.active_requests - 1)
+                    activity.last_seen = time.monotonic()
 
     async def master(self, request: web.Request) -> web.StreamResponse:
         playback_id = request.match_info["playback_id"]
-        user_id, playback, cast_token = await self._session_and_playback(
+        user_id, playback, cast_token, session_key = await self._session_and_playback(
             request,
             playback_id,
         )
@@ -228,11 +267,12 @@ class MediaGateway:
             playback.media_url,
             force_playlist=playback.media_kind == "hls",
             cast_token=cast_token,
+            session_key=session_key,
         )
 
     async def resource(self, request: web.Request) -> web.StreamResponse:
         playback_id = request.match_info["playback_id"]
-        user_id, playback, cast_token = await self._session_and_playback(
+        user_id, playback, cast_token, session_key = await self._session_and_playback(
             request,
             playback_id,
         )
@@ -248,6 +288,7 @@ class MediaGateway:
             target,
             force_playlist=False,
             cast_token=cast_token,
+            session_key=session_key,
         )
 
     async def _serve_target(
@@ -259,12 +300,13 @@ class MediaGateway:
         *,
         force_playlist: bool,
         cast_token: str = "",
+        session_key: str,
     ) -> web.StreamResponse:
         range_header = request.headers.get("Range", "")
         if range_header and not RANGE_PATTERN.fullmatch(range_header):
             raise web.HTTPRequestRangeNotSatisfiable()
         try:
-            async with self._stream_slot(user_id):
+            async with self._stream_slot(user_id, session_key):
                 upstream = await self.upstream.request(
                     target,
                     dict(playback.media_headers),
@@ -357,6 +399,10 @@ class MediaGateway:
             line = raw_line.rstrip("\r\n")
             stripped = line.strip()
             if not stripped:
+                rewritten = ""
+            elif stripped.upper().startswith("#EXT-X-START:"):
+                # Resume position is owned by AniStream. An upstream start
+                # directive must not move a new playback away from 0 seconds.
                 rewritten = ""
             elif stripped.startswith("#"):
                 rewritten = URI_ATTRIBUTE.sub(

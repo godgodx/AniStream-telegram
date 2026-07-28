@@ -47,6 +47,7 @@ class WebRoutes:
         app.router.add_get("/api/session", self.session_info)
         app.router.add_post("/api/playback", self.playback)
         app.router.add_post("/api/playback/episode", self.change_episode)
+        app.router.add_post("/api/playback/source", self.change_source)
         app.router.add_post("/api/progress", self.progress)
         app.router.add_post("/api/cast", self.cast)
         app.router.add_post("/api/logout", self.logout)
@@ -168,6 +169,18 @@ class WebRoutes:
             raise web.HTTPBadRequest(text="Episode is outside the catalogue")
         return episode, total
 
+    @staticmethod
+    def _source_index(value: Any) -> int | None:
+        if value is None:
+            return None
+        try:
+            source_index = int(value)
+        except (TypeError, ValueError) as exc:
+            raise web.HTTPBadRequest(text="Source selection is malformed") from exc
+        if not 0 <= source_index < 20:
+            raise web.HTTPBadRequest(text="Source is outside the available range")
+        return source_index
+
     async def _prepare_episode(
         self,
         session: WebSession,
@@ -175,12 +188,15 @@ class WebRoutes:
         episode: int,
         total: int,
         start_position: float,
+        *,
+        preferred_source_index: int | None = None,
     ) -> dict[str, Any]:
         try:
             media = await self.core.prepare_media(
                 catalogue,
                 episode,
                 actor_key=session.telegram_user_id,
+                preferred_source_index=preferred_source_index,
             )
             public_url_parts(media.url, self.config.media_allowed_hosts)
         except CapacityExceeded as exc:
@@ -213,11 +229,19 @@ class WebRoutes:
         autoplay_enabled = await self.database.autoplay_enabled(
             session.telegram_user_id
         )
+        source_count = max(1, min(20, int(getattr(media, "source_count", 1))))
+        source_index = max(
+            0,
+            min(source_count - 1, int(getattr(media, "source_index", 0))),
+        )
         return {
             "playback_id": playback.id,
             "stream_url": f"/media/{playback.id}/master",
             "kind": playback.media_kind,
             "source": playback.source_name,
+            "source_index": source_index,
+            "source_count": source_count,
+            "has_alternative_source": source_count > 1,
             "episode": episode,
             "total_episodes": total,
             "has_previous": episode > 1,
@@ -237,16 +261,15 @@ class WebRoutes:
         launch = dict(session.payload)
         catalogue = self._catalogue(session)
         episode, total = self._episode(catalogue, launch.get("episode"))
-        stored_position = await self.database.episode_position(
+        stored_position = await self.database.saved_episode_position(
             session.telegram_user_id,
             catalogue,
             episode,
         )
-        start_position = (
-            stored_position
-            if stored_position > 0
-            else max(0.0, float(launch.get("start_position", 0.0) or 0.0))
-        )
+        # A missing row is different from a saved 0-second position. In both
+        # cases playback must begin deterministically at the start rather than
+        # inheriting an upstream or WebView playback offset.
+        start_position = 0.0 if stored_position is None else stored_position
         return web.json_response(
             await self._prepare_episode(
                 session,
@@ -265,21 +288,74 @@ class WebRoutes:
         payload = await self._json(request)
         catalogue = self._catalogue(session)
         episode, total = self._episode(catalogue, payload.get("episode"))
-        start_position = await self.database.episode_position(
+        stored_position = await self.database.saved_episode_position(
             session.telegram_user_id,
             catalogue,
             episode,
         )
+        start_position = 0.0 if stored_position is None else stored_position
+        preferred_source_index = self._source_index(payload.get("source_index"))
         response_payload = await self._prepare_episode(
             session,
             catalogue,
             episode,
             total,
             start_position,
+            preferred_source_index=preferred_source_index,
         )
         launch = dict(session.payload)
         launch["episode"] = episode
         launch["start_position"] = start_position
+        launch["source_index"] = response_payload["source_index"]
+        raw_session = request.cookies.get(self.config.cookie_name, "")
+        if not await self.database.update_web_session_payload(
+            raw_session,
+            session.telegram_user_id,
+            launch,
+        ):
+            raise web.HTTPUnauthorized(text="Authentication required")
+        return web.json_response(response_payload)
+
+    async def change_source(self, request: web.Request) -> web.Response:
+        session = await self._authenticated(request)
+        await self._csrf(request, session)
+        if not await self.playback_limiter.allow(str(session.telegram_user_id)):
+            raise web.HTTPTooManyRequests(text="Source changes are too frequent")
+        payload = await self._json(request)
+        playback_id = str(payload.get("playback_id", ""))
+        playback = await self.database.get_playback(
+            playback_id,
+            session.telegram_user_id,
+        )
+        if playback is None:
+            raise web.HTTPForbidden(text="Playback session is invalid")
+        catalogue = self._catalogue(session)
+        episode, total = self._episode(catalogue, session.payload.get("episode"))
+        if (
+            playback.episode != episode
+            or dict(playback.catalogue_payload) != catalogue
+        ):
+            raise web.HTTPForbidden(text="Playback session is no longer current")
+        preferred_source_index = self._source_index(payload.get("source_index"))
+        if preferred_source_index is None:
+            raise web.HTTPBadRequest(text="Choose a source")
+        stored_position = await self.database.saved_episode_position(
+            session.telegram_user_id,
+            catalogue,
+            episode,
+        )
+        start_position = 0.0 if stored_position is None else stored_position
+        response_payload = await self._prepare_episode(
+            session,
+            catalogue,
+            episode,
+            total,
+            start_position,
+            preferred_source_index=preferred_source_index,
+        )
+        launch = dict(session.payload)
+        launch["start_position"] = start_position
+        launch["source_index"] = response_payload["source_index"]
         raw_session = request.cookies.get(self.config.cookie_name, "")
         if not await self.database.update_web_session_payload(
             raw_session,
