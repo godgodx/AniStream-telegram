@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -14,6 +15,7 @@ from anistream.models import (
     ProbeResult,
     ResolvedMedia,
 )
+from anistream.services.media_probe import MP4_PROBE_BYTES, RemoteMediaProbe
 from anistream_telegram.core import (
     CoreService,
     catalogue_from_payload,
@@ -243,3 +245,180 @@ async def test_core_automatic_source_fallback_checks_each_candidate_once(
     ]
     assert media.source_index == 1
     assert media.source_count == 2
+
+
+async def test_core_prefers_the_same_source_then_falls_back_for_next_episode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = CoreService()
+    payload = catalogue_payload(
+        Catalogue(
+            provider_id="provider",
+            provider_name="Provider",
+            title="Title",
+            url="https://provider.example/title",
+            season="Season 1",
+            language=MediaLanguage("vf", "VF"),
+            episodes=(
+                Episode(
+                    1,
+                    (
+                        EmbedCandidate(
+                            "Working player",
+                            "https://video.example/embed/working",
+                        ),
+                        EmbedCandidate(
+                            "Broken preferred player",
+                            "https://video.example/embed/broken",
+                        ),
+                    ),
+                ),
+            ),
+        )
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(service.resolvers, "supports", lambda _url: True)
+
+    def resolve(url: str) -> ResolvedMedia:
+        calls.append(url)
+        if url.endswith("/broken"):
+            raise RuntimeError("source unavailable")
+        return ResolvedMedia(
+            f"{url}/video.mp4",
+            url,
+            "Test resolver",
+            {},
+            "mp4",
+        )
+
+    monkeypatch.setattr(service.resolvers, "resolve", resolve)
+    monkeypatch.setattr(
+        service.probe,
+        "probe",
+        lambda _media: ProbeResult(True, "mp4", "ok"),
+    )
+
+    media = await service.prepare_media(
+        payload,
+        1,
+        actor_key=123,
+        preferred_source_index=1,
+        fallback_from_preferred=True,
+    )
+
+    assert calls == [
+        "https://video.example/embed/broken",
+        "https://video.example/embed/working",
+    ]
+    assert media.source_index == 0
+
+
+class ProbeResponse:
+    def __init__(
+        self,
+        body: bytes,
+        *,
+        url: str,
+        status: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.body = body
+        self.url = url
+        self.status_code = status
+        self.headers = headers or {}
+        self.closed = False
+
+    def iter_content(self, _size: int):
+        yield self.body
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_media_probe_returns_a_complete_hls_manifest_for_reuse() -> None:
+    body = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nvideo.m3u8\n"
+    response = ProbeResponse(
+        body,
+        url="https://cdn.example/path/master.m3u8",
+        headers={"Content-Type": "application/vnd.apple.mpegurl"},
+    )
+    http = SimpleNamespace(get=Mock(return_value=response))
+    probe = RemoteMediaProbe(http)  # type: ignore[arg-type]
+
+    result = probe.probe(
+        ResolvedMedia(
+            "https://cdn.example/master.m3u8",
+            "https://embed.example/",
+            "Test",
+            {},
+            "hls",
+        )
+    )
+
+    assert result.valid is True
+    assert result.kind == "hls"
+    assert result.prefetched_playlist == body
+    assert result.prefetched_playlist_url == response.url
+    assert response.closed is True
+
+
+def test_media_probe_does_not_reuse_a_partial_hls_manifest() -> None:
+    body = b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nvideo.m3u8\n"
+    response = ProbeResponse(
+        body,
+        url="https://cdn.example/path/master.m3u8",
+        status=206,
+        headers={
+            "Content-Type": "application/vnd.apple.mpegurl",
+            "Content-Range": f"bytes 0-{len(body) - 1}/{len(body) + 100}",
+        },
+    )
+    http = SimpleNamespace(get=Mock(return_value=response))
+    probe = RemoteMediaProbe(http)  # type: ignore[arg-type]
+
+    result = probe.probe(
+        ResolvedMedia(
+            "https://cdn.example/master.m3u8",
+            "https://embed.example/",
+            "Test",
+            {},
+            "hls",
+        )
+    )
+
+    assert result.valid is True
+    assert result.kind == "hls"
+    assert result.prefetched_playlist == b""
+    assert result.prefetched_playlist_url == ""
+    assert response.closed is True
+
+
+def test_media_probe_uses_a_small_mp4_range() -> None:
+    body = b"\x00\x00\x00\x18ftyp" + (b"\x00" * (MP4_PROBE_BYTES - 8))
+    response = ProbeResponse(
+        body,
+        url="https://cdn.example/video.mp4",
+        status=206,
+        headers={
+            "Content-Type": "video/mp4",
+            "Content-Range": f"bytes 0-{MP4_PROBE_BYTES - 1}/999999",
+        },
+    )
+    http = SimpleNamespace(get=Mock(return_value=response))
+    probe = RemoteMediaProbe(http)  # type: ignore[arg-type]
+
+    result = probe.probe(
+        ResolvedMedia(
+            response.url,
+            "https://embed.example/",
+            "Test",
+            {},
+            "mp4",
+        )
+    )
+
+    assert result.valid is True
+    assert result.kind == "mp4"
+    assert result.prefetched_playlist == b""
+    headers = http.get.call_args.kwargs["headers"]
+    assert headers["Range"] == f"bytes=0-{MP4_PROBE_BYTES - 1}"

@@ -232,6 +232,7 @@ class CoreService:
         *,
         actor_key: object = "internal",
         preferred_source_index: int | None = None,
+        fallback_from_preferred: bool = False,
     ) -> ResolvedMedia:
         async with self.provider_capacity.slot(str(actor_key)):
             return await asyncio.to_thread(
@@ -239,6 +240,7 @@ class CoreService:
                 payload,
                 episode_number,
                 preferred_source_index,
+                fallback_from_preferred,
             )
 
     def _prepare_media_sync(
@@ -246,6 +248,7 @@ class CoreService:
         payload: dict[str, Any],
         episode_number: int,
         preferred_source_index: int | None = None,
+        fallback_from_preferred: bool = False,
     ) -> ResolvedMedia:
         catalogue = catalogue_from_payload(payload)
         if not 1 <= episode_number <= len(catalogue.episodes):
@@ -261,29 +264,23 @@ class CoreService:
 
         if preferred_source_index is not None:
             if not 0 <= preferred_source_index < len(supported):
-                raise ValueError("source is outside the available range")
-            candidate = supported[preferred_source_index]
-            try:
-                media = self.resolvers.resolve(candidate.url)
-                probe = self.probe.probe(media)
-                if not probe.valid:
-                    raise ValueError(probe.detail)
-                return replace(
-                    media,
-                    source_index=preferred_source_index,
-                    source_count=len(supported),
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    f"selected source failed: {candidate.player}: {exc}"
-                ) from exc
+                if not fallback_from_preferred:
+                    raise ValueError("source is outside the available range")
+                preferred_source_index = None
 
         errors: list[str] = []
         # SourcePlanner is useful for multi-episode CLI planning, but for one
         # Mini App playback it preflights failed candidates and then retries
         # them during route selection. Resolve each supported source exactly
         # once and return the first verified playable result.
-        for source_index, candidate in enumerate(supported):
+        source_order = list(range(len(supported)))
+        if preferred_source_index is not None:
+            source_order.remove(preferred_source_index)
+            source_order.insert(0, preferred_source_index)
+            if not fallback_from_preferred:
+                source_order = source_order[:1]
+        for source_index in source_order:
+            candidate = supported[source_index]
             try:
                 media = self.resolvers.resolve(candidate.url)
                 probe = self.probe.probe(media)
@@ -291,9 +288,17 @@ class CoreService:
                     raise ValueError(probe.detail)
                 return replace(
                     media,
+                    kind=probe.kind if probe.kind != "unknown" else media.kind,
                     source_index=source_index,
                     source_count=len(supported),
+                    prefetched_playlist=probe.prefetched_playlist,
+                    prefetched_playlist_url=probe.prefetched_playlist_url,
                 )
             except Exception as exc:
                 errors.append(f"{candidate.player}: {exc}")
-        raise RuntimeError("all sources failed: " + "; ".join(errors))
+        prefix = (
+            "selected source failed: "
+            if preferred_source_index is not None and not fallback_from_preferred
+            else "all sources failed: "
+        )
+        raise RuntimeError(prefix + "; ".join(errors))

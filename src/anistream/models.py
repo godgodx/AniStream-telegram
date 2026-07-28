@@ -5,6 +5,9 @@ from pathlib import Path
 from typing import Mapping
 
 
+MAX_PREFETCHED_PLAYLIST_BYTES = 256 * 1024
+
+
 @dataclass(frozen=True, slots=True)
 class MediaLanguage:
     """Provider-owned language metadata carried through the neutral core."""
@@ -74,6 +77,8 @@ class ResolvedMedia:
     kind: str = "unknown"
     source_index: int = 0
     source_count: int = 1
+    prefetched_playlist: bytes = b""
+    prefetched_playlist_url: str = ""
 
 
 @dataclass(slots=True)
@@ -101,3 +106,5 @@ class ProbeResult:
     valid: bool
     kind: str = "unknown"
     detail: str = ""
+    prefetched_playlist: bytes = b""
+    prefetched_playlist_url: str = ""

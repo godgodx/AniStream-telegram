@@ -43,8 +43,10 @@ workflow.
   languages before a result is selected.
 - **Structured seasons and languages** — providers expose one neutral variant
   per season/language pair without global language assumptions.
-- **Source preflight planning** — resolve and probe ordered candidates before
-  playback, then fall back to another supported source when necessary.
+- **Reusable source preflight** — resolve and probe ordered candidates before
+  playback, then fall back when necessary. A complete bounded HLS playlist
+  obtained during validation is consumed by the first player request instead
+  of being downloaded twice.
 - **Secure Mini App playback** — one-time launch tickets create authenticated
   `HttpOnly` sessions; raw provider headers and media URLs never reach normal
   frontend code.
@@ -58,7 +60,8 @@ workflow.
   private action.
 - **Series controls** — move to the previous, next, or any specific episode and
   optionally start the next episode after normal completion. Autoplay is enabled
-  by default and stored per Telegram account.
+  by default and stored per Telegram account. Near the end of an episode,
+  AniStream safely prepares the next source without changing watch history.
 - **Adaptive playback controls** — HLS streams expose quality, audio-language,
   and subtitle selectors when the upstream playlist actually supplies those
   choices. A visible playback-options button reports when a source has no
@@ -244,11 +247,25 @@ when the page closes. Series expose an episode selector plus previous/next
 controls. They advance automatically after the current episode finishes when
 the user's per-account autoplay setting is enabled.
 
+During the final two minutes of a series episode, the Mini App may prepare the
+next episode in a short-lived user-bound session. Preparation performs source
+resolution and validation but does not update Continue Watching, episode
+progress, or the active web session. Those values change only when the user
+presses Next or autoplay actually advances. The current numbered source is
+preferred for the next episode; if it is missing or broken, normal source
+fallback selects the first working alternative. Changing source invalidates
+any stale client-side preparation.
+
 When an episode exposes multiple supported players, **Change source** moves to
 the next numbered source while preserving the saved position. Sources remain
 anonymous in the UI. A title with no stored per-episode progress is explicitly
 started at `0:00`; upstream HLS start offsets are ignored so provider or WebView
 state cannot move a new playback forward.
+
+HLS validation keeps at most a small complete playlist for one-time reuse by
+the authenticated media gateway. Oversized or partial playlists use the normal
+gateway fetch path, and MP4 validation reads only the initial bounded header
+bytes.
 
 For HLS masters, the player also discovers available renditions, alternate
 audio tracks, and subtitle tracks after the manifest loads. Quality defaults

@@ -13,7 +13,7 @@ from aiogram.exceptions import TelegramAPIError
 from anistream_telegram.bot import MAIN_MENU_TEXT, main_keyboard
 from anistream_telegram.config import Config
 from anistream_telegram.core import CoreService
-from anistream_telegram.database import Database, WebSession
+from anistream_telegram.database import Database, PlaybackSession, WebSession
 from anistream_telegram.limits import CapacityExceeded, SlidingWindowLimiter
 from anistream_telegram.media import MediaGateway
 from anistream_telegram.security import (
@@ -48,6 +48,7 @@ class WebRoutes:
         self.auth_limiter = SlidingWindowLimiter(12, 60)
         self.progress_limiter = SlidingWindowLimiter(120, 60)
         self.playback_limiter = SlidingWindowLimiter(12, 60)
+        self.prefetch_limiter = SlidingWindowLimiter(4, 60)
         self.cast_limiter = SlidingWindowLimiter(10, 60)
 
     async def _restore_main_menu(self, chat_id: int, message_id: int) -> None:
@@ -88,6 +89,8 @@ class WebRoutes:
         app.router.add_post("/api/playback", self.playback)
         app.router.add_post("/api/playback/episode", self.change_episode)
         app.router.add_post("/api/playback/source", self.change_source)
+        app.router.add_post("/api/playback/prefetch", self.prefetch_next)
+        app.router.add_post("/api/playback/activate", self.activate_prefetch)
         app.router.add_post("/api/progress", self.progress)
         app.router.add_post("/api/cast", self.cast)
         app.router.add_post("/api/logout", self.logout)
@@ -240,15 +243,32 @@ class WebRoutes:
         start_position: float,
         *,
         preferred_source_index: int | None = None,
+        fallback_from_preferred: bool = False,
+        record_progress: bool = True,
+        prepared: bool = False,
+        actor_key: object | None = None,
     ) -> dict[str, Any]:
         try:
             media = await self.core.prepare_media(
                 catalogue,
                 episode,
-                actor_key=session.telegram_user_id,
+                actor_key=(
+                    session.telegram_user_id
+                    if actor_key is None
+                    else actor_key
+                ),
                 preferred_source_index=preferred_source_index,
+                fallback_from_preferred=fallback_from_preferred,
             )
             public_url_parts(media.url, self.config.media_allowed_hosts)
+            prefetched_playlist_url = str(
+                getattr(media, "prefetched_playlist_url", "")
+            )
+            if prefetched_playlist_url:
+                public_url_parts(
+                    prefetched_playlist_url,
+                    self.config.media_allowed_hosts,
+                )
         except CapacityExceeded as exc:
             raise web.HTTPTooManyRequests(
                 text="Another playback request is already running"
@@ -256,6 +276,16 @@ class WebRoutes:
         except (UnsafeUpstreamError, ValueError, RuntimeError) as exc:
             LOGGER.info("Playback preparation failed: %s", type(exc).__name__)
             raise web.HTTPBadGateway(text="No safe playable source is currently available") from exc
+        source_count = max(1, min(20, int(getattr(media, "source_count", 1))))
+        source_index = max(
+            0,
+            min(source_count - 1, int(getattr(media, "source_index", 0))),
+        )
+        ttl_seconds = (
+            min(300, self.config.playback_ttl_seconds)
+            if prepared
+            else self.config.playback_ttl_seconds
+        )
         playback = await self.database.create_playback(
             session.telegram_user_id,
             catalogue,
@@ -264,25 +294,51 @@ class WebRoutes:
             media_headers=sanitize_upstream_headers(dict(media.headers)),
             media_kind=media.kind,
             source_name=media.resolver_name,
-            ttl_seconds=self.config.playback_ttl_seconds,
+            ttl_seconds=ttl_seconds,
+            prefetched_playlist=bytes(
+                getattr(media, "prefetched_playlist", b"")
+            ),
+            prefetched_playlist_url=prefetched_playlist_url,
+            prepared=prepared,
+            preferred_source_index=preferred_source_index or 0,
+            source_index=source_index,
+            source_count=source_count,
         )
         # Persist the selected episode immediately. This covers a Mini App
         # being closed before the first timeupdate/pagehide event fires.
-        await self.database.record_progress(
-            session.telegram_user_id,
+        if record_progress:
+            await self.database.record_progress(
+                session.telegram_user_id,
+                catalogue,
+                episode,
+                start_position,
+                0.0,
+                False,
+            )
+        return await self._playback_payload(
+            session,
             catalogue,
+            playback,
             episode,
+            total,
             start_position,
-            0.0,
-            False,
+            source_index,
+            source_count,
         )
+
+    async def _playback_payload(
+        self,
+        session: WebSession,
+        catalogue: dict[str, Any],
+        playback: PlaybackSession,
+        episode: int,
+        total: int,
+        start_position: float,
+        source_index: int,
+        source_count: int,
+    ) -> dict[str, Any]:
         autoplay_enabled = await self.database.autoplay_enabled(
             session.telegram_user_id
-        )
-        source_count = max(1, min(20, int(getattr(media, "source_count", 1))))
-        source_index = max(
-            0,
-            min(source_count - 1, int(getattr(media, "source_index", 0))),
         )
         return {
             "playback_id": playback.id,
@@ -303,6 +359,27 @@ class WebRoutes:
             "language": str(catalogue.get("language_label", ""))[:100],
         }
 
+    async def _update_session_playback(
+        self,
+        request: web.Request,
+        session: WebSession,
+        *,
+        episode: int,
+        start_position: float,
+        source_index: int,
+    ) -> None:
+        launch = dict(session.payload)
+        launch["episode"] = episode
+        launch["start_position"] = start_position
+        launch["source_index"] = source_index
+        raw_session = request.cookies.get(self.config.cookie_name, "")
+        if not await self.database.update_web_session_payload(
+            raw_session,
+            session.telegram_user_id,
+            launch,
+        ):
+            raise web.HTTPUnauthorized(text="Authentication required")
+
     async def playback(self, request: web.Request) -> web.Response:
         session = await self._authenticated(request)
         await self._csrf(request, session)
@@ -320,15 +397,21 @@ class WebRoutes:
         # cases playback must begin deterministically at the start rather than
         # inheriting an upstream or WebView playback offset.
         start_position = 0.0 if stored_position is None else stored_position
-        return web.json_response(
-            await self._prepare_episode(
-                session,
-                catalogue,
-                episode,
-                total,
-                start_position,
-            )
+        response_payload = await self._prepare_episode(
+            session,
+            catalogue,
+            episode,
+            total,
+            start_position,
         )
+        await self._update_session_playback(
+            request,
+            session,
+            episode=episode,
+            start_position=start_position,
+            source_index=response_payload["source_index"],
+        )
+        return web.json_response(response_payload)
 
     async def change_episode(self, request: web.Request) -> web.Response:
         session = await self._authenticated(request)
@@ -352,18 +435,15 @@ class WebRoutes:
             total,
             start_position,
             preferred_source_index=preferred_source_index,
+            fallback_from_preferred=preferred_source_index is not None,
         )
-        launch = dict(session.payload)
-        launch["episode"] = episode
-        launch["start_position"] = start_position
-        launch["source_index"] = response_payload["source_index"]
-        raw_session = request.cookies.get(self.config.cookie_name, "")
-        if not await self.database.update_web_session_payload(
-            raw_session,
-            session.telegram_user_id,
-            launch,
-        ):
-            raise web.HTTPUnauthorized(text="Authentication required")
+        await self._update_session_playback(
+            request,
+            session,
+            episode=episode,
+            start_position=start_position,
+            source_index=response_payload["source_index"],
+        )
         return web.json_response(response_payload)
 
     async def change_source(self, request: web.Request) -> web.Response:
@@ -403,17 +483,119 @@ class WebRoutes:
             start_position,
             preferred_source_index=preferred_source_index,
         )
-        launch = dict(session.payload)
-        launch["start_position"] = start_position
-        launch["source_index"] = response_payload["source_index"]
-        raw_session = request.cookies.get(self.config.cookie_name, "")
-        if not await self.database.update_web_session_payload(
-            raw_session,
-            session.telegram_user_id,
-            launch,
-        ):
-            raise web.HTTPUnauthorized(text="Authentication required")
+        await self._update_session_playback(
+            request,
+            session,
+            episode=episode,
+            start_position=start_position,
+            source_index=response_payload["source_index"],
+        )
         return web.json_response(response_payload)
+
+    async def prefetch_next(self, request: web.Request) -> web.Response:
+        session = await self._authenticated(request)
+        await self._csrf(request, session)
+        if not await self.prefetch_limiter.allow(str(session.telegram_user_id)):
+            raise web.HTTPTooManyRequests(text="Episode prefetches are too frequent")
+        payload = await self._json(request)
+        catalogue = self._catalogue(session)
+        current_episode, total = self._episode(
+            catalogue,
+            session.payload.get("episode"),
+        )
+        target_episode, _ = self._episode(catalogue, payload.get("episode"))
+        if current_episode >= total or target_episode != current_episode + 1:
+            raise web.HTTPBadRequest(text="Only the next episode can be prefetched")
+        preferred_source_index = self._source_index(payload.get("source_index"))
+        if preferred_source_index is None:
+            preferred_source_index = (
+                self._source_index(session.payload.get("source_index")) or 0
+            )
+        stored_position = await self.database.saved_episode_position(
+            session.telegram_user_id,
+            catalogue,
+            target_episode,
+        )
+        start_position = 0.0 if stored_position is None else stored_position
+        response_payload = await self._prepare_episode(
+            session,
+            catalogue,
+            target_episode,
+            total,
+            start_position,
+            preferred_source_index=preferred_source_index,
+            fallback_from_preferred=True,
+            record_progress=False,
+            prepared=True,
+            actor_key=f"prefetch:{session.telegram_user_id}",
+        )
+        response_payload["prepared"] = True
+        return web.json_response(response_payload)
+
+    async def activate_prefetch(self, request: web.Request) -> web.Response:
+        session = await self._authenticated(request)
+        await self._csrf(request, session)
+        if not await self.playback_limiter.allow(str(session.telegram_user_id)):
+            raise web.HTTPTooManyRequests(text="Playback requests are too frequent")
+        payload = await self._json(request)
+        playback_id = str(payload.get("playback_id", ""))
+        catalogue = self._catalogue(session)
+        current_episode, total = self._episode(
+            catalogue,
+            session.payload.get("episode"),
+        )
+        if current_episode >= total:
+            raise web.HTTPConflict(text="There is no next episode to activate")
+        expected_episode = current_episode + 1
+        current_source_index = (
+            self._source_index(session.payload.get("source_index")) or 0
+        )
+        activated = await self.database.activate_prepared_playback(
+            playback_id,
+            session.telegram_user_id,
+            expected_episode=expected_episode,
+            expected_preferred_source_index=current_source_index,
+            expected_catalogue_payload=catalogue,
+            ttl_seconds=self.config.playback_ttl_seconds,
+        )
+        if activated is None:
+            raise web.HTTPConflict(
+                text="The prepared episode is stale or no longer available"
+            )
+        playback, prepared = activated
+        stored_position = await self.database.saved_episode_position(
+            session.telegram_user_id,
+            catalogue,
+            expected_episode,
+        )
+        start_position = 0.0 if stored_position is None else stored_position
+        await self.database.record_progress(
+            session.telegram_user_id,
+            catalogue,
+            expected_episode,
+            start_position,
+            0.0,
+            False,
+        )
+        await self._update_session_playback(
+            request,
+            session,
+            episode=expected_episode,
+            start_position=start_position,
+            source_index=prepared.source_index,
+        )
+        return web.json_response(
+            await self._playback_payload(
+                session,
+                catalogue,
+                playback,
+                expected_episode,
+                total,
+                start_position,
+                prepared.source_index,
+                prepared.source_count,
+            )
+        )
 
     async def session_info(self, request: web.Request) -> web.Response:
         session = await self._authenticated(request)

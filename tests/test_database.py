@@ -368,6 +368,73 @@ async def test_cast_grant_is_playback_bound_and_revoked_with_whitelist(
         await database.close()
 
 
+async def test_prepared_playback_and_manifest_are_user_bound(
+    tmp_path: Path,
+) -> None:
+    database = await database_at(tmp_path / "db.sqlite")
+    try:
+        body = b"#EXTM3U\nsegment.ts\n"
+        playback = await database.create_playback(
+            123,
+            catalogue(),
+            4,
+            media_url="https://cdn.example/master.m3u8",
+            media_headers={},
+            media_kind="hls",
+            source_name="Test",
+            ttl_seconds=300,
+            prefetched_playlist=body,
+            prefetched_playlist_url="https://cdn.example/path/master.m3u8",
+            prepared=True,
+            preferred_source_index=1,
+            source_index=0,
+            source_count=2,
+        )
+
+        assert await database.consume_playback_manifest(playback.id, 999) is None
+        assert await database.consume_playback_manifest(playback.id, 123) == (
+            body,
+            "https://cdn.example/path/master.m3u8",
+        )
+        assert (
+            await database.activate_prepared_playback(
+                playback.id,
+                999,
+                expected_episode=4,
+                expected_preferred_source_index=1,
+                expected_catalogue_payload=catalogue(),
+                ttl_seconds=600,
+            )
+            is None
+        )
+        activated = await database.activate_prepared_playback(
+            playback.id,
+            123,
+            expected_episode=4,
+            expected_preferred_source_index=1,
+            expected_catalogue_payload=catalogue(),
+            ttl_seconds=600,
+        )
+        assert activated is not None
+        activated_playback, prepared = activated
+        assert activated_playback.id == playback.id
+        assert prepared.source_index == 0
+        assert prepared.source_count == 2
+        assert (
+            await database.activate_prepared_playback(
+                playback.id,
+                123,
+                expected_episode=4,
+                expected_preferred_source_index=1,
+                expected_catalogue_payload=catalogue(),
+                ttl_seconds=600,
+            )
+            is None
+        )
+    finally:
+        await database.close()
+
+
 async def test_disabled_user_loses_existing_web_session(tmp_path: Path) -> None:
     database = await database_at(tmp_path / "db.sqlite")
     try:

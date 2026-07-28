@@ -260,6 +260,20 @@ class MediaGateway:
             request,
             playback_id,
         )
+        if playback.media_kind == "hls" and not request.headers.get("Range", ""):
+            prefetched = await self.database.consume_playback_manifest(
+                playback.id,
+                user_id,
+            )
+            if prefetched is not None:
+                body, base_url = prefetched
+                async with self._stream_slot(user_id, session_key):
+                    return self._playlist_body_response(
+                        playback,
+                        body,
+                        base_url,
+                        cast_token=cast_token,
+                    )
         return await self._serve_target(
             request,
             user_id,
@@ -358,6 +372,23 @@ class MediaGateway:
     ) -> web.Response:
         body = await upstream.content.read(MAX_PLAYLIST_INPUT_BYTES + 1)
         upstream.release()
+        if len(body) > MAX_PLAYLIST_INPUT_BYTES:
+            raise web.HTTPBadGateway(text="Upstream playlist is too large")
+        return self._playlist_body_response(
+            playback,
+            body,
+            base_url,
+            cast_token=cast_token,
+        )
+
+    def _playlist_body_response(
+        self,
+        playback: PlaybackSession,
+        body: bytes,
+        base_url: str,
+        *,
+        cast_token: str = "",
+    ) -> web.Response:
         if len(body) > MAX_PLAYLIST_INPUT_BYTES:
             raise web.HTTPBadGateway(text="Upstream playlist is too large")
         try:

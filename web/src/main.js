@@ -40,6 +40,11 @@ let preferredQualityHeight = 0;
 let preferredAudio = "";
 let preferredSubtitle = "";
 let streamControlsExpanded = false;
+let prefetchedNext = null;
+let nextPrefetchPromise = null;
+let nextPrefetchKey = "";
+let prefetchGeneration = 0;
+let nextPrefetchRetryAt = 0;
 
 let googleCastReady = false;
 let castContext = null;
@@ -136,6 +141,116 @@ async function saveProgress(
     // A transient progress failure must never interrupt playback.
     return false;
   }
+}
+
+function episodePrefetchKey(info) {
+  if (!info?.has_next) return "";
+  return [
+    info.playback_id,
+    Number(info.episode) + 1,
+    Number(info.source_index) || 0,
+  ].join(":");
+}
+
+function invalidateNextPrefetch() {
+  prefetchGeneration += 1;
+  prefetchedNext = null;
+  nextPrefetchPromise = null;
+  nextPrefetchKey = "";
+  nextPrefetchRetryAt = 0;
+}
+
+function connectionAllowsPrefetch() {
+  const connection =
+    navigator.connection ||
+    navigator.mozConnection ||
+    navigator.webkitConnection;
+  if (!connection) return true;
+  return (
+    connection.saveData !== true &&
+    !["slow-2g", "2g"].includes(connection.effectiveType)
+  );
+}
+
+async function startNextPrefetch(info = currentInfo) {
+  if (
+    !info?.has_next ||
+    changingEpisode ||
+    changingSource ||
+    !connectionAllowsPrefetch()
+  ) {
+    return null;
+  }
+  const key = episodePrefetchKey(info);
+  if (!key) return null;
+  if (nextPrefetchKey === key) {
+    if (prefetchedNext) return prefetchedNext;
+    if (nextPrefetchPromise) return nextPrefetchPromise;
+    if (Date.now() < nextPrefetchRetryAt) return null;
+  }
+
+  invalidateNextPrefetch();
+  const generation = prefetchGeneration;
+  nextPrefetchKey = key;
+  const request = api("/api/playback/prefetch", {
+    method: "POST",
+    body: JSON.stringify({
+      episode: Number(info.episode) + 1,
+      source_index: Number(info.source_index) || 0,
+    }),
+  })
+    .then((prepared) => {
+      if (generation === prefetchGeneration && nextPrefetchKey === key) {
+        prefetchedNext = prepared;
+      }
+      return prepared;
+    })
+    .catch(() => {
+      if (generation === prefetchGeneration && nextPrefetchKey === key) {
+        nextPrefetchRetryAt = Date.now() + 30_000;
+      }
+      return null;
+    })
+    .finally(() => {
+      if (generation === prefetchGeneration && nextPrefetchKey === key) {
+        nextPrefetchPromise = null;
+      }
+    });
+  nextPrefetchPromise = request;
+  return request;
+}
+
+function maybePrefetchNext(
+  info = currentInfo,
+  position = video.currentTime,
+  duration = video.duration,
+) {
+  const currentPosition = Number(position);
+  const currentDuration = Number(duration);
+  if (
+    !info?.has_next ||
+    !Number.isFinite(currentPosition) ||
+    !Number.isFinite(currentDuration) ||
+    currentDuration < 60 ||
+    currentPosition < 30 ||
+    currentDuration - currentPosition > 120
+  ) {
+    return;
+  }
+  void startNextPrefetch(info);
+}
+
+async function preparedNextEpisode(targetEpisode) {
+  if (!currentInfo || Number(targetEpisode) !== Number(currentInfo.episode) + 1) {
+    return null;
+  }
+  const key = episodePrefetchKey(currentInfo);
+  if (!key || nextPrefetchKey !== key) return null;
+  if (prefetchedNext) return prefetchedNext;
+  if (nextPrefetchPromise) {
+    await nextPrefetchPromise;
+  }
+  return nextPrefetchKey === key ? prefetchedNext : null;
 }
 
 function googleCastConnected() {
@@ -385,6 +500,7 @@ function updateEpisodeUi(info) {
 }
 
 function attachPlayer(info, { autoplay = false } = {}) {
+  invalidateNextPrefetch();
   teardownPlayer();
   updateEpisodeUi(info);
   clearError();
@@ -469,6 +585,7 @@ function attachPlayer(info, { autoplay = false } = {}) {
     () => {
       progress.textContent = formatTime(video.currentTime);
       void saveProgress(false, false);
+      maybePrefetchNext(info);
     },
     options,
   );
@@ -598,6 +715,11 @@ function setupRemoteCastController() {
     () => {
       if (googleCastConnected()) {
         progress.textContent = formatTime(remotePlayer.currentTime);
+        maybePrefetchNext(
+          currentInfo,
+          remotePlayer.currentTime,
+          remotePlayer.duration,
+        );
       }
     },
   );
@@ -740,10 +862,27 @@ async function changeEpisode(targetEpisode, { autoplay = false } = {}) {
         await saveProgress(true, false);
       }
     }
-    const info = await api("/api/playback/episode", {
-      method: "POST",
-      body: JSON.stringify({ episode: target }),
-    });
+    let info = null;
+    const prepared = await preparedNextEpisode(target);
+    if (prepared) {
+      try {
+        info = await api("/api/playback/activate", {
+          method: "POST",
+          body: JSON.stringify({ playback_id: prepared.playback_id }),
+        });
+      } catch {
+        info = null;
+      }
+    }
+    if (!info) {
+      info = await api("/api/playback/episode", {
+        method: "POST",
+        body: JSON.stringify({
+          episode: target,
+          source_index: Number(currentInfo.source_index) || 0,
+        }),
+      });
+    }
     attachPlayer(info, { autoplay: autoplay && !googleCastConnected() });
     if (googleCastConnected()) {
       await loadCurrentOnGoogleCast(info, info.start_position);

@@ -13,6 +13,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -21,6 +22,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+from anistream.models import MAX_PREFETCHED_PLAYLIST_BYTES
 
 
 def utcnow() -> datetime:
@@ -109,6 +112,32 @@ class PlaybackSession(Base):
     media_headers: Mapped[dict[str, str]] = mapped_column(JSON, nullable=False)
     media_kind: Mapped[str] = mapped_column(String(16), nullable=False)
     source_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True, nullable=False)
+
+
+class PlaybackManifest(Base):
+    __tablename__ = "playback_manifests"
+
+    playback_id: Mapped[str] = mapped_column(
+        ForeignKey("playback_sessions.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    body: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    base_url: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True, nullable=False)
+
+
+class PreparedPlayback(Base):
+    __tablename__ = "prepared_playbacks"
+
+    playback_id: Mapped[str] = mapped_column(
+        ForeignKey("playback_sessions.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    preferred_source_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_count: Mapped[int] = mapped_column(Integer, nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime, index=True, nullable=False)
 
 
@@ -484,7 +513,18 @@ class Database:
         media_kind: str,
         source_name: str,
         ttl_seconds: int,
+        prefetched_playlist: bytes = b"",
+        prefetched_playlist_url: str = "",
+        prepared: bool = False,
+        preferred_source_index: int = 0,
+        source_index: int = 0,
+        source_count: int = 1,
     ) -> PlaybackSession:
+        if len(prefetched_playlist) > MAX_PREFETCHED_PLAYLIST_BYTES:
+            raise ValueError("prefetched playlist is too large")
+        if bool(prefetched_playlist) != bool(prefetched_playlist_url):
+            raise ValueError("prefetched playlist metadata is incomplete")
+        expires_at = utcnow() + timedelta(seconds=ttl_seconds)
         item = PlaybackSession(
             id=secrets.token_urlsafe(18),
             telegram_user_id=user_id,
@@ -494,10 +534,30 @@ class Database:
             media_headers=media_headers,
             media_kind=media_kind,
             source_name=source_name[:128],
-            expires_at=utcnow() + timedelta(seconds=ttl_seconds),
+            expires_at=expires_at,
         )
         async with self.sessions.begin() as session:
             session.add(item)
+            if prefetched_playlist:
+                session.add(
+                    PlaybackManifest(
+                        playback_id=item.id,
+                        body=prefetched_playlist,
+                        base_url=prefetched_playlist_url,
+                        expires_at=expires_at,
+                    )
+                )
+            if prepared:
+                session.add(
+                    PreparedPlayback(
+                        playback_id=item.id,
+                        telegram_user_id=user_id,
+                        preferred_source_index=preferred_source_index,
+                        source_index=source_index,
+                        source_count=source_count,
+                        expires_at=expires_at,
+                    )
+                )
         return item
 
     async def get_playback(self, playback_id: str, user_id: int) -> PlaybackSession | None:
@@ -510,6 +570,73 @@ class Database:
             ):
                 return None
             return item
+
+    async def consume_playback_manifest(
+        self,
+        playback_id: str,
+        user_id: int,
+    ) -> tuple[bytes, str] | None:
+        now = utcnow()
+        async with self.sessions.begin() as session:
+            playback = await session.get(PlaybackSession, playback_id)
+            if (
+                playback is None
+                or playback.telegram_user_id != user_id
+                or playback.expires_at <= now
+            ):
+                return None
+            manifest = await session.scalar(
+                select(PlaybackManifest)
+                .where(
+                    PlaybackManifest.playback_id == playback_id,
+                    PlaybackManifest.expires_at > now,
+                )
+                .with_for_update()
+            )
+            if manifest is None:
+                return None
+            body = bytes(manifest.body)
+            base_url = manifest.base_url
+            await session.delete(manifest)
+            return body, base_url
+
+    async def activate_prepared_playback(
+        self,
+        playback_id: str,
+        user_id: int,
+        *,
+        expected_episode: int,
+        expected_preferred_source_index: int,
+        expected_catalogue_payload: dict[str, Any],
+        ttl_seconds: int,
+    ) -> tuple[PlaybackSession, PreparedPlayback] | None:
+        now = utcnow()
+        async with self.sessions.begin() as session:
+            prepared = await session.scalar(
+                select(PreparedPlayback)
+                .where(
+                    PreparedPlayback.playback_id == playback_id,
+                    PreparedPlayback.telegram_user_id == user_id,
+                    PreparedPlayback.expires_at > now,
+                )
+                .with_for_update()
+            )
+            if prepared is None:
+                return None
+            playback = await session.get(PlaybackSession, playback_id)
+            if (
+                playback is None
+                or playback.telegram_user_id != user_id
+                or playback.episode != expected_episode
+                or dict(playback.catalogue_payload) != expected_catalogue_payload
+                or playback.expires_at <= now
+                or prepared.preferred_source_index
+                != expected_preferred_source_index
+            ):
+                return None
+            playback.expires_at = now + timedelta(seconds=ttl_seconds)
+            await session.delete(prepared)
+            return playback, prepared
 
     async def create_cast_grant(
         self,
@@ -782,6 +909,12 @@ class Database:
             await session.execute(delete(LaunchTicket).where(LaunchTicket.expires_at <= now))
             await session.execute(delete(WebSession).where(WebSession.expires_at <= now))
             await session.execute(delete(CastGrant).where(CastGrant.expires_at <= now))
+            await session.execute(
+                delete(PlaybackManifest).where(PlaybackManifest.expires_at <= now)
+            )
+            await session.execute(
+                delete(PreparedPlayback).where(PreparedPlayback.expires_at <= now)
+            )
             await session.execute(
                 delete(PlaybackSession).where(PlaybackSession.expires_at <= now)
             )

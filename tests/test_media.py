@@ -4,10 +4,12 @@ import re
 from contextlib import AsyncExitStack
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
 
 from anistream_telegram.config import Config
 from anistream_telegram.database import Database, PlaybackSession, utcnow
@@ -141,6 +143,58 @@ async def test_hls_playlist_urls_are_opaque_and_bound(tmp_path: Path) -> None:
     token = parse_qs(urlparse(resource).query)["t"][0]
     assert gateway.tokens.parse(token, "playback-id").endswith("/path/segment-001.ts")
     assert len(re.findall(r"/media/playback-id/resource", response.text)) == 2
+
+
+async def test_master_reuses_the_prefetched_hls_manifest_once(
+    tmp_path: Path,
+) -> None:
+    settings = config(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize((123,))
+    raw_session, _ = await database.create_web_session(
+        123,
+        {},
+        ttl_seconds=600,
+    )
+    body = b"#EXTM3U\n#EXTINF:10,\nsegment-001.ts\n"
+    playback = await database.create_playback(
+        123,
+        {},
+        1,
+        media_url="https://cdn.example/master.m3u8",
+        media_headers={},
+        media_kind="hls",
+        source_name="Test",
+        ttl_seconds=600,
+        prefetched_playlist=body,
+        prefetched_playlist_url="https://cdn.example/path/master.m3u8",
+    )
+    gateway = MediaGateway(settings, database)
+    gateway.upstream.request = AsyncMock(
+        side_effect=AssertionError("upstream must not be requested"),
+    )
+    app = web.Application()
+    app.router.add_get("/media/{playback_id}/master", gateway.master)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.get(
+            f"/media/{playback.id}/master",
+            headers={"Cookie": f"{settings.cookie_name}={raw_session}"},
+        )
+
+        assert response.status == 200
+        text = await response.text()
+        assert "segment-001.ts" not in text
+        assert f"/media/{playback.id}/resource?t=" in text
+        gateway.upstream.request.assert_not_awaited()
+        assert (
+            await database.consume_playback_manifest(playback.id, 123)
+            is None
+        )
+    finally:
+        await client.close()
+        await database.close()
 
 
 async def test_cast_hls_playlist_propagates_grant_and_cors(tmp_path: Path) -> None:

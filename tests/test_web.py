@@ -47,9 +47,12 @@ def test_mini_app_exposes_dynamic_hls_track_controls() -> None:
     assert "streamControlsExpanded = !streamControlsExpanded" in script
     assert 'api("/api/playback", { method: "POST" })' in script
     assert 'api("/api/playback/source"' in script
+    assert 'api("/api/playback/prefetch"' in script
+    assert 'api("/api/playback/activate"' in script
     assert "changeSource(Number(sourcePicker.value))" in script
     assert "`Source ${index + 1}`" in script
     assert "video.currentTime = targetPosition" in script
+    assert "currentDuration - currentPosition > 120" in script
 
 
 def test_episode_picker_is_outside_native_video_controls() -> None:
@@ -74,6 +77,7 @@ class FakeCore:
         *,
         actor_key: object = "internal",
         preferred_source_index: int | None = None,
+        fallback_from_preferred: bool = False,
     ) -> SimpleNamespace:
         self.calls += 1
         source_index = preferred_source_index or 0
@@ -354,6 +358,164 @@ async def test_episode_change_resumes_position_and_updates_session(
         assert updated is not None
         assert updated.payload["episode"] == 4
         assert updated.payload["start_position"] == 92.5
+    finally:
+        await client.close()
+        await database.close()
+
+
+async def test_next_episode_prefetch_does_not_change_memory_until_activation(
+    tmp_path: Path,
+) -> None:
+    settings = config(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize(settings.allowed_users)
+    await database.record_progress(123, catalogue(), 3, 321.0, 1500, False)
+    raw_session, csrf = await database.create_web_session(
+        123,
+        {
+            "catalogue": catalogue(),
+            "episode": 3,
+            "source_index": 1,
+            "start_position": 321.0,
+        },
+        ttl_seconds=600,
+    )
+    core = FakeCore()
+    media = MediaGateway(settings, database)
+    app = web.Application(middlewares=[error_boundary, security_headers])
+    app[CONFIG_KEY] = settings
+    WebRoutes(settings, database, core, media).register(app)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        headers = {
+            "Origin": settings.public_origin,
+            "X-CSRF-Token": csrf,
+            "Cookie": f"{settings.cookie_name}={raw_session}",
+        }
+        rejected = await client.post(
+            "/api/playback/prefetch",
+            headers={"Cookie": f"{settings.cookie_name}={raw_session}"},
+            json={"episode": 4, "source_index": 1},
+        )
+        assert rejected.status == 403
+        assert core.calls == 0
+
+        prepared_response = await client.post(
+            "/api/playback/prefetch",
+            headers=headers,
+            json={"episode": 4, "source_index": 1},
+        )
+        assert prepared_response.status == 200
+        prepared = await prepared_response.json()
+        assert prepared["prepared"] is True
+        assert prepared["episode"] == 4
+        assert prepared["source_index"] == 1
+        assert core.requests == [
+            {
+                "episode": 4,
+                "actor_key": "prefetch:123",
+                "source_index": 1,
+            }
+        ]
+
+        unchanged = (await database.continue_watching(123))[0]
+        assert unchanged["last_played_episode"] == 3
+        assert unchanged["resume_episode"] == 3
+        assert unchanged["position"] == 321.0
+        unchanged_session = await database.get_web_session(raw_session)
+        assert unchanged_session is not None
+        assert unchanged_session.payload["episode"] == 3
+        assert unchanged_session.payload["source_index"] == 1
+
+        activated_response = await client.post(
+            "/api/playback/activate",
+            headers=headers,
+            json={"playback_id": prepared["playback_id"]},
+        )
+        assert activated_response.status == 200
+        activated = await activated_response.json()
+        assert activated["episode"] == 4
+        assert activated["source_index"] == 1
+        assert activated["start_position"] == 0.0
+        assert core.calls == 1
+
+        updated = (await database.continue_watching(123))[0]
+        assert updated["last_played_episode"] == 4
+        assert updated["resume_episode"] == 4
+        assert updated["position"] == 0.0
+        updated_session = await database.get_web_session(raw_session)
+        assert updated_session is not None
+        assert updated_session.payload["episode"] == 4
+        assert updated_session.payload["source_index"] == 1
+
+        replay = await client.post(
+            "/api/playback/activate",
+            headers=headers,
+            json={"playback_id": prepared["playback_id"]},
+        )
+        assert replay.status == 409
+    finally:
+        await client.close()
+        await database.close()
+
+
+async def test_source_change_invalidates_a_prepared_next_episode(
+    tmp_path: Path,
+) -> None:
+    settings = config(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize(settings.allowed_users)
+    await database.record_progress(123, catalogue(), 3, 400.0, 1500, False)
+    session_payload = {
+        "catalogue": catalogue(),
+        "episode": 3,
+        "source_index": 0,
+        "start_position": 400.0,
+    }
+    raw_session, csrf = await database.create_web_session(
+        123,
+        session_payload,
+        ttl_seconds=600,
+    )
+    core = FakeCore()
+    media = MediaGateway(settings, database)
+    app = web.Application(middlewares=[error_boundary, security_headers])
+    app[CONFIG_KEY] = settings
+    WebRoutes(settings, database, core, media).register(app)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        headers = {
+            "Origin": settings.public_origin,
+            "X-CSRF-Token": csrf,
+            "Cookie": f"{settings.cookie_name}={raw_session}",
+        }
+        response = await client.post(
+            "/api/playback/prefetch",
+            headers=headers,
+            json={"episode": 4, "source_index": 0},
+        )
+        assert response.status == 200
+        prepared = await response.json()
+
+        session_payload["source_index"] = 1
+        assert await database.update_web_session_payload(
+            raw_session,
+            123,
+            session_payload,
+        )
+        stale = await client.post(
+            "/api/playback/activate",
+            headers=headers,
+            json={"playback_id": prepared["playback_id"]},
+        )
+        assert stale.status == 409
+
+        unchanged = (await database.continue_watching(123))[0]
+        assert unchanged["last_played_episode"] == 3
+        assert unchanged["resume_episode"] == 3
+        assert unchanged["position"] == 400.0
     finally:
         await client.close()
         await database.close()
