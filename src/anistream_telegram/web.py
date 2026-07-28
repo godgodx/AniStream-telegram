@@ -332,12 +332,25 @@ class WebRoutes:
         )
         # Persist the selected episode immediately. This covers a Mini App
         # being closed before the first timeupdate/pagehide event fires.
+        effective_start_position = start_position
         if record_progress:
+            # Source preparation can take several seconds. The previously
+            # active player may save newer progress while it is running, so
+            # never write the position captured before preparation back over
+            # that fresher value.
+            stored_position = await self.database.saved_episode_position(
+                session.telegram_user_id,
+                catalogue,
+                episode,
+            )
+            effective_start_position = (
+                0.0 if stored_position is None else stored_position
+            )
             await self.database.record_progress(
                 session.telegram_user_id,
                 catalogue,
                 episode,
-                start_position,
+                effective_start_position,
                 0.0,
                 False,
             )
@@ -347,7 +360,7 @@ class WebRoutes:
             playback,
             episode,
             total,
-            start_position,
+            effective_start_position,
             source_index,
             source_count,
         )
@@ -438,7 +451,7 @@ class WebRoutes:
             request,
             session,
             episode=episode,
-            start_position=start_position,
+            start_position=response_payload["start_position"],
             source_index=response_payload["source_index"],
         )
         return web.json_response(response_payload)
@@ -471,7 +484,7 @@ class WebRoutes:
             request,
             session,
             episode=episode,
-            start_position=start_position,
+            start_position=response_payload["start_position"],
             source_index=response_payload["source_index"],
         )
         return web.json_response(response_payload)
@@ -502,10 +515,11 @@ class WebRoutes:
         position, duration = self._progress_values(payload)
         observed_at_ms, event_sequence = self._progress_order(
             payload,
-            required=True,
+            required=False,
         )
         playback_generation = self._playback_generation(
-            payload.get("playback_generation")
+            payload.get("playback_generation"),
+            required=False,
         )
         accepted = await self.database.record_progress(
             session.telegram_user_id,
@@ -536,7 +550,7 @@ class WebRoutes:
             request,
             session,
             episode=episode,
-            start_position=start_position,
+            start_position=response_payload["start_position"],
             source_index=response_payload["source_index"],
         )
         return web.json_response(response_payload)
@@ -702,10 +716,11 @@ class WebRoutes:
         )
         observed_at_ms, event_sequence = self._progress_order(
             payload,
-            required=True,
+            required=False,
         )
         playback_generation = self._playback_generation(
             payload.get("playback_generation"),
+            required=False,
         )
         accepted = await self.database.record_progress(
             session.telegram_user_id,

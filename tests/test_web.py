@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -92,7 +93,9 @@ def test_mini_app_defers_saved_resume_until_media_is_seekable() -> None:
     assert "observed_at_ms: Date.now()" in script
     assert "event_sequence: progressEventSequence" in script
     assert "playback_generation: playbackGeneration" in script
-    assert "positionValue <= 0.25" in script
+    assert "mediaIsDetaching" in script
+    assert 'document.visibilityState !== "visible"' in script
+    assert 'video.addEventListener("seeked"' in script
     assert "playbackId, true" in script
     assert "hls.startLoad(" in script
     assert "hls.recoverMediaError()" in script
@@ -168,6 +171,18 @@ class FakeCore:
             source_index=source_index,
             source_count=2,
         )
+
+
+class BlockingCore(FakeCore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def prepare_media(self, *args, **kwargs) -> SimpleNamespace:
+        self.started.set()
+        await self.release.wait()
+        return await super().prepare_media(*args, **kwargs)
 
 
 def catalogue() -> dict:
@@ -782,8 +797,8 @@ async def test_paused_progress_is_returned_after_reopening_player(
                 "duration": 1440.0,
                 "completed": False,
                 "playback_generation": first_payload["playback_generation"],
-                "observed_at_ms": 1_000,
-                "event_sequence": 3,
+                "observed_at_ms": 3_000,
+                "event_sequence": 1,
                 "csrf_token": first_csrf,
             },
         )
@@ -791,12 +806,50 @@ async def test_paused_progress_is_returned_after_reopening_player(
         assert (await stale_close.json())["accepted"] is False
         assert await database.episode_position(123, catalogue(), 3) == 331.0
 
+        # A Mini App already open during deployment has neither ordering
+        # metadata nor a generation. It remains usable while the exact
+        # playback is active.
+        legacy_progress = await client.post(
+            "/api/progress/beacon",
+            headers={
+                "Origin": settings.public_origin,
+                "Cookie": f"{settings.cookie_name}={first_session}",
+            },
+            json={
+                "playback_id": first_payload["playback_id"],
+                "position": 340.0,
+                "duration": 1440.0,
+                "completed": False,
+                "csrf_token": first_csrf,
+            },
+        )
+        assert legacy_progress.status == 200
+        assert (await legacy_progress.json())["accepted"] is True
+
+        legacy_zero = await client.post(
+            "/api/progress/beacon",
+            headers={
+                "Origin": settings.public_origin,
+                "Cookie": f"{settings.cookie_name}={first_session}",
+            },
+            json={
+                "playback_id": first_payload["playback_id"],
+                "position": 0.0,
+                "duration": 1440.0,
+                "completed": False,
+                "csrf_token": first_csrf,
+            },
+        )
+        assert legacy_zero.status == 200
+        assert (await legacy_zero.json())["accepted"] is False
+        assert await database.episode_position(123, catalogue(), 3) == 340.0
+
         reopened_session, reopened_csrf = await database.create_web_session(
             123,
             {
                 "catalogue": catalogue(),
                 "episode": 3,
-                "start_position": 331.0,
+                "start_position": 340.0,
             },
             ttl_seconds=600,
         )
@@ -809,8 +862,103 @@ async def test_paused_progress_is_returned_after_reopening_player(
             },
         )
         assert reopened.status == 200
-        assert (await reopened.json())["start_position"] == 331.0
+        assert (await reopened.json())["start_position"] == 340.0
+
+        stale_legacy_player = await client.post(
+            "/api/progress/beacon",
+            headers={
+                "Origin": settings.public_origin,
+                "Cookie": f"{settings.cookie_name}={first_session}",
+            },
+            json={
+                "playback_id": first_payload["playback_id"],
+                "position": 500.0,
+                "duration": 1440.0,
+                "completed": False,
+                "csrf_token": first_csrf,
+            },
+        )
+        assert stale_legacy_player.status == 200
+        assert (await stale_legacy_player.json())["accepted"] is False
+        assert await database.episode_position(123, catalogue(), 3) == 340.0
     finally:
+        await client.close()
+        await database.close()
+
+
+async def test_playback_reloads_progress_after_slow_source_preparation(
+    tmp_path: Path,
+) -> None:
+    settings = config(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize(settings.allowed_users)
+    await database.record_progress(123, catalogue(), 3, 300.0, 1500, False)
+    old_playback = await database.create_playback(
+        123,
+        catalogue(),
+        3,
+        media_url="https://cdn.example/old-player.mp4",
+        media_headers={},
+        media_kind="mp4",
+        source_name="Old player",
+        ttl_seconds=600,
+    )
+    raw_session, csrf = await database.create_web_session(
+        123,
+        {
+            "catalogue": catalogue(),
+            "episode": 3,
+            "start_position": 300.0,
+        },
+        ttl_seconds=600,
+    )
+    core = BlockingCore()
+    media = MediaGateway(settings, database)
+    app = web.Application(middlewares=[error_boundary, security_headers])
+    app[CONFIG_KEY] = settings
+    WebRoutes(settings, database, core, media).register(app)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    request_task: asyncio.Task | None = None
+    try:
+        request_task = asyncio.create_task(
+            client.post(
+                "/api/playback",
+                headers={
+                    "Origin": settings.public_origin,
+                    "X-CSRF-Token": csrf,
+                    "Cookie": f"{settings.cookie_name}={raw_session}",
+                },
+            )
+        )
+        await asyncio.wait_for(core.started.wait(), timeout=2)
+
+        await database.record_progress(
+            123,
+            catalogue(),
+            3,
+            310.0,
+            1500,
+            False,
+            observed_at_ms=2_000,
+            event_sequence=1,
+            playback_id=old_playback.id,
+            playback_generation=old_playback.generation,
+        )
+        core.release.set()
+
+        response = await asyncio.wait_for(request_task, timeout=2)
+        assert response.status == 200
+        payload = await response.json()
+        assert payload["start_position"] == 310.0
+        assert await database.episode_position(123, catalogue(), 3) == 310.0
+        updated = await database.get_web_session(raw_session)
+        assert updated is not None
+        assert updated.payload["start_position"] == 310.0
+    finally:
+        core.release.set()
+        if request_task is not None and not request_task.done():
+            request_task.cancel()
         await client.close()
         await database.close()
 

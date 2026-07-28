@@ -830,6 +830,16 @@ class Database:
         except (KeyError, TypeError, ValueError):
             return 0
         now = utcnow()
+        # Progress, remove, restart, and activation all serialize on the watch
+        # state before touching ActivePlayback. Besides preventing lock-order
+        # inversions, this lets an in-flight save from the previous player
+        # commit before a replacement becomes active and reloads its position.
+        await session.scalar(
+            self._watch_state_for_update(
+                playback.telegram_user_id,
+                identity,
+            )
+        )
         active_insert = self._insert_do_nothing(
             session,
             ActivePlayback,
@@ -1153,22 +1163,15 @@ class Database:
                     playback_id,
                     with_for_update=True,
                 )
-                incoming_order = (observed_at_ms, event_sequence)
                 if (
                     not inserted_playback_cursor
                     and playback_cursor is not None
-                    and incoming_order <= (
-                        playback_cursor.observed_at_ms,
-                        playback_cursor.event_sequence,
-                    )
+                    and event_sequence <= playback_cursor.event_sequence
                 ):
                     return False
                 if playback_cursor is None:  # pragma: no cover
                     raise RuntimeError("playback progress cursor could not be created")
-                if incoming_order > (
-                    playback_cursor.observed_at_ms,
-                    playback_cursor.event_sequence,
-                ):
+                if event_sequence > playback_cursor.event_sequence:
                     playback_cursor.observed_at_ms = observed_at_ms
                     playback_cursor.event_sequence = event_sequence
                     playback_cursor.updated_at = now
@@ -1196,33 +1199,63 @@ class Database:
                     )
                     .with_for_update()
                 )
-                incoming_order = (observed_at_ms, event_sequence)
                 if (
                     not inserted_cursor
                     and cursor is not None
-                    and incoming_order <= (
-                        cursor.observed_at_ms,
-                        cursor.event_sequence,
-                    )
+                    and event_sequence <= cursor.event_sequence
                 ):
                     return False
                 if cursor is None:  # pragma: no cover - insert/select invariant.
                     raise RuntimeError("progress cursor could not be created")
-                if incoming_order > (
-                    cursor.observed_at_ms,
-                    cursor.event_sequence,
-                ):
+                if event_sequence > cursor.event_sequence:
                     cursor.observed_at_ms = observed_at_ms
                     cursor.event_sequence = event_sequence
                     cursor.updated_at = now
+
+            progress: EpisodeProgress | None = None
+            if (
+                playback_id is not None
+                and observed_at_ms is None
+                and not completed
+                and position <= 0.25
+            ):
+                # Compatibility for a Mini App that was already open during
+                # deployment. Legacy clients have no sequence metadata, and
+                # Telegram's iOS WebView may report zero while detaching the
+                # video. Reject only that ambiguous legacy close event. New
+                # clients carry a sequence and may intentionally seek to zero.
+                progress = await session.scalar(
+                    select(EpisodeProgress)
+                    .where(
+                        EpisodeProgress.watch_state_id == state.id,
+                        EpisodeProgress.episode == episode,
+                    )
+                    .with_for_update()
+                )
+                if (
+                    progress is not None
+                    and float(progress.position_seconds or 0.0) >= 5.0
+                ):
+                    return False
 
             state.catalogue_payload = catalogue_payload
             state.last_played_episode = episode
             state.updated_at = now
             if completed:
                 state.next_episode = max(state.next_episode, min(total, episode + 1))
-                if episode == total:
-                    state.status = "completed"
+                final_episode_completed = episode == total
+                if not final_episode_completed:
+                    final_episode_completed = bool(
+                        await session.scalar(
+                            select(EpisodeProgress.completed).where(
+                                EpisodeProgress.watch_state_id == state.id,
+                                EpisodeProgress.episode == total,
+                            )
+                        )
+                    )
+                state.status = (
+                    "completed" if final_episode_completed else "in_progress"
+                )
             else:
                 state.next_episode = max(state.next_episode, episode)
                 # A partial replay is an active interruption point. It must
@@ -1245,14 +1278,15 @@ class Database:
                     ("watch_state_id", "episode"),
                 )
             )
-            progress = await session.scalar(
-                select(EpisodeProgress)
-                .where(
-                    EpisodeProgress.watch_state_id == state.id,
-                    EpisodeProgress.episode == episode,
+            if progress is None:
+                progress = await session.scalar(
+                    select(EpisodeProgress)
+                    .where(
+                        EpisodeProgress.watch_state_id == state.id,
+                        EpisodeProgress.episode == episode,
+                    )
+                    .with_for_update()
                 )
-                .with_for_update()
-            )
             if progress is None:  # pragma: no cover - insert/select invariant.
                 raise RuntimeError("episode progress could not be created")
             progress.position_seconds = 0.0 if completed else position

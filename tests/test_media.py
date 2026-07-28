@@ -242,6 +242,41 @@ async def test_final_503_penalizes_source_health(
     assert health.observe.call_args.kwargs["success"] is False
 
 
+async def test_invalid_hls_playlist_is_never_scored_as_healthy(
+    tmp_path: Path,
+) -> None:
+    health = SimpleNamespace(observe=Mock())
+    gateway = MediaGateway(
+        config(tmp_path),
+        Database(config(tmp_path).database_url),
+        health,
+    )
+    upstream = ProbeResponse(
+        b"<html>not a playlist</html>",
+        "https://cdn.example/master.m3u8",
+    )
+    gateway.upstream.request = AsyncMock(return_value=upstream)
+
+    with pytest.raises(web.HTTPBadGateway) as error:
+        await gateway._serve_target(
+            SimpleNamespace(headers={}),
+            123,
+            SimpleNamespace(
+                id="playback-id",
+                media_headers={},
+                expires_at=utcnow() + timedelta(minutes=10),
+            ),
+            str(upstream.url),
+            force_playlist=True,
+            session_key="web:test",
+        )
+
+    assert "not an HLS playlist" in error.value.text
+    assert upstream.released is True
+    assert health.observe.call_count == 1
+    assert health.observe.call_args.kwargs["success"] is False
+
+
 def config(tmp_path: Path) -> Config:
     return Config(
         bot_token="123456789:test",

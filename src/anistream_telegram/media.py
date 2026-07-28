@@ -572,6 +572,7 @@ class MediaGateway:
         if range_header and not RANGE_PATTERN.fullmatch(range_header):
             raise web.HTTPRequestRangeNotSatisfiable()
         request_started = time.monotonic()
+        health_observed = False
         try:
             async with self._stream_slot(user_id, session_key):
                 upstream = await self.upstream.request(
@@ -587,6 +588,7 @@ class MediaGateway:
                             latency_seconds=time.monotonic() - request_started,
                             success=False,
                         )
+                        health_observed = True
                         raise web.HTTPBadGateway(
                             text=f"Upstream media returned HTTP {upstream.status}"
                         )
@@ -606,17 +608,28 @@ class MediaGateway:
                             playback.id,
                             time.monotonic() - request_started,
                         )
+                        try:
+                            response = await self._playlist_response(
+                                playback,
+                                upstream,
+                                final_url,
+                                cast_token=cast_token,
+                            )
+                        except Exception:
+                            self.source_health.observe(
+                                final_url,
+                                latency_seconds=time.monotonic() - request_started,
+                                success=False,
+                            )
+                            health_observed = True
+                            raise
                         self.source_health.observe(
                             final_url,
                             latency_seconds=time.monotonic() - request_started,
                             success=True,
                         )
-                        return await self._playlist_response(
-                            playback,
-                            upstream,
-                            final_url,
-                            cast_token=cast_token,
-                        )
+                        health_observed = True
+                        return response
                     return await self._stream_response(
                         request,
                         upstream,
@@ -644,11 +657,12 @@ class MediaGateway:
             LOGGER.warning("Blocked unsafe upstream target: %s", exc)
             raise web.HTTPBadGateway(text="The media source was rejected") from exc
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            self.source_health.observe(
-                target,
-                latency_seconds=time.monotonic() - request_started,
-                success=False,
-            )
+            if not health_observed:
+                self.source_health.observe(
+                    target,
+                    latency_seconds=time.monotonic() - request_started,
+                    success=False,
+                )
             LOGGER.info("Upstream media request failed: %s", type(exc).__name__)
             raise web.HTTPBadGateway(text="The media source is temporarily unavailable") from exc
 

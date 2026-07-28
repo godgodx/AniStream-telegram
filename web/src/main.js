@@ -224,10 +224,17 @@ function progressObservation(
     lastProgressObservation?.playback_id === targetPlaybackId
       ? lastProgressObservation
       : null;
-  // Telegram's iOS WebView can reset currentTime to exactly zero while the
-  // player is being detached. Preserve the last real observation in that
-  // narrow case instead of converting a close event into a restart.
+  const mediaIsDetaching =
+    targetPlaybackId === playbackId &&
+    positionOverride === null &&
+    (document.visibilityState !== "visible" ||
+      video.readyState === 0 ||
+      !video.currentSrc);
+  // Keep protecting iOS detach events, but only when the media is actually
+  // hidden or detached. A visible, seekable player may intentionally return
+  // to 0:00 and that choice must be persisted.
   if (
+    mediaIsDetaching &&
     positionValue <= 0.25 &&
     Number(previous?.position) >= 5 &&
     !video.ended
@@ -1629,6 +1636,17 @@ video.addEventListener(
   "webkitcurrentplaybacktargetiswirelesschanged",
   updatePictureInPictureUi,
 );
+video.addEventListener("seeked", () => {
+  if (
+    !completed &&
+    !localResumePending &&
+    document.visibilityState === "visible" &&
+    video.readyState > 0 &&
+    Boolean(video.currentSrc)
+  ) {
+    void saveProgress(true, false);
+  }
+});
 
 fullscreen.addEventListener("click", async () => {
   try {

@@ -319,7 +319,7 @@ async def test_continue_watching_loads_progress_in_one_bounded_query(
         await database.close()
 
 
-async def test_stale_progress_event_cannot_overwrite_newer_position(
+async def test_progress_sequence_survives_client_clock_rollback(
     tmp_path: Path,
 ) -> None:
     database = await database_at(tmp_path / "db.sqlite")
@@ -341,13 +341,14 @@ async def test_stale_progress_event_cannot_overwrite_newer_position(
             0.0,
             1435.0,
             False,
-            observed_at_ms=1_000,
-            event_sequence=3,
+            observed_at_ms=3_000,
+            event_sequence=1,
         )
         assert await database.episode_position(123, catalogue(), 6) == 331.0
 
-        # A genuinely newer backward seek must still be accepted; ordering is
-        # based on the observation, never on taking the maximum position.
+        # The monotonic per-player sequence is authoritative. Date.now() can
+        # move backwards after an OS clock correction without making a newer
+        # seek stale.
         assert await database.record_progress(
             123,
             catalogue(),
@@ -355,8 +356,8 @@ async def test_stale_progress_event_cannot_overwrite_newer_position(
             120.0,
             1435.0,
             False,
-            observed_at_ms=3_000,
-            event_sequence=4,
+            observed_at_ms=1_000,
+            event_sequence=3,
         )
         assert await database.episode_position(123, catalogue(), 6) == 120.0
     finally:
@@ -491,6 +492,64 @@ async def test_completed_season_returns_to_active_during_partial_rewatch(
         assert entry["next_episode"] == 12
         assert entry["resume_episode"] == 1
         assert entry["position"] == 120.0
+
+        await database.record_progress(123, catalogue(), 1, 1500, 1500, True)
+
+        replay_finished = (await database.continue_watching(123))[0]
+        assert replay_finished["status"] == "completed"
+        assert replay_finished["resume_episode"] == 12
+    finally:
+        await database.close()
+
+
+async def test_legacy_zero_close_does_not_override_progress_but_modern_seek_does(
+    tmp_path: Path,
+) -> None:
+    database = await database_at(tmp_path / "db.sqlite")
+    try:
+        playback = await database.create_playback(
+            123,
+            catalogue(),
+            6,
+            media_url="https://cdn.example/episode.mp4",
+            media_headers={},
+            media_kind="mp4",
+            source_name="Test",
+            ttl_seconds=600,
+        )
+        assert await database.record_progress(
+            123,
+            catalogue(),
+            6,
+            331.0,
+            1435.0,
+            False,
+            playback_id=playback.id,
+        )
+        assert not await database.record_progress(
+            123,
+            catalogue(),
+            6,
+            0.0,
+            1435.0,
+            False,
+            playback_id=playback.id,
+        )
+        assert await database.episode_position(123, catalogue(), 6) == 331.0
+
+        assert await database.record_progress(
+            123,
+            catalogue(),
+            6,
+            0.0,
+            1435.0,
+            False,
+            observed_at_ms=1_000,
+            event_sequence=1,
+            playback_id=playback.id,
+            playback_generation=playback.generation,
+        )
+        assert await database.episode_position(123, catalogue(), 6) == 0.0
     finally:
         await database.close()
 
