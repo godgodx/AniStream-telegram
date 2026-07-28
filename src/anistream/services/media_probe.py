@@ -14,7 +14,12 @@ class RemoteMediaProbe:
         headers = dict(media.headers)
         headers["Range"] = "bytes=0-65535"
         try:
-            response = self.http.get(media.url, headers=headers, stream=True, timeout=(10, 20))
+            response = self.http.get(
+                media.url,
+                headers=headers,
+                stream=True,
+                timeout=(5, 10),
+            )
         except Exception as exc:
             return ProbeResult(False, detail=f"connection failed: {exc}")
         try:

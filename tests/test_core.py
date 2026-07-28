@@ -143,3 +143,65 @@ async def test_core_prepares_the_requested_supported_source(
     assert media.embed_url == "https://video.example/embed/two"
     assert media.source_index == 1
     assert media.source_count == 2
+
+
+async def test_core_automatic_source_fallback_checks_each_candidate_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = CoreService()
+    payload = catalogue_payload(
+        Catalogue(
+            provider_id="provider",
+            provider_name="Provider",
+            title="Title",
+            url="https://provider.example/title",
+            season="Movie",
+            language=MediaLanguage("vf", "VF"),
+            episodes=(
+                Episode(
+                    1,
+                    (
+                        EmbedCandidate(
+                            "Slow broken player",
+                            "https://video.example/embed/broken",
+                        ),
+                        EmbedCandidate(
+                            "Working player",
+                            "https://video.example/embed/working",
+                        ),
+                    ),
+                ),
+            ),
+        )
+    )
+    calls: list[str] = []
+
+    monkeypatch.setattr(service.resolvers, "supports", lambda _url: True)
+
+    def resolve(url: str) -> ResolvedMedia:
+        calls.append(url)
+        if url.endswith("/broken"):
+            raise RuntimeError("source unavailable")
+        return ResolvedMedia(
+            f"{url}/video.mp4",
+            url,
+            "Test resolver",
+            {},
+            "mp4",
+        )
+
+    monkeypatch.setattr(service.resolvers, "resolve", resolve)
+    monkeypatch.setattr(
+        service.probe,
+        "probe",
+        lambda _media: ProbeResult(True, "mp4", "ok"),
+    )
+
+    media = await service.prepare_media(payload, 1, actor_key=123)
+
+    assert calls == [
+        "https://video.example/embed/broken",
+        "https://video.example/embed/working",
+    ]
+    assert media.source_index == 1
+    assert media.source_count == 2

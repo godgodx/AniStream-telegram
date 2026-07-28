@@ -17,7 +17,6 @@ from anistream.models import (
 from anistream.providers import ProviderRegistry, default_providers
 from anistream.resolvers import ResolverRegistry, default_resolvers
 from anistream.services.media_probe import RemoteMediaProbe
-from anistream.services.source_planner import SourcePlanner
 from anistream.utils.http import DEFAULT_USER_AGENT, HttpClient
 from anistream_telegram.limits import CapacityLimiter
 
@@ -134,9 +133,18 @@ class CoreService:
             provider.id: f"Provider {index}"
             for index, provider in enumerate(providers, start=1)
         }
-        self.resolvers = ResolverRegistry(default_resolvers(self.http))
-        self.probe = RemoteMediaProbe(self.http)
-        self.planner = SourcePlanner(self.resolvers, self.probe)
+        # Provider pages may benefit from conservative retries, but playback
+        # discovery must fail over quickly. A dead embed/media host must not
+        # hold the Mini App request open until the reverse proxy returns 504.
+        media_http = HttpClient(
+            user_agent=user_agent or DEFAULT_USER_AGENT,
+            cookie=cookie,
+            cookie_hosts={"anime-sama.to", "www.anime-sama.to"},
+            timeout=(5.0, 10.0),
+            retry_total=0,
+        )
+        self.resolvers = ResolverRegistry(default_resolvers(media_http))
+        self.probe = RemoteMediaProbe(media_http)
         self.provider_capacity = CapacityLimiter(
             total_limit=4,
             per_key_limit=1,
@@ -248,17 +256,17 @@ class CoreService:
                     f"selected source failed: {candidate.player}: {exc}"
                 ) from exc
 
-        plan = self.planner.plan(catalogue, [episode_number])
         errors: list[str] = []
-        for candidate in plan.routes.get(episode_number, list(episode.candidates)):
+        # SourcePlanner is useful for multi-episode CLI planning, but for one
+        # Mini App playback it preflights failed candidates and then retries
+        # them during route selection. Resolve each supported source exactly
+        # once and return the first verified playable result.
+        for source_index, candidate in enumerate(supported):
             try:
-                media = plan.cache.get((episode_number, candidate.url))
-                if media is None:
-                    media = self.resolvers.resolve(candidate.url)
-                    probe = self.probe.probe(media)
-                    if not probe.valid:
-                        raise ValueError(probe.detail)
-                source_index = supported.index(candidate)
+                media = self.resolvers.resolve(candidate.url)
+                probe = self.probe.probe(media)
+                if not probe.valid:
+                    raise ValueError(probe.detail)
                 return replace(
                     media,
                     source_index=source_index,

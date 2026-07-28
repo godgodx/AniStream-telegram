@@ -9,6 +9,16 @@ import responses
 from anistream.utils.http import HttpClient
 
 
+def test_http_client_allows_disabling_automatic_retries() -> None:
+    client = HttpClient(retry_total=0)
+    session = client._session()
+    adapter = session.get_adapter("https://example.com")
+
+    assert adapter.max_retries.total == 0
+    assert adapter.max_retries.connect == 0
+    assert adapter.max_retries.read == 0
+
+
 def test_sync_http_client_rejects_private_dns(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         socket,

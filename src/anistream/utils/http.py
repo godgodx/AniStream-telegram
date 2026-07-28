@@ -217,6 +217,7 @@ class HttpClient:
         cookie: str = "",
         cookie_hosts: set[str] | None = None,
         timeout: tuple[float, float] = (10.0, 30.0),
+        retry_total: int = 2,
         max_redirects: int = 3,
         max_response_bytes: int = 5 * 1024 * 1024,
     ) -> None:
@@ -224,6 +225,7 @@ class HttpClient:
         self.cookie = cookie.strip()
         self.cookie_hosts = {host.lower() for host in (cookie_hosts or set())}
         self.timeout = timeout
+        self.retry_total = max(0, min(3, int(retry_total)))
         self.max_redirects = max(0, min(5, max_redirects))
         self.max_response_bytes = max(64 * 1024, min(20 * 1024 * 1024, max_response_bytes))
         self._local = threading.local()
@@ -232,9 +234,9 @@ class HttpClient:
         session = getattr(self._local, "session", None)
         if session is None:
             retry = Retry(
-                total=2,
-                connect=2,
-                read=2,
+                total=self.retry_total,
+                connect=self.retry_total,
+                read=self.retry_total,
                 backoff_factor=0.5,
                 status_forcelist=(429, 500, 502, 503, 504),
                 allowed_methods=frozenset({"GET", "HEAD"}),
