@@ -59,6 +59,21 @@ def test_mini_app_exposes_dynamic_hls_track_controls() -> None:
     assert "prefetchedNextIsFresh()" in script
     assert "PREFETCH_EXPIRY_MARGIN_MS = 30_000" in script
     assert "PREFETCH_RETRY_DELAY_MS = 60_000" in script
+    assert '<script defer src="https://telegram.org/' in html
+    assert '<script defer src="/app/assets/hls.min.js"' in html
+
+
+def test_frontend_build_fingerprints_immutable_assets() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    build = (project_root / "web" / "build.mjs").read_text(encoding="utf-8")
+    web_routes = (
+        project_root / "src" / "anistream_telegram" / "web.py"
+    ).read_text(encoding="utf-8")
+
+    assert 'createHash("sha256")' in build
+    assert ".slice(0, 12)" in build
+    assert "public, max-age=31536000, immutable" in web_routes
+    assert 'response.headers["Cache-Control"] = "no-cache, no-store"' in web_routes
 
 
 def test_mini_app_defers_saved_resume_until_media_is_seekable() -> None:
@@ -76,8 +91,14 @@ def test_mini_app_defers_saved_resume_until_media_is_seekable() -> None:
     assert "lastProgressObservation" in script
     assert "observed_at_ms: Date.now()" in script
     assert "event_sequence: progressEventSequence" in script
+    assert "playback_generation: playbackGeneration" in script
     assert "positionValue <= 0.25" in script
     assert "playbackId, true" in script
+    assert "hls.startLoad(" in script
+    assert "hls.recoverMediaError()" in script
+    assert "recoverFatalPlayback" in script
+    assert "nextUntriedSource" in script
+    assert 'api("/api/session")' in script
 
 
 def test_mini_app_exposes_cross_browser_picture_in_picture() -> None:
@@ -728,6 +749,7 @@ async def test_paused_progress_is_returned_after_reopening_player(
                 "position": 331.0,
                 "duration": 1440.0,
                 "completed": False,
+                "playback_generation": first_payload["playback_generation"],
                 "observed_at_ms": 2_000,
                 "event_sequence": 2,
                 "csrf_token": first_csrf,
@@ -748,6 +770,7 @@ async def test_paused_progress_is_returned_after_reopening_player(
                 "position": 0.0,
                 "duration": 1440.0,
                 "completed": False,
+                "playback_generation": first_payload["playback_generation"],
                 "observed_at_ms": 1_000,
                 "event_sequence": 3,
                 "csrf_token": first_csrf,
@@ -822,7 +845,12 @@ async def test_source_change_keeps_saved_progress_and_selects_requested_source(
             },
             json={
                 "playback_id": current.id,
+                "playback_generation": current.generation,
                 "source_index": 1,
+                "position": 137.25,
+                "duration": 1500,
+                "observed_at_ms": 2_000,
+                "event_sequence": 1,
             },
         )
         assert rejected.status == 403
@@ -837,7 +865,12 @@ async def test_source_change_keeps_saved_progress_and_selects_requested_source(
             },
             json={
                 "playback_id": current.id,
+                "playback_generation": current.generation,
                 "source_index": 1,
+                "position": 137.25,
+                "duration": 1500,
+                "observed_at_ms": 2_000,
+                "event_sequence": 1,
             },
         )
 
@@ -846,7 +879,8 @@ async def test_source_change_keeps_saved_progress_and_selects_requested_source(
         assert payload["source_index"] == 1
         assert payload["source_count"] == 2
         assert payload["has_alternative_source"] is True
-        assert payload["start_position"] == 125.5
+        assert payload["start_position"] == 137.25
+        assert payload["playback_generation"] == current.generation + 1
         assert core.requests == [
             {
                 "episode": 3,
@@ -857,6 +891,7 @@ async def test_source_change_keeps_saved_progress_and_selects_requested_source(
         updated = await database.get_web_session(raw_session)
         assert updated is not None
         assert updated.payload["source_index"] == 1
+        assert await database.episode_position(123, catalogue(), 3) == 137.25
     finally:
         await client.close()
         await database.close()
@@ -993,6 +1028,9 @@ async def test_episode_picker_rewind_becomes_the_resume_point(
                 "position": 300.0,
                 "duration": 600.0,
                 "completed": False,
+                "playback_generation": selected_payload["playback_generation"],
+                "observed_at_ms": 3_000,
+                "event_sequence": 1,
             },
         )
         assert saved.status == 200

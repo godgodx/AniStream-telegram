@@ -19,9 +19,13 @@ from sqlalchemy import (
     UniqueConstraint,
     delete,
     event,
+    insert,
     select,
+    update,
 )
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from anistream.models import MAX_PREFETCHED_PLAYLIST_BYTES
@@ -153,6 +157,24 @@ class PreparedPlayback(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime, index=True, nullable=False)
 
 
+class ActivePlayback(Base):
+    __tablename__ = "active_playbacks"
+
+    telegram_user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+    )
+    identity_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    playback_id: Mapped[str] = mapped_column(
+        ForeignKey("playback_sessions.id", ondelete="CASCADE"),
+        unique=True,
+        nullable=False,
+    )
+    episode: Mapped[int] = mapped_column(Integer, nullable=False)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
 class CastGrant(Base):
     __tablename__ = "cast_grants"
 
@@ -231,6 +253,77 @@ class EpisodeProgressCursor(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
 
 
+class PlaybackProgressCursor(Base):
+    __tablename__ = "playback_progress_cursors"
+
+    playback_id: Mapped[str] = mapped_column(
+        ForeignKey("playback_sessions.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    observed_at_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    event_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
+class SchemaMigration(Base):
+    __tablename__ = "schema_migrations"
+
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    applied_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
+SCHEMA_MIGRATIONS = (
+    (1, "baseline schema"),
+    (2, "ordered progress cursors"),
+    (3, "active playback generations"),
+    (4, "per-playback progress cursors"),
+)
+
+
+def apply_schema_migrations(connection: Any) -> None:
+    """Apply ordered, additive migrations on SQLite and PostgreSQL.
+
+    Version 1 adopts existing installations by creating any missing baseline
+    tables. Later versions are intentionally explicit even though create_all()
+    also makes a fresh database current in one pass.
+    """
+
+    SchemaMigration.__table__.create(connection, checkfirst=True)
+    applied = set(
+        connection.execute(select(SchemaMigration.version)).scalars()
+    )
+    for version, name in SCHEMA_MIGRATIONS:
+        if version in applied:
+            continue
+        if version == 1:
+            Base.metadata.create_all(connection)
+        elif version == 2:
+            EpisodeProgressCursor.__table__.create(
+                connection,
+                checkfirst=True,
+            )
+        elif version == 3:
+            ActivePlayback.__table__.create(
+                connection,
+                checkfirst=True,
+            )
+        elif version == 4:
+            PlaybackProgressCursor.__table__.create(
+                connection,
+                checkfirst=True,
+            )
+        else:  # pragma: no cover - guards future registry mistakes.
+            raise RuntimeError(f"unknown schema migration {version}")
+        connection.execute(
+            insert(SchemaMigration).values(
+                version=version,
+                name=name,
+                applied_at=utcnow(),
+            )
+        )
+
+
 class Database:
     def __init__(self, url: str) -> None:
         connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
@@ -247,9 +340,27 @@ class Database:
             )
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
 
+    @staticmethod
+    def _insert_do_nothing(
+        session: AsyncSession,
+        model: type[Base],
+        values: dict[str, Any],
+        index_elements: tuple[str, ...],
+    ):
+        dialect = session.bind.dialect.name if session.bind is not None else ""
+        if dialect == "postgresql":
+            statement = postgresql_insert(model).values(**values)
+        elif dialect == "sqlite":
+            statement = sqlite_insert(model).values(**values)
+        else:
+            return insert(model).values(**values)
+        return statement.on_conflict_do_nothing(
+            index_elements=index_elements
+        )
+
     async def initialize(self, bootstrap_users: tuple[int, ...] = ()) -> None:
         async with self.engine.begin() as connection:
-            await connection.run_sync(Base.metadata.create_all)
+            await connection.run_sync(apply_schema_migrations)
         for user_id in bootstrap_users:
             await self.bootstrap_allowed_user(user_id)
         await self.cleanup()
@@ -259,18 +370,39 @@ class Database:
 
     async def set_allowed(self, user_id: int, enabled: bool) -> None:
         async with self.sessions.begin() as session:
-            item = await session.get(AllowedUser, user_id)
-            if item is None:
-                session.add(AllowedUser(telegram_user_id=user_id, enabled=enabled))
-            else:
-                item.enabled = enabled
+            await session.execute(
+                self._insert_do_nothing(
+                    session,
+                    AllowedUser,
+                    {
+                        "telegram_user_id": user_id,
+                        "enabled": bool(enabled),
+                        "created_at": utcnow(),
+                    },
+                    ("telegram_user_id",),
+                )
+            )
+            await session.execute(
+                update(AllowedUser)
+                .where(AllowedUser.telegram_user_id == user_id)
+                .values(enabled=bool(enabled))
+            )
 
     async def bootstrap_allowed_user(self, user_id: int) -> None:
         """Create an initial allow entry without overriding a persisted revocation."""
         async with self.sessions.begin() as session:
-            item = await session.get(AllowedUser, user_id)
-            if item is None:
-                session.add(AllowedUser(telegram_user_id=user_id, enabled=True))
+            await session.execute(
+                self._insert_do_nothing(
+                    session,
+                    AllowedUser,
+                    {
+                        "telegram_user_id": user_id,
+                        "enabled": True,
+                        "created_at": utcnow(),
+                    },
+                    ("telegram_user_id",),
+                )
+            )
 
     async def is_allowed(self, user_id: int) -> bool:
         async with self.sessions() as session:
@@ -293,34 +425,52 @@ class Database:
 
     async def set_autoplay_enabled(self, user_id: int, enabled: bool) -> bool:
         async with self.sessions.begin() as session:
-            preference = await session.get(UserPreference, user_id)
-            if preference is None:
-                preference = UserPreference(
-                    telegram_user_id=user_id,
-                    autoplay_next=bool(enabled),
+            now = utcnow()
+            await session.execute(
+                self._insert_do_nothing(
+                    session,
+                    UserPreference,
+                    {
+                        "telegram_user_id": user_id,
+                        "autoplay_next": bool(enabled),
+                        "updated_at": now,
+                    },
+                    ("telegram_user_id",),
                 )
-                session.add(preference)
-            else:
-                preference.autoplay_next = bool(enabled)
-                preference.updated_at = utcnow()
+            )
+            await session.execute(
+                update(UserPreference)
+                .where(UserPreference.telegram_user_id == user_id)
+                .values(
+                    autoplay_next=bool(enabled),
+                    updated_at=now,
+                )
+            )
         return bool(enabled)
 
     async def toggle_autoplay(self, user_id: int) -> bool:
         async with self.sessions.begin() as session:
+            await session.execute(
+                self._insert_do_nothing(
+                    session,
+                    UserPreference,
+                    {
+                        "telegram_user_id": user_id,
+                        "autoplay_next": True,
+                        "updated_at": utcnow(),
+                    },
+                    ("telegram_user_id",),
+                )
+            )
             preference = await session.scalar(
                 select(UserPreference)
                 .where(UserPreference.telegram_user_id == user_id)
                 .with_for_update()
             )
-            if preference is None:
-                preference = UserPreference(
-                    telegram_user_id=user_id,
-                    autoplay_next=False,
-                )
-                session.add(preference)
-            else:
-                preference.autoplay_next = not preference.autoplay_next
-                preference.updated_at = utcnow()
+            if preference is None:  # pragma: no cover - insert/select invariant.
+                raise RuntimeError("autoplay preference could not be created")
+            preference.autoplay_next = not preference.autoplay_next
+            preference.updated_at = utcnow()
             return bool(preference.autoplay_next)
 
     async def provider_states(
@@ -362,6 +512,19 @@ class Database:
         provider_id: str,
     ) -> bool:
         async with self.sessions.begin() as session:
+            await session.execute(
+                self._insert_do_nothing(
+                    session,
+                    UserProviderPreference,
+                    {
+                        "telegram_user_id": user_id,
+                        "provider_id": provider_id,
+                        "enabled": True,
+                        "updated_at": utcnow(),
+                    },
+                    ("telegram_user_id", "provider_id"),
+                )
+            )
             preference = await session.scalar(
                 select(UserProviderPreference)
                 .where(
@@ -370,16 +533,10 @@ class Database:
                 )
                 .with_for_update()
             )
-            if preference is None:
-                preference = UserProviderPreference(
-                    telegram_user_id=user_id,
-                    provider_id=provider_id,
-                    enabled=False,
-                )
-                session.add(preference)
-            else:
-                preference.enabled = not preference.enabled
-                preference.updated_at = utcnow()
+            if preference is None:  # pragma: no cover - insert/select invariant.
+                raise RuntimeError("provider preference could not be created")
+            preference.enabled = not preference.enabled
+            preference.updated_at = utcnow()
             return bool(preference.enabled)
 
     async def create_selection(
@@ -470,16 +627,21 @@ class Database:
         user_id: int,
     ) -> dict[str, Any] | None:
         async with self.sessions.begin() as session:
-            item = await session.get(LaunchTicket, token_hash(raw_token), with_for_update=True)
-            if (
-                item is None
-                or item.telegram_user_id != user_id
-                or item.consumed_at is not None
-                or item.expires_at <= utcnow()
-            ):
+            consumed_at = utcnow()
+            payload = await session.scalar(
+                update(LaunchTicket)
+                .where(
+                    LaunchTicket.token_hash == token_hash(raw_token),
+                    LaunchTicket.telegram_user_id == user_id,
+                    LaunchTicket.consumed_at.is_(None),
+                    LaunchTicket.expires_at > consumed_at,
+                )
+                .values(consumed_at=consumed_at)
+                .returning(LaunchTicket.payload)
+            )
+            if payload is None:
                 return None
-            item.consumed_at = utcnow()
-            return dict(item.payload)
+            return dict(payload)
 
     async def create_web_session(
         self,
@@ -513,6 +675,43 @@ class Database:
             if allowed is None or not allowed.enabled:
                 return None
             return item
+
+    async def get_media_playback(
+        self,
+        raw_token: str,
+        playback_id: str,
+    ) -> tuple[WebSession, PlaybackSession] | None:
+        """Authorize one media request with a single joined SQL statement."""
+
+        if not raw_token:
+            return None
+        now = utcnow()
+        async with self.sessions() as session:
+            row = (
+                await session.execute(
+                    select(WebSession, PlaybackSession)
+                    .join(
+                        AllowedUser,
+                        AllowedUser.telegram_user_id
+                        == WebSession.telegram_user_id,
+                    )
+                    .join(
+                        PlaybackSession,
+                        PlaybackSession.telegram_user_id
+                        == WebSession.telegram_user_id,
+                    )
+                    .where(
+                        WebSession.token_hash == token_hash(raw_token),
+                        WebSession.expires_at > now,
+                        AllowedUser.enabled.is_(True),
+                        PlaybackSession.id == playback_id,
+                        PlaybackSession.expires_at > now,
+                    )
+                )
+            ).first()
+            if row is None:
+                return None
+            return row[0], row[1]
 
     async def delete_web_session(self, raw_token: str) -> None:
         async with self.sessions.begin() as session:
@@ -600,7 +799,58 @@ class Database:
                         expires_at=expires_at,
                     )
                 )
+            else:
+                generation = await self._activate_playback_in_session(
+                    session,
+                    item,
+                )
+                setattr(item, "generation", generation)
         return item
+
+    async def _activate_playback_in_session(
+        self,
+        session: AsyncSession,
+        playback: PlaybackSession,
+    ) -> int:
+        try:
+            _, _, identity = self.catalogue_identity(
+                dict(playback.catalogue_payload)
+            )
+        except (KeyError, TypeError, ValueError):
+            return 0
+        now = utcnow()
+        active_insert = self._insert_do_nothing(
+            session,
+            ActivePlayback,
+            {
+                "telegram_user_id": playback.telegram_user_id,
+                "identity_hash": identity,
+                "playback_id": playback.id,
+                "episode": playback.episode,
+                "generation": 1,
+                "updated_at": now,
+            },
+            ("telegram_user_id", "identity_hash"),
+        ).returning(ActivePlayback.identity_hash)
+        inserted = await session.scalar(active_insert)
+        if inserted is not None:
+            return 1
+        active = await session.scalar(
+            select(ActivePlayback)
+            .where(
+                ActivePlayback.telegram_user_id
+                == playback.telegram_user_id,
+                ActivePlayback.identity_hash == identity,
+            )
+            .with_for_update()
+        )
+        if active is None:  # pragma: no cover - insert/select invariant.
+            raise RuntimeError("active playback could not be created")
+        active.playback_id = playback.id
+        active.episode = playback.episode
+        active.generation += 1
+        active.updated_at = now
+        return active.generation
 
     async def get_playback(self, playback_id: str, user_id: int) -> PlaybackSession | None:
         async with self.sessions() as session:
@@ -655,13 +905,13 @@ class Database:
         now = utcnow()
         async with self.sessions.begin() as session:
             prepared = await session.scalar(
-                select(PreparedPlayback)
+                delete(PreparedPlayback)
                 .where(
                     PreparedPlayback.playback_id == playback_id,
                     PreparedPlayback.telegram_user_id == user_id,
                     PreparedPlayback.expires_at > now,
                 )
-                .with_for_update()
+                .returning(PreparedPlayback)
             )
             if prepared is None:
                 return None
@@ -677,7 +927,11 @@ class Database:
             ):
                 return None
             playback.expires_at = now + timedelta(seconds=ttl_seconds)
-            await session.delete(prepared)
+            generation = await self._activate_playback_in_session(
+                session,
+                playback,
+            )
+            setattr(playback, "generation", generation)
             return playback, prepared
 
     async def create_cast_grant(
@@ -711,22 +965,28 @@ class Database:
             return None
         now = utcnow()
         async with self.sessions() as session:
-            grant = await session.get(CastGrant, token_hash(raw_token))
-            if (
-                grant is None
-                or grant.playback_id != playback_id
-                or grant.expires_at <= now
-            ):
-                return None
-            allowed = await session.get(AllowedUser, grant.telegram_user_id)
-            if allowed is None or not allowed.enabled:
-                return None
-            playback = await session.get(PlaybackSession, playback_id)
-            if (
-                playback is None
-                or playback.telegram_user_id != grant.telegram_user_id
-                or playback.expires_at <= now
-            ):
+            playback = await session.scalar(
+                select(PlaybackSession)
+                .join(
+                    CastGrant,
+                    CastGrant.playback_id == PlaybackSession.id,
+                )
+                .join(
+                    AllowedUser,
+                    AllowedUser.telegram_user_id
+                    == CastGrant.telegram_user_id,
+                )
+                .where(
+                    CastGrant.token_hash == token_hash(raw_token),
+                    CastGrant.playback_id == playback_id,
+                    CastGrant.expires_at > now,
+                    AllowedUser.enabled.is_(True),
+                    PlaybackSession.telegram_user_id
+                    == CastGrant.telegram_user_id,
+                    PlaybackSession.expires_at > now,
+                )
+            )
+            if playback is None:
                 return None
             return playback
 
@@ -750,6 +1010,8 @@ class Database:
         *,
         observed_at_ms: int | None = None,
         event_sequence: int | None = None,
+        playback_id: str | None = None,
+        playback_generation: int | None = None,
     ) -> bool:
         if (observed_at_ms is None) != (event_sequence is None):
             raise ValueError("progress ordering metadata must be supplied together")
@@ -758,6 +1020,42 @@ class Database:
         episode = max(1, min(total, int(episode)))
         now = utcnow()
         async with self.sessions.begin() as session:
+            if playback_id is not None:
+                active = await session.get(
+                    ActivePlayback,
+                    {
+                        "telegram_user_id": user_id,
+                        "identity_hash": identity,
+                    },
+                )
+                if (
+                    active is None
+                    or active.playback_id != playback_id
+                    or (
+                        playback_generation is not None
+                        and active.generation != playback_generation
+                    )
+                    or active.episode != episode
+                ):
+                    return False
+            await session.execute(
+                self._insert_do_nothing(
+                    session,
+                    WatchState,
+                    {
+                        "telegram_user_id": user_id,
+                        "provider_id": provider_id,
+                        "catalogue_url": catalogue_url,
+                        "identity_hash": identity,
+                        "catalogue_payload": catalogue_payload,
+                        "next_episode": episode,
+                        "last_played_episode": episode,
+                        "status": "in_progress",
+                        "updated_at": now,
+                    },
+                    ("telegram_user_id", "identity_hash"),
+                )
+            )
             state = await session.scalar(
                 select(WatchState)
                 .where(
@@ -766,20 +1064,68 @@ class Database:
                 )
                 .with_for_update()
             )
-            if state is None:
-                state = WatchState(
-                    telegram_user_id=user_id,
-                    provider_id=provider_id,
-                    catalogue_url=catalogue_url,
-                    identity_hash=identity,
-                    catalogue_payload=catalogue_payload,
-                    next_episode=episode,
-                    last_played_episode=episode,
-                )
-                session.add(state)
-                await session.flush()
+            if state is None:  # pragma: no cover - insert/select invariant.
+                raise RuntimeError("watch state could not be created")
 
-            if observed_at_ms is not None and event_sequence is not None:
+            if (
+                playback_id is not None
+                and observed_at_ms is not None
+                and event_sequence is not None
+            ):
+                playback_cursor_insert = self._insert_do_nothing(
+                    session,
+                    PlaybackProgressCursor,
+                    {
+                        "playback_id": playback_id,
+                        "observed_at_ms": observed_at_ms,
+                        "event_sequence": event_sequence,
+                        "updated_at": now,
+                    },
+                    ("playback_id",),
+                ).returning(PlaybackProgressCursor.playback_id)
+                inserted_playback_cursor = (
+                    await session.scalar(playback_cursor_insert)
+                ) is not None
+                playback_cursor = await session.get(
+                    PlaybackProgressCursor,
+                    playback_id,
+                    with_for_update=True,
+                )
+                incoming_order = (observed_at_ms, event_sequence)
+                if (
+                    not inserted_playback_cursor
+                    and playback_cursor is not None
+                    and incoming_order <= (
+                        playback_cursor.observed_at_ms,
+                        playback_cursor.event_sequence,
+                    )
+                ):
+                    return False
+                if playback_cursor is None:  # pragma: no cover
+                    raise RuntimeError("playback progress cursor could not be created")
+                if incoming_order > (
+                    playback_cursor.observed_at_ms,
+                    playback_cursor.event_sequence,
+                ):
+                    playback_cursor.observed_at_ms = observed_at_ms
+                    playback_cursor.event_sequence = event_sequence
+                    playback_cursor.updated_at = now
+            elif observed_at_ms is not None and event_sequence is not None:
+                cursor_insert = self._insert_do_nothing(
+                    session,
+                    EpisodeProgressCursor,
+                    {
+                        "watch_state_id": state.id,
+                        "episode": episode,
+                        "observed_at_ms": observed_at_ms,
+                        "event_sequence": event_sequence,
+                        "updated_at": now,
+                    },
+                    ("watch_state_id", "episode"),
+                ).returning(EpisodeProgressCursor.watch_state_id)
+                inserted_cursor = (
+                    await session.scalar(cursor_insert)
+                ) is not None
                 cursor = await session.scalar(
                     select(EpisodeProgressCursor)
                     .where(
@@ -789,20 +1135,21 @@ class Database:
                     .with_for_update()
                 )
                 incoming_order = (observed_at_ms, event_sequence)
-                if cursor is not None and incoming_order <= (
+                if (
+                    not inserted_cursor
+                    and cursor is not None
+                    and incoming_order <= (
+                        cursor.observed_at_ms,
+                        cursor.event_sequence,
+                    )
+                ):
+                    return False
+                if cursor is None:  # pragma: no cover - insert/select invariant.
+                    raise RuntimeError("progress cursor could not be created")
+                if incoming_order > (
                     cursor.observed_at_ms,
                     cursor.event_sequence,
                 ):
-                    return False
-                if cursor is None:
-                    cursor = EpisodeProgressCursor(
-                        watch_state_id=state.id,
-                        episode=episode,
-                        observed_at_ms=observed_at_ms,
-                        event_sequence=event_sequence,
-                    )
-                    session.add(cursor)
-                else:
                     cursor.observed_at_ms = observed_at_ms
                     cursor.event_sequence = event_sequence
                     cursor.updated_at = now
@@ -816,7 +1163,26 @@ class Database:
                     state.status = "completed"
             else:
                 state.next_episode = max(state.next_episode, episode)
+                # A partial replay is an active interruption point. It must
+                # reappear in Continue Watching even when the season had
+                # previously been completed.
+                state.status = "in_progress"
 
+            await session.execute(
+                self._insert_do_nothing(
+                    session,
+                    EpisodeProgress,
+                    {
+                        "watch_state_id": state.id,
+                        "episode": episode,
+                        "position_seconds": 0.0,
+                        "duration_seconds": 0.0,
+                        "completed": False,
+                        "updated_at": now,
+                    },
+                    ("watch_state_id", "episode"),
+                )
+            )
             progress = await session.scalar(
                 select(EpisodeProgress)
                 .where(
@@ -825,9 +1191,8 @@ class Database:
                 )
                 .with_for_update()
             )
-            if progress is None:
-                progress = EpisodeProgress(watch_state_id=state.id, episode=episode)
-                session.add(progress)
+            if progress is None:  # pragma: no cover - insert/select invariant.
+                raise RuntimeError("episode progress could not be created")
             progress.position_seconds = 0.0 if completed else position
             progress.duration_seconds = max(float(progress.duration_seconds or 0.0), duration)
             # Opening or replaying an episode makes it the active interruption
@@ -854,27 +1219,35 @@ class Database:
                     statement.order_by(WatchState.updated_at.desc()).limit(limit)
                 )
             )
+            state_ids = [state.id for state in states]
+            progress_by_key: dict[tuple[int, int], EpisodeProgress] = {}
+            if state_ids:
+                progress_rows = await session.scalars(
+                    select(EpisodeProgress).where(
+                        EpisodeProgress.watch_state_id.in_(state_ids)
+                    )
+                )
+                progress_by_key = {
+                    (item.watch_state_id, item.episode): item
+                    for item in progress_rows
+                }
             output: list[dict[str, Any]] = []
             for state in states:
-                last_progress = await session.scalar(
-                    select(EpisodeProgress).where(
-                        EpisodeProgress.watch_state_id == state.id,
-                        EpisodeProgress.episode == state.last_played_episode,
-                    )
+                last_progress = progress_by_key.get(
+                    (state.id, state.last_played_episode)
                 )
                 if last_progress is not None and not last_progress.completed:
                     resume_episode = state.last_played_episode
                     position = float(last_progress.position_seconds or 0.0)
                 else:
                     resume_episode = state.next_episode
+                    next_progress = progress_by_key.get(
+                        (state.id, state.next_episode)
+                    )
                     position = float(
-                        await session.scalar(
-                            select(EpisodeProgress.position_seconds).where(
-                                EpisodeProgress.watch_state_id == state.id,
-                                EpisodeProgress.episode == state.next_episode,
-                            )
-                        )
-                        or 0.0
+                        next_progress.position_seconds
+                        if next_progress is not None
+                        else 0.0
                     )
                 output.append(
                     {
@@ -913,6 +1286,17 @@ class Database:
                     EpisodeProgress.watch_state_id == state.id
                 )
             )
+            await session.execute(
+                delete(EpisodeProgressCursor).where(
+                    EpisodeProgressCursor.watch_state_id == state.id
+                )
+            )
+            await session.execute(
+                delete(ActivePlayback).where(
+                    ActivePlayback.telegram_user_id == user_id,
+                    ActivePlayback.identity_hash == identity,
+                )
+            )
             await session.delete(state)
             return True
 
@@ -936,6 +1320,17 @@ class Database:
             await session.execute(
                 delete(EpisodeProgress).where(
                     EpisodeProgress.watch_state_id == state.id
+                )
+            )
+            await session.execute(
+                delete(EpisodeProgressCursor).where(
+                    EpisodeProgressCursor.watch_state_id == state.id
+                )
+            )
+            await session.execute(
+                delete(ActivePlayback).where(
+                    ActivePlayback.telegram_user_id == user_id,
+                    ActivePlayback.identity_hash == identity,
                 )
             )
             state.catalogue_payload = catalogue_payload

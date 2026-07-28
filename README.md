@@ -43,10 +43,11 @@ workflow.
   languages before a result is selected.
 - **Structured seasons and languages** — providers expose one neutral variant
   per season/language pair without global language assumptions.
-- **Reusable source preflight** — resolve and probe ordered candidates before
-  playback, then fall back when necessary. A complete bounded HLS playlist
-  obtained during validation is consumed by the first player request instead
-  of being downloaded twice.
+- **Adaptive source preflight** — rank candidates from a short-lived moving
+  history of resolution time, first-resource latency, throughput, and failures.
+  Unknown HLS hosts receive a bounded startup-resource check; the probe shares
+  the gateway connection pool, and its complete playlist is consumed by the
+  first player request instead of being downloaded twice.
 - **Secure Mini App playback** — one-time launch tickets create authenticated
   `HttpOnly` sessions; raw provider headers and media URLs never reach normal
   frontend code.
@@ -55,7 +56,10 @@ workflow.
 - **Reliable watch history** — save a distinct position for every episode,
   preserve forward continuation during rewatches, and resume the last genuinely
   interrupted episode. Finished series move to a clearly labelled Completed
-  section, while any active or completed entry can be restarted from episode 1.
+  section; replaying part of a completed season moves it back to Continue
+  Watching. Every progress event is ordered and bound to the current playback
+  generation so an old WebView cannot overwrite the active player. Any active
+  or completed entry can be restarted from episode 1.
   Users can also remove an entry and its saved positions through a confirmed
   private action.
 - **Series controls** — move to the previous, next, or any specific episode and
@@ -66,6 +70,9 @@ workflow.
   and subtitle selectors when the upstream playlist actually supplies those
   choices. A visible playback-options button reports when a source has no
   alternate quality, audio track, or subtitle track.
+- **Bounded HLS recovery** — retry one network failure, recover one media
+  failure, rebuild the player once, then move through untried sources while
+  preserving the last reliable playback position.
 - **TV playback** — expose Google Cast, AirPlay, or Remote Playback when the
   current Telegram client or external browser supports it.
 - **Hardened outbound networking** — block credentials, unsafe ports,
@@ -107,7 +114,9 @@ without notice.
 | Docker with Compose | Isolated application, PostgreSQL, and Caddy services | Production |
 
 PostgreSQL is used by the production Compose deployment. SQLite remains
-available to developers and automated tests.
+available to developers and automated tests. Startup records ordered schema
+migrations in `schema_migrations`; back up the PostgreSQL volume before
+upgrading even when a migration is additive.
 
 ## Installation
 
@@ -439,6 +448,9 @@ through the neutral core as a stable code and user-facing label.
   rather than by individual HLS segment. Each session still has an internal
   request cap, so adaptive video, audio, and subtitles can load concurrently
   without removing anti-abuse backpressure.
+- The shipped Compose topology intentionally runs one application replica.
+  Admission and source-health windows are process-local; do not scale `app`
+  horizontally until those controls are moved to a shared store.
 - Unlisted users can invoke only the exact `/id` command in a private chat;
   callbacks, other commands, launch tickets, and Mini App authentication remain
   blocked.

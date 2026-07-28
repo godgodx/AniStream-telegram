@@ -113,26 +113,42 @@ class Embed4MeResolver(Resolver):
             f"?id={video_id}&w=1920&h=1080&r=https://lpayer.embed4me.com/"
         )
         headers = self.media_headers(url, "https://lpayer.embed4me.com/")
-        last_error = "empty response"
-        for _ in range(3):
-            try:
-                response = self.http.get(api_url, headers=headers)
-                if response.status_code != 200:
-                    last_error = f"HTTP {response.status_code}"
-                    continue
-                encrypted = response.text.strip().strip('"')
-                cipher = AES.new(self._key, AES.MODE_CBC, self._iv)
-                decoded = unpad(cipher.decrypt(binascii.unhexlify(encrypted)), AES.block_size).decode("utf-8")
-                payload = json.loads(decoded)
-                source = payload.get("source")
-                if isinstance(source, list):
-                    source = next((item.get("file") for item in source if isinstance(item, dict) and item.get("file")), None)
-                if isinstance(source, str) and source:
-                    return ResolvedMedia(source, url, self.name, headers, _kind(source))
-                last_error = "decrypted payload did not contain a source"
-            except (ValueError, binascii.Error, UnicodeError, json.JSONDecodeError) as exc:
-                last_error = str(exc)
-        raise ResolverError(f"Embed4me resolution failed: {last_error}")
+        try:
+            response = self.http.get(api_url, headers=headers)
+            if response.status_code != 200:
+                raise ResolverError(
+                    f"Embed4me resolution failed: HTTP {response.status_code}"
+                )
+            encrypted = response.text.strip().strip('"')
+            cipher = AES.new(self._key, AES.MODE_CBC, self._iv)
+            decoded = unpad(
+                cipher.decrypt(binascii.unhexlify(encrypted)),
+                AES.block_size,
+            ).decode("utf-8")
+            payload = json.loads(decoded)
+            source = payload.get("source")
+            if isinstance(source, list):
+                source = next(
+                    (
+                        item.get("file")
+                        for item in source
+                        if isinstance(item, dict) and item.get("file")
+                    ),
+                    None,
+                )
+            if isinstance(source, str) and source:
+                return ResolvedMedia(
+                    source,
+                    url,
+                    self.name,
+                    headers,
+                    _kind(source),
+                )
+            raise ResolverError(
+                "Embed4me resolution failed: decrypted payload did not contain a source"
+            )
+        except (ValueError, binascii.Error, UnicodeError, json.JSONDecodeError) as exc:
+            raise ResolverError(f"Embed4me resolution failed: {exc}") from exc
 
 
 class VidmolyResolver(Resolver):

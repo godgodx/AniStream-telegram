@@ -10,7 +10,7 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlparse
 
 import aiohttp
 from aiohttp import ClientResponse, web
@@ -18,6 +18,11 @@ from aiohttp.abc import AbstractResolver
 
 from anistream_telegram.config import Config
 from anistream_telegram.database import Database, PlaybackSession, token_hash
+from anistream.models import (
+    MAX_PREFETCHED_PLAYLIST_BYTES,
+    ProbeResult,
+    ResolvedMedia,
+)
 from anistream_telegram.security import (
     AuthenticationError,
     OpaqueMediaToken,
@@ -26,6 +31,7 @@ from anistream_telegram.security import (
     sanitize_upstream_headers,
     validate_public_addresses,
 )
+from anistream_telegram.source_health import SourceHealthTracker
 
 
 LOGGER = logging.getLogger(__name__)
@@ -52,6 +58,9 @@ MAX_PLAYLIST_URI_LENGTH = 8_192
 MAX_PLAYLIST_TOKEN_LENGTH = 8_192
 MAX_REQUESTS_PER_PLAYBACK_SESSION = 12
 PLAYBACK_SESSION_IDLE_SECONDS = 30
+PROBE_MEDIA_BYTES = 64 * 1024
+COLD_HLS_PROBE_SECONDS = 4.0
+TRANSIENT_UPSTREAM_STATUSES = {502, 503, 504}
 
 
 @dataclass(slots=True)
@@ -147,45 +156,251 @@ class UpstreamClient:
     ) -> ClientResponse:
         if self.session is None:
             raise RuntimeError("upstream client is not started")
-        current = url
         clean_headers = sanitize_upstream_headers(headers)
         clean_headers["Accept-Encoding"] = "identity"
         if range_header:
             clean_headers["Range"] = range_header
-        for redirect_count in range(max_redirects + 1):
-            public_url_parts(current, self.config.media_allowed_hosts)
-            response = await self.session.get(
-                current,
-                headers=clean_headers,
-                allow_redirects=False,
-            )
-            if response.status not in {301, 302, 303, 307, 308}:
-                return response
-            location = response.headers.get("Location", "").strip()
-            if not location or redirect_count >= max_redirects:
-                response.release()
-                raise web.HTTPBadGateway(text="Upstream redirect could not be followed")
-            next_url = urljoin(current, location)
-            public_url_parts(next_url, self.config.media_allowed_hosts)
-            response.release()
-            current = next_url
-        raise web.HTTPBadGateway(text="Too many upstream redirects")
+        last_error: Exception | None = None
+        for attempt in range(2):
+            current = url
+            try:
+                for redirect_count in range(max_redirects + 1):
+                    public_url_parts(current, self.config.media_allowed_hosts)
+                    response = await self.session.get(
+                        current,
+                        headers=clean_headers,
+                        allow_redirects=False,
+                    )
+                    if response.status not in {301, 302, 303, 307, 308}:
+                        if (
+                            response.status in TRANSIENT_UPSTREAM_STATUSES
+                            and attempt == 0
+                        ):
+                            response.release()
+                            await asyncio.sleep(0.1)
+                            break
+                        return response
+                    location = response.headers.get("Location", "").strip()
+                    if not location or redirect_count >= max_redirects:
+                        response.release()
+                        raise web.HTTPBadGateway(
+                            text="Upstream redirect could not be followed"
+                        )
+                    next_url = urljoin(current, location)
+                    public_url_parts(next_url, self.config.media_allowed_hosts)
+                    response.release()
+                    current = next_url
+                else:
+                    raise web.HTTPBadGateway(text="Too many upstream redirects")
+            except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as exc:
+                last_error = exc
+                if attempt == 0:
+                    await asyncio.sleep(0.1)
+                    continue
+                raise
+        if last_error is not None:
+            raise last_error
+        raise web.HTTPBadGateway(text="Upstream request failed")
 
 
 class MediaGateway:
-    def __init__(self, config: Config, database: Database) -> None:
+    def __init__(
+        self,
+        config: Config,
+        database: Database,
+        source_health: SourceHealthTracker | None = None,
+    ) -> None:
         self.config = config
         self.database = database
         self.tokens = OpaqueMediaToken(config.session_secret)
         self.upstream = UpstreamClient(config)
+        self.source_health = source_health or SourceHealthTracker()
         self._active: dict[int, dict[str, PlaybackActivity]] = defaultdict(dict)
         self._active_lock = asyncio.Lock()
+        self._first_resource_seen: dict[str, float] = {}
 
     async def start(self) -> None:
         await self.upstream.start()
 
     async def close(self) -> None:
         await self.upstream.close()
+
+    async def probe(
+        self,
+        media: ResolvedMedia,
+        validate_first_resource: bool = False,
+    ) -> ProbeResult:
+        """Probe through the gateway pool so the TLS connection remains warm."""
+
+        expected_hls = (
+            media.kind == "hls"
+            or ".m3u8" in urlparse(media.url).path.casefold()
+        )
+        maximum = (
+            MAX_PREFETCHED_PLAYLIST_BYTES if expected_hls else PROBE_MEDIA_BYTES
+        )
+        started = time.monotonic()
+        response: ClientResponse | None = None
+        valid = False
+        try:
+            response = await self.upstream.request(
+                media.url,
+                dict(media.headers),
+                range_header=f"bytes=0-{maximum - 1}",
+            )
+            if response.status not in {200, 206}:
+                return ProbeResult(False, detail=f"HTTP {response.status}")
+            body = await response.content.read(maximum + 1)
+            if len(body) > maximum:
+                return ProbeResult(False, detail="probe response is too large")
+            content_type = (
+                response.headers.get("Content-Type", "")
+                .split(";", 1)[0]
+                .casefold()
+            )
+            final_url = str(response.url)
+            is_hls = (
+                ".m3u8" in urlparse(final_url).path.casefold()
+                or "mpegurl" in content_type
+                or body.lstrip().startswith(b"#EXTM3U")
+            )
+            if is_hls:
+                if not body.lstrip().startswith(b"#EXTM3U"):
+                    return ProbeResult(
+                        False,
+                        "hls",
+                        "response did not contain an HLS playlist",
+                    )
+                if validate_first_resource:
+                    await self._probe_first_hls_resource(
+                        body,
+                        final_url,
+                        dict(media.headers),
+                    )
+                complete = response.status == 200
+                if response.status == 206:
+                    total = (
+                        response.headers.get("Content-Range", "")
+                        .rpartition("/")[2]
+                        .strip()
+                    )
+                    complete = total.isdigit() and int(total) <= len(body)
+                valid = True
+                return ProbeResult(
+                    True,
+                    "hls",
+                    "valid HLS playlist and startup resource",
+                    body if complete else b"",
+                    final_url if complete else "",
+                )
+            if content_type.startswith(("text/", "image/")) or "html" in content_type:
+                return ProbeResult(
+                    False,
+                    detail=f"unexpected content type: {content_type or 'unknown'}",
+                )
+            if len(body) >= 12 and body[4:8] == b"ftyp":
+                valid = True
+                return ProbeResult(True, "mp4", "ISO Base Media header detected")
+            if content_type.startswith("video/") and len(body) >= 1024:
+                valid = True
+                return ProbeResult(True, "video", f"video response: {content_type}")
+            return ProbeResult(
+                False,
+                detail="response did not look like playable media",
+            )
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            UnicodeDecodeError,
+            ValueError,
+            web.HTTPException,
+        ) as exc:
+            return ProbeResult(False, detail=f"connection failed: {exc}")
+        finally:
+            if response is not None:
+                response.release()
+            self.source_health.observe(
+                media.url,
+                latency_seconds=time.monotonic() - started,
+                success=valid,
+            )
+
+    async def _probe_first_hls_resource(
+        self,
+        body: bytes,
+        base_url: str,
+        headers: dict[str, str],
+    ) -> None:
+        async with asyncio.timeout(COLD_HLS_PROBE_SECONDS):
+            playlist = body
+            playlist_url = base_url
+            text = playlist.decode("utf-8-sig")
+            plain_uris = [
+                line.strip()
+                for line in text.splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            ]
+            if not plain_uris:
+                raise ValueError("HLS playlist has no playable resource")
+            if "#EXT-X-STREAM-INF" in text.upper():
+                variant_url = urljoin(playlist_url, plain_uris[0])
+                public_url_parts(
+                    variant_url,
+                    self.config.media_allowed_hosts,
+                )
+                variant = await self.upstream.request(variant_url, headers)
+                try:
+                    if variant.status not in {200, 206}:
+                        raise ValueError(
+                            f"HLS variant returned HTTP {variant.status}"
+                        )
+                    playlist = await variant.content.read(
+                        MAX_PREFETCHED_PLAYLIST_BYTES + 1
+                    )
+                    if len(playlist) > MAX_PREFETCHED_PLAYLIST_BYTES:
+                        raise ValueError("HLS variant playlist is too large")
+                    playlist_url = str(variant.url)
+                finally:
+                    variant.release()
+                text = playlist.decode("utf-8-sig")
+                plain_uris = [
+                    line.strip()
+                    for line in text.splitlines()
+                    if line.strip() and not line.lstrip().startswith("#")
+                ]
+                if not plain_uris:
+                    raise ValueError("HLS variant has no media segment")
+
+            targets = [urljoin(playlist_url, plain_uris[0])]
+            key_match = URI_ATTRIBUTE.search(
+                next(
+                    (
+                        line
+                        for line in text.splitlines()
+                        if line.lstrip().upper().startswith("#EXT-X-KEY:")
+                    ),
+                    "",
+                )
+            )
+            if key_match is not None:
+                targets.insert(0, urljoin(playlist_url, key_match.group(1)))
+            for target in targets:
+                public_url_parts(target, self.config.media_allowed_hosts)
+                resource = await self.upstream.request(
+                    target,
+                    headers,
+                    range_header=f"bytes=0-{PROBE_MEDIA_BYTES - 1}",
+                )
+                try:
+                    if resource.status not in {200, 206}:
+                        raise ValueError(
+                            f"HLS startup resource returned HTTP {resource.status}"
+                        )
+                    sample = await resource.content.read(PROBE_MEDIA_BYTES + 1)
+                    if not sample:
+                        raise ValueError("HLS startup resource is empty")
+                finally:
+                    resource.release()
 
     async def options(self, request: web.Request) -> web.Response:
         return web.Response(status=204, headers=CAST_CORS_HEADERS)
@@ -202,12 +417,13 @@ class MediaGateway:
                 raise web.HTTPForbidden(text="Cast session is unavailable")
             return playback.telegram_user_id, playback, cast_token, "cast"
         raw_session = request.cookies.get(self.config.cookie_name, "")
-        session = await self.database.get_web_session(raw_session)
-        if session is None:
-            raise web.HTTPUnauthorized(text="Authentication required")
-        playback = await self.database.get_playback(playback_id, session.telegram_user_id)
-        if playback is None:
-            raise web.HTTPForbidden(text="Playback session is unavailable")
+        authorized = await self.database.get_media_playback(
+            raw_session,
+            playback_id,
+        )
+        if authorized is None:
+            raise web.HTTPUnauthorized(text="Playback session is unavailable")
+        session, playback = authorized
         return (
             session.telegram_user_id,
             playback,
@@ -319,6 +535,7 @@ class MediaGateway:
         range_header = request.headers.get("Range", "")
         if range_header and not RANGE_PATTERN.fullmatch(range_header):
             raise web.HTTPRequestRangeNotSatisfiable()
+        request_started = time.monotonic()
         try:
             async with self._stream_slot(user_id, session_key):
                 upstream = await self.upstream.request(
@@ -341,6 +558,17 @@ class MediaGateway:
                         or force_playlist
                     ) and not range_header
                     if is_playlist:
+                        LOGGER.info(
+                            "HLS playlist fetched stage=%s playback=%s seconds=%.3f",
+                            "master" if force_playlist else "variant",
+                            playback.id,
+                            time.monotonic() - request_started,
+                        )
+                        self.source_health.observe(
+                            final_url,
+                            latency_seconds=time.monotonic() - request_started,
+                            success=True,
+                        )
                         return await self._playlist_response(
                             playback,
                             upstream,
@@ -351,6 +579,21 @@ class MediaGateway:
                         request,
                         upstream,
                         cast_enabled=bool(cast_token),
+                        playback_id=playback.id,
+                        target_url=final_url,
+                        request_started=request_started,
+                        measure_startup=(
+                            content_type.startswith(("video/", "audio/"))
+                            or urlparse(final_url).path.casefold().endswith(
+                                (
+                                    ".ts",
+                                    ".m4s",
+                                    ".mp4",
+                                    ".aac",
+                                    ".webm",
+                                )
+                            )
+                        ),
                     )
                 except Exception:
                     upstream.release()
@@ -359,6 +602,11 @@ class MediaGateway:
             LOGGER.warning("Blocked unsafe upstream target: %s", exc)
             raise web.HTTPBadGateway(text="The media source was rejected") from exc
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            self.source_health.observe(
+                target,
+                latency_seconds=time.monotonic() - request_started,
+                success=False,
+            )
             LOGGER.info("Upstream media request failed: %s", type(exc).__name__)
             raise web.HTTPBadGateway(text="The media source is temporarily unavailable") from exc
 
@@ -463,6 +711,10 @@ class MediaGateway:
         upstream: ClientResponse,
         *,
         cast_enabled: bool = False,
+        playback_id: str = "",
+        target_url: str = "",
+        request_started: float | None = None,
+        measure_startup: bool = True,
     ) -> web.StreamResponse:
         headers: dict[str, str] = {
             "Cache-Control": "private, max-age=30",
@@ -483,12 +735,83 @@ class MediaGateway:
                 headers[name] = value
         response = web.StreamResponse(status=upstream.status, headers=headers)
         await response.prepare(request)
+        first_resource = bool(
+            measure_startup
+            and playback_id
+            and playback_id not in self._first_resource_seen
+        )
+        if first_resource:
+            self._first_resource_seen[playback_id] = time.monotonic()
+            if len(self._first_resource_seen) > 4096:
+                oldest = next(iter(self._first_resource_seen))
+                self._first_resource_seen.pop(oldest, None)
+        transfer_started = time.monotonic()
+        first_byte_at: float | None = None
+        transferred = 0
+        client_disconnected = False
+        upstream_failed = False
         try:
-            async for chunk in upstream.content.iter_chunked(64 * 1024):
-                await response.write(chunk)
-        except (ConnectionResetError, asyncio.CancelledError):
-            pass
+            while True:
+                try:
+                    chunk = await upstream.content.read(64 * 1024)
+                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    upstream_failed = True
+                    LOGGER.info(
+                        "Upstream body failed stage=stream playback=%s error=%s",
+                        playback_id,
+                        type(exc).__name__,
+                    )
+                    break
+                if not chunk:
+                    break
+                now = time.monotonic()
+                if first_byte_at is None:
+                    first_byte_at = now
+                transferred += len(chunk)
+                try:
+                    await response.write(chunk)
+                except (ConnectionResetError, asyncio.CancelledError):
+                    client_disconnected = True
+                    LOGGER.debug(
+                        "Client abandoned media response playback=%s",
+                        playback_id,
+                    )
+                    break
         finally:
             upstream.release()
-        await response.write_eof()
+        if first_resource and target_url:
+            finished = time.monotonic()
+            if client_disconnected:
+                # A seek/source switch is not evidence that the CDN failed.
+                # Let the next actual segment become the startup measurement.
+                self._first_resource_seen.pop(playback_id, None)
+            else:
+                self.source_health.observe(
+                    target_url,
+                    latency_seconds=(
+                        (first_byte_at or finished)
+                        - (request_started or transfer_started)
+                    ),
+                    success=not upstream_failed and transferred > 0,
+                    bytes_transferred=transferred,
+                    transfer_seconds=max(0.001, finished - transfer_started),
+                )
+                LOGGER.info(
+                    "First media resource playback=%s ttfb_seconds=%.3f "
+                    "bytes=%s transfer_seconds=%.3f success=%s",
+                    playback_id,
+                    (first_byte_at or finished)
+                    - (request_started or transfer_started),
+                    transferred,
+                    finished - transfer_started,
+                    not upstream_failed,
+                )
+        if not client_disconnected:
+            try:
+                await response.write_eof()
+            except (ConnectionResetError, asyncio.CancelledError):
+                LOGGER.debug(
+                    "Client disconnected before media EOF playback=%s",
+                    playback_id,
+                )
         return response

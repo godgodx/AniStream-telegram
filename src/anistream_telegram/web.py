@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +30,9 @@ from anistream_telegram.security import (
 LOGGER = logging.getLogger(__name__)
 CONFIG_KEY = web.AppKey("config", Config)
 PREPARED_PLAYBACK_TTL_SECONDS = 10 * 60
+HASHED_ASSET_PATTERN = re.compile(
+    r"^/app/assets/[a-z0-9_-]+\.[0-9a-f]{12}(?:\.min)?\.(?:js|css)$"
+)
 
 
 class WebRoutes:
@@ -148,6 +153,7 @@ class WebRoutes:
             raise web.HTTPForbidden(text="CSRF validation failed")
 
     async def authenticate(self, request: web.Request) -> web.Response:
+        started = time.monotonic()
         self._check_origin(request)
         if not await self.auth_limiter.allow(self._client_key(request)):
             raise web.HTTPTooManyRequests(text="Too many authentication attempts")
@@ -204,6 +210,11 @@ class WebRoutes:
             samesite="None" if self.config.cookie_secure else "Lax",
             path="/",
         )
+        LOGGER.info(
+            "Mini App authentication completed user=%s seconds=%.3f",
+            identity.user_id,
+            time.monotonic() - started,
+        )
         return response
 
     @staticmethod
@@ -250,6 +261,7 @@ class WebRoutes:
         prepared: bool = False,
         actor_key: object | None = None,
     ) -> dict[str, Any]:
+        preparation_started = time.monotonic()
         try:
             media = await self.core.prepare_media(
                 catalogue,
@@ -279,6 +291,7 @@ class WebRoutes:
             LOGGER.info("Playback preparation failed: %s", type(exc).__name__)
             raise web.HTTPBadGateway(text="No safe playable source is currently available") from exc
         source_count = max(1, min(20, int(getattr(media, "source_count", 1))))
+        resolved_at = time.monotonic()
         source_index = max(
             0,
             min(source_count - 1, int(getattr(media, "source_index", 0))),
@@ -305,6 +318,17 @@ class WebRoutes:
             preferred_source_index=preferred_source_index or 0,
             source_index=source_index,
             source_count=source_count,
+        )
+        created_at = time.monotonic()
+        LOGGER.info(
+            "Playback prepared user=%s episode=%s resolve_probe_seconds=%.3f "
+            "create_playback_seconds=%.3f total_seconds=%.3f prepared=%s",
+            session.telegram_user_id,
+            episode,
+            resolved_at - preparation_started,
+            created_at - resolved_at,
+            created_at - preparation_started,
+            prepared,
         )
         # Persist the selected episode immediately. This covers a Mini App
         # being closed before the first timeupdate/pagehide event fires.
@@ -344,6 +368,10 @@ class WebRoutes:
         )
         return {
             "playback_id": playback.id,
+            "playback_generation": max(
+                0,
+                int(getattr(playback, "generation", 0)),
+            ),
             "stream_url": f"/media/{playback.id}/master",
             "kind": playback.media_kind,
             "source": playback.source_name,
@@ -471,12 +499,31 @@ class WebRoutes:
         preferred_source_index = self._source_index(payload.get("source_index"))
         if preferred_source_index is None:
             raise web.HTTPBadRequest(text="Choose a source")
-        stored_position = await self.database.saved_episode_position(
+        position, duration = self._progress_values(payload)
+        observed_at_ms, event_sequence = self._progress_order(
+            payload,
+            required=True,
+        )
+        playback_generation = self._playback_generation(
+            payload.get("playback_generation")
+        )
+        accepted = await self.database.record_progress(
             session.telegram_user_id,
             catalogue,
             episode,
+            position,
+            duration,
+            False,
+            observed_at_ms=observed_at_ms,
+            event_sequence=event_sequence,
+            playback_id=playback_id,
+            playback_generation=playback_generation,
         )
-        start_position = 0.0 if stored_position is None else stored_position
+        if not accepted:
+            raise web.HTTPConflict(
+                text="This playback was replaced by a newer player"
+            )
+        start_position = position
         response_payload = await self._prepare_episode(
             session,
             catalogue,
@@ -648,6 +695,34 @@ class WebRoutes:
         )
         if playback is None:
             raise web.HTTPForbidden(text="Playback session is invalid")
+        position, duration = self._progress_values(payload)
+        reported_complete = payload.get("completed") is True
+        completed = reported_complete or (
+            duration >= 60 and position / max(duration, 1) >= 0.95
+        )
+        observed_at_ms, event_sequence = self._progress_order(
+            payload,
+            required=True,
+        )
+        playback_generation = self._playback_generation(
+            payload.get("playback_generation"),
+        )
+        accepted = await self.database.record_progress(
+            session.telegram_user_id,
+            dict(playback.catalogue_payload),
+            playback.episode,
+            position,
+            duration,
+            completed,
+            observed_at_ms=observed_at_ms,
+            event_sequence=event_sequence,
+            playback_id=playback_id,
+            playback_generation=playback_generation,
+        )
+        return {"ok": True, "accepted": accepted, "completed": completed}
+
+    @staticmethod
+    def _progress_values(payload: dict[str, Any]) -> tuple[float, float]:
         try:
             position = float(payload.get("position", 0.0))
             duration = float(payload.get("duration", 0.0))
@@ -662,13 +737,23 @@ class WebRoutes:
             or duration > 172_800
             or (duration > 0 and position > duration + 60)
         ):
-            raise web.HTTPBadRequest(text="Progress values are outside accepted bounds")
-        reported_complete = payload.get("completed") is True
-        completed = reported_complete or (
-            duration >= 60 and position / max(duration, 1) >= 0.95
-        )
+            raise web.HTTPBadRequest(
+                text="Progress values are outside accepted bounds"
+            )
+        return position, duration
+
+    @staticmethod
+    def _progress_order(
+        payload: dict[str, Any],
+        *,
+        required: bool = False,
+    ) -> tuple[int | None, int | None]:
         observed_at_raw = payload.get("observed_at_ms")
         event_sequence_raw = payload.get("event_sequence")
+        if required and observed_at_raw is None and event_sequence_raw is None:
+            raise web.HTTPBadRequest(
+                text="Progress ordering metadata is required"
+            )
         if (observed_at_raw is None) != (event_sequence_raw is None):
             raise web.HTTPBadRequest(text="Progress ordering metadata is incomplete")
         observed_at_ms: int | None = None
@@ -689,17 +774,27 @@ class WebRoutes:
                 )
             observed_at_ms = observed_at_raw
             event_sequence = event_sequence_raw
-        accepted = await self.database.record_progress(
-            session.telegram_user_id,
-            dict(playback.catalogue_payload),
-            playback.episode,
-            position,
-            duration,
-            completed,
-            observed_at_ms=observed_at_ms,
-            event_sequence=event_sequence,
-        )
-        return {"ok": True, "accepted": accepted, "completed": completed}
+        return observed_at_ms, event_sequence
+
+    @staticmethod
+    def _playback_generation(
+        value: Any,
+        *,
+        required: bool = True,
+    ) -> int | None:
+        if value is None and not required:
+            return None
+        if isinstance(value, bool):
+            raise web.HTTPBadRequest(text="Playback generation is invalid")
+        try:
+            generation = int(value)
+        except (TypeError, ValueError) as exc:
+            raise web.HTTPBadRequest(
+                text="Playback generation is invalid"
+            ) from exc
+        if generation < 0 or generation > 9_007_199_254_740_991:
+            raise web.HTTPBadRequest(text="Playback generation is invalid")
+        return generation
 
     async def cast(self, request: web.Request) -> web.Response:
         session = await self._authenticated(request)
@@ -753,7 +848,9 @@ class WebRoutes:
 
     async def index(self, request: web.Request) -> web.FileResponse:
         path = self.config.project_root / "web" / "dist" / "index.html"
-        return web.FileResponse(path)
+        response = web.FileResponse(path)
+        response.headers["Cache-Control"] = "no-cache, no-store"
+        return response
 
     async def frontend_missing(self, request: web.Request) -> web.Response:
         return web.Response(
@@ -775,6 +872,11 @@ class WebRoutes:
 @web.middleware
 async def security_headers(request: web.Request, handler):
     response = await handler(request)
+    if HASHED_ASSET_PATTERN.fullmatch(request.path):
+        response.headers.setdefault(
+            "Cache-Control",
+            "public, max-age=31536000, immutable",
+        )
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
     response.headers.setdefault(

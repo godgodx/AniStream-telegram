@@ -16,6 +16,7 @@ from anistream_telegram.config import Config
 from anistream_telegram.core import CoreService
 from anistream_telegram.database import Database
 from anistream_telegram.media import MediaGateway
+from anistream_telegram.source_health import SourceHealthTracker
 from anistream_telegram.web import CONFIG_KEY, WebRoutes, error_boundary, security_headers
 
 
@@ -32,11 +33,14 @@ MAINTENANCE_TASK_KEY = web.AppKey("maintenance_task", object)
 
 def build_application(config: Config) -> web.Application:
     database = Database(config.database_url)
+    source_health = SourceHealthTracker()
     core = CoreService(
         user_agent=config.anime_sama_user_agent,
         cf_clearance=config.anime_sama_cf_clearance,
+        source_health=source_health,
     )
-    media = MediaGateway(config, database)
+    media = MediaGateway(config, database, source_health)
+    core.set_async_probe(media.probe)
     bot = Bot(config.bot_token)
     dispatcher = Dispatcher(storage=MemoryStorage())
     handlers = BotHandlers(config, database, core)
@@ -143,6 +147,7 @@ def build_application(config: Config) -> web.Application:
         await dispatcher.storage.close()
         await bot.session.close()
         await media.close()
+        await core.close()
         await database.close()
 
     app.on_startup.append(startup)

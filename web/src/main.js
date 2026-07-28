@@ -32,6 +32,7 @@ const PREFETCH_RETRY_DELAY_MS = 60_000;
 
 let csrfToken = "";
 let playbackId = "";
+let playbackGeneration = 0;
 let currentInfo = null;
 let hls = null;
 let playerEvents = null;
@@ -54,6 +55,9 @@ let prefetchGeneration = 0;
 let nextPrefetchRetryAt = 0;
 let localResumePending = false;
 let localResumeTarget = 0;
+let playerRecoveryState = null;
+
+performance.mark?.("anistream-init");
 
 let googleCastReady = false;
 let castContext = null;
@@ -259,6 +263,7 @@ function progressSnapshot(
   return {
     ...observation,
     event_sequence: progressEventSequence,
+    playback_generation: playbackGeneration,
     completed: isComplete,
   };
 }
@@ -692,6 +697,10 @@ function updateAutoplayUi(info) {
 function updateEpisodeUi(info) {
   currentInfo = info;
   playbackId = info.playback_id;
+  playbackGeneration = Math.max(
+    0,
+    Number(info.playback_generation) || 0,
+  );
   completed = false;
   lastSavedAt = 0;
   lastSavedPlaybackId = "";
@@ -717,7 +726,13 @@ function updateEpisodeUi(info) {
   updateAutoplayUi(info);
 }
 
-function attachPlayer(info, { autoplay = false } = {}) {
+function attachPlayer(
+  info,
+  {
+    autoplay = false,
+    recoveryState = null,
+  } = {},
+) {
   invalidateNextPrefetch();
   teardownPlayer();
   updateEpisodeUi(info);
@@ -731,6 +746,13 @@ function attachPlayer(info, { autoplay = false } = {}) {
   const streamUrl = info.stream_url;
   const useHls = info.kind === "hls";
   const requestedPosition = Number(info.start_position);
+  playerRecoveryState =
+    recoveryState || {
+      networkAttempts: 0,
+      mediaAttempts: 0,
+      rebuildAttempts: 0,
+      triedSources: new Set([Number(info.source_index) || 0]),
+    };
   localResumeTarget =
     Number.isFinite(requestedPosition) && requestedPosition > 0
       ? requestedPosition
@@ -769,7 +791,7 @@ function attachPlayer(info, { autoplay = false } = {}) {
     });
     hls.on(Hls.Events.ERROR, (_, data) => {
       if (data.fatal && !changingEpisode && !changingSource) {
-        showError("The stream stopped. Try another episode or reopen it from the bot.");
+        void recoverFatalPlayback(data, info, autoplay);
       }
     });
   } else {
@@ -821,6 +843,16 @@ function attachPlayer(info, { autoplay = false } = {}) {
     }
     playerReadyHandled = true;
     loading.hidden = true;
+    performance.mark?.("anistream-player-ready");
+    try {
+      performance.measure?.(
+        "anistream-startup",
+        "anistream-init",
+        "anistream-player-ready",
+      );
+    } catch {
+      // Performance timing is diagnostic only.
+    }
     updatePictureInPictureUi();
     if (autoplay && !googleCastConnected()) {
       void video.play().catch(() => {
@@ -861,6 +893,22 @@ function attachPlayer(info, { autoplay = false } = {}) {
     () => {
       applyResumePosition({ restartIfOutOfRange: true });
       finishPlayerReady();
+    },
+    options,
+  );
+  video.addEventListener(
+    "playing",
+    () => {
+      performance.mark?.("anistream-playing");
+      try {
+        performance.measure?.(
+          "anistream-time-to-playing",
+          "anistream-init",
+          "anistream-playing",
+        );
+      } catch {
+        // Performance timing is diagnostic only.
+      }
     },
     options,
   );
@@ -911,12 +959,112 @@ function attachPlayer(info, { autoplay = false } = {}) {
     "error",
     () => {
       if (!changingEpisode && !changingSource) {
-        showError("This source cannot be played right now. Try another episode.");
+        void recoverFatalPlayback(
+          { type: "native", details: "media element error" },
+          info,
+          autoplay,
+        );
       }
     },
     options,
   );
   updatePictureInPictureUi();
+}
+
+function reliablePlaybackPosition() {
+  if (googleCastConnected() && remotePlayer?.isMediaLoaded) {
+    return {
+      position: Math.max(0, Number(remotePlayer.currentTime) || 0),
+      duration: Math.max(0, Number(remotePlayer.duration) || 0),
+    };
+  }
+  const cached =
+    lastProgressObservation?.playback_id === playbackId
+      ? lastProgressObservation
+      : null;
+  const position = Number(video.currentTime);
+  const duration = Number(video.duration);
+  return {
+    position:
+      Number.isFinite(position) && position > 0
+        ? position
+        : Math.max(0, Number(cached?.position) || 0),
+    duration:
+      Number.isFinite(duration) && duration > 0
+        ? duration
+        : Math.max(0, Number(cached?.duration) || 0),
+  };
+}
+
+function nextUntriedSource(info, recoveryState) {
+  const count = Math.max(1, Number(info.source_count) || 1);
+  const current = Math.max(0, Number(info.source_index) || 0);
+  for (let offset = 1; offset < count; offset += 1) {
+    const candidate = (current + offset) % count;
+    if (!recoveryState.triedSources.has(candidate)) return candidate;
+  }
+  return null;
+}
+
+async function recoverFatalPlayback(data, info, autoplay) {
+  if (
+    changingEpisode ||
+    changingSource ||
+    playbackId !== info.playback_id ||
+    !playerRecoveryState
+  ) {
+    return;
+  }
+  const recovery = playerRecoveryState;
+  if (
+    data.type === Hls?.ErrorTypes?.NETWORK_ERROR &&
+    recovery.networkAttempts < 1 &&
+    hls
+  ) {
+    recovery.networkAttempts += 1;
+    status.textContent = "Retrying the stream connection…";
+    loading.hidden = false;
+    hls.startLoad(Math.max(0, Number(video.currentTime) || 0));
+    return;
+  }
+  if (
+    data.type === Hls?.ErrorTypes?.MEDIA_ERROR &&
+    recovery.mediaAttempts < 1 &&
+    hls
+  ) {
+    recovery.mediaAttempts += 1;
+    status.textContent = "Recovering the video player…";
+    loading.hidden = false;
+    hls.recoverMediaError();
+    return;
+  }
+  const resume = reliablePlaybackPosition();
+  if (recovery.rebuildAttempts < 1 && info.kind === "hls") {
+    recovery.rebuildAttempts += 1;
+    status.textContent = "Restarting the video player…";
+    attachPlayer(
+      { ...info, start_position: resume.position },
+      {
+        autoplay: autoplay || !video.paused,
+        recoveryState: recovery,
+      },
+    );
+    return;
+  }
+  const fallback = nextUntriedSource(info, recovery);
+  if (fallback !== null) {
+    recovery.triedSources.add(fallback);
+    status.textContent = `Trying source ${fallback + 1}…`;
+    await changeSource(fallback, {
+      automatic: true,
+      resume,
+      recoveryState: recovery,
+    });
+    return;
+  }
+  showError(
+    "The stream stopped after all recovery attempts. Try again in a moment.",
+  );
 }
 
 async function loadCurrentOnGoogleCast(
@@ -1196,7 +1344,14 @@ async function changeEpisode(targetEpisode, { autoplay = false } = {}) {
   }
 }
 
-async function changeSource(targetSourceIndex) {
+async function changeSource(
+  targetSourceIndex,
+  {
+    automatic = false,
+    resume = null,
+    recoveryState = null,
+  } = {},
+) {
   if (
     changingSource ||
     changingEpisode ||
@@ -1224,29 +1379,41 @@ async function changeSource(targetSourceIndex) {
   clearError();
   loading.hidden = false;
   status.textContent = `Preparing source ${targetSource + 1}...`;
+  let retrySource = null;
   try {
+    const current = resume || reliablePlaybackPosition();
+    const snapshot = progressSnapshot(
+      false,
+      current.position,
+      current.duration,
+      currentInfo.playback_id,
+    );
+    if (!snapshot) {
+      throw new Error("The current playback position is unavailable.");
+    }
     if (googleCastConnected() && remotePlayer?.isMediaLoaded) {
-      await saveProgress(
-        true,
-        false,
-        remotePlayer.currentTime,
-        remotePlayer.duration,
-      );
       if (!remotePlayer.isPaused) {
         remoteController?.playOrPause();
       }
     } else {
-      await saveProgress(true, false);
       video.pause();
     }
     const info = await api("/api/playback/source", {
       method: "POST",
       body: JSON.stringify({
         playback_id: currentInfo.playback_id,
+        playback_generation: playbackGeneration,
         source_index: targetSource,
+        position: snapshot.position,
+        duration: snapshot.duration,
+        observed_at_ms: snapshot.observed_at_ms,
+        event_sequence: snapshot.event_sequence,
       }),
     });
-    attachPlayer(info, { autoplay: wasPlaying && !googleCastConnected() });
+    attachPlayer(info, {
+      autoplay: wasPlaying && !googleCastConnected(),
+      recoveryState: automatic ? recoveryState : null,
+    });
     if (googleCastConnected()) {
       await loadCurrentOnGoogleCast(info, info.start_position);
     }
@@ -1259,30 +1426,44 @@ async function changeSource(targetSourceIndex) {
         void video.play().catch(() => {});
       }
     }
-    showError(
-      reason instanceof Error
-        ? `${reason.message} Choose another source or try again.`
-        : "This source is unavailable. Choose another source or try again.",
-    );
+    if (automatic && recoveryState) {
+      retrySource = nextUntriedSource(currentInfo, recoveryState);
+      if (retrySource !== null) {
+        recoveryState.triedSources.add(retrySource);
+      }
+    }
+    if (retrySource === null) {
+      showError(
+        reason instanceof Error
+          ? `${reason.message} Choose another source or try again.`
+          : "This source is unavailable. Choose another source or try again.",
+      );
+    }
   } finally {
     changingSource = false;
     updateSourceUi(currentInfo);
   }
+  if (retrySource !== null) {
+    await changeSource(retrySource, {
+      automatic: true,
+      resume: resume || reliablePlaybackPosition(),
+      recoveryState,
+    });
+  }
 }
 
 async function initialize() {
-  if (!telegram || !telegram.initData) {
-    showError("Open this player from the AniStream Telegram bot.");
-    return;
-  }
-  telegram.ready();
-  telegram.expand();
-  telegram.setHeaderColor?.("secondary_bg_color");
-  telegram.enableClosingConfirmation?.();
+  telegram?.ready();
+  telegram?.expand();
+  telegram?.setHeaderColor?.("secondary_bg_color");
+  telegram?.enableClosingConfirmation?.();
 
   const launchToken = new URLSearchParams(window.location.search).get("launch") || "";
   try {
     if (launchToken) {
+      if (!telegram?.initData) {
+        throw new Error("Open this player from the AniStream Telegram bot.");
+      }
       const auth = await api("/api/auth/telegram", {
         method: "POST",
         body: JSON.stringify({
@@ -1293,6 +1474,8 @@ async function initialize() {
       csrfToken = auth.csrf_token;
       history.replaceState(null, "", window.location.pathname);
     } else {
+      // A reload or WebView restore can lose Telegram initData while the
+      // HttpOnly AniStream session cookie remains valid.
       const current = await api("/api/session");
       csrfToken = current.csrf_token;
     }

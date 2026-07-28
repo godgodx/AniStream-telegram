@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
-from anistream_telegram.database import Database
+from sqlalchemy import event, select
+
+from anistream_telegram.database import Database, SchemaMigration
 
 
 def catalogue() -> dict:
@@ -35,6 +38,28 @@ async def test_sqlite_enforces_foreign_keys(tmp_path: Path) -> None:
         await database.close()
 
 
+async def test_schema_versions_are_recorded_and_idempotent(tmp_path: Path) -> None:
+    path = tmp_path / "db.sqlite"
+    database = await database_at(path)
+    try:
+        async with database.sessions() as session:
+            versions = list(
+                await session.scalars(
+                    select(SchemaMigration.version).order_by(
+                        SchemaMigration.version
+                    )
+                )
+            )
+        assert versions == [1, 2, 3, 4]
+        await database.initialize()
+        async with database.sessions() as session:
+            assert list(
+                await session.scalars(select(SchemaMigration.version))
+            ) == [1, 2, 3, 4]
+    finally:
+        await database.close()
+
+
 async def test_whitelist_and_one_time_launch_ticket(tmp_path: Path) -> None:
     database = await database_at(tmp_path / "db.sqlite")
     try:
@@ -45,6 +70,22 @@ async def test_whitelist_and_one_time_launch_ticket(tmp_path: Path) -> None:
         assert await database.exchange_launch_ticket(ticket, 999) is None
         assert await database.exchange_launch_ticket(ticket, 123) == {"episode": 3}
         assert await database.exchange_launch_ticket(ticket, 123) is None
+    finally:
+        await database.close()
+
+
+async def test_launch_ticket_is_atomic_under_concurrent_sqlite_exchange(
+    tmp_path: Path,
+) -> None:
+    database = await database_at(tmp_path / "db.sqlite")
+    try:
+        ticket = await database.create_launch_ticket(123, {"episode": 3})
+        results = await asyncio.gather(
+            database.exchange_launch_ticket(ticket, 123),
+            database.exchange_launch_ticket(ticket, 123),
+        )
+        assert results.count({"episode": 3}) == 1
+        assert results.count(None) == 1
     finally:
         await database.close()
 
@@ -210,6 +251,52 @@ async def test_positions_are_stored_per_episode(tmp_path: Path) -> None:
         await database.close()
 
 
+async def test_continue_watching_loads_progress_in_one_bounded_query(
+    tmp_path: Path,
+) -> None:
+    database = await database_at(tmp_path / "db.sqlite")
+    try:
+        for episode_number in range(1, 6):
+            item = {**catalogue(), "url": f"https://provider.example/{episode_number}"}
+            await database.record_progress(
+                123,
+                item,
+                episode_number,
+                30.0,
+                1500.0,
+                False,
+            )
+        statements: list[str] = []
+
+        def before_cursor_execute(
+            _connection,
+            _cursor,
+            statement,
+            _parameters,
+            _context,
+            _executemany,
+        ) -> None:
+            if statement.lstrip().upper().startswith("SELECT"):
+                statements.append(statement)
+
+        event.listen(
+            database.engine.sync_engine,
+            "before_cursor_execute",
+            before_cursor_execute,
+        )
+        try:
+            assert len(await database.continue_watching(123)) == 5
+        finally:
+            event.remove(
+                database.engine.sync_engine,
+                "before_cursor_execute",
+                before_cursor_execute,
+            )
+        assert len(statements) == 2
+    finally:
+        await database.close()
+
+
 async def test_stale_progress_event_cannot_overwrite_newer_position(
     tmp_path: Path,
 ) -> None:
@@ -250,6 +337,70 @@ async def test_stale_progress_event_cannot_overwrite_newer_position(
             event_sequence=4,
         )
         assert await database.episode_position(123, catalogue(), 6) == 120.0
+    finally:
+        await database.close()
+
+
+async def test_stale_incomplete_event_cannot_undo_completion(
+    tmp_path: Path,
+) -> None:
+    database = await database_at(tmp_path / "db.sqlite")
+    try:
+        assert await database.record_progress(
+            123,
+            catalogue(),
+            12,
+            1500.0,
+            1500.0,
+            True,
+            observed_at_ms=2_000,
+            event_sequence=2,
+        )
+        assert not await database.record_progress(
+            123,
+            catalogue(),
+            12,
+            600.0,
+            1500.0,
+            False,
+            observed_at_ms=1_000,
+            event_sequence=1,
+        )
+        entry = (await database.continue_watching(123))[0]
+        assert entry["status"] == "completed"
+    finally:
+        await database.close()
+
+
+async def test_concurrent_sqlite_progress_creation_is_serialized(
+    tmp_path: Path,
+) -> None:
+    database = await database_at(tmp_path / "db.sqlite")
+    try:
+        results = await asyncio.gather(
+            database.record_progress(
+                123,
+                catalogue(),
+                6,
+                100.0,
+                1500.0,
+                False,
+                observed_at_ms=1_000,
+                event_sequence=1,
+            ),
+            database.record_progress(
+                123,
+                catalogue(),
+                6,
+                200.0,
+                1500.0,
+                False,
+                observed_at_ms=2_000,
+                event_sequence=2,
+            ),
+        )
+        assert results == [True, True]
+        assert await database.episode_position(123, catalogue(), 6) == 200.0
     finally:
         await database.close()
 
@@ -305,7 +456,7 @@ async def test_selected_episode_at_zero_is_the_interruption_point(tmp_path: Path
         await database.close()
 
 
-async def test_completed_season_stays_completed_during_partial_rewatch(
+async def test_completed_season_returns_to_active_during_partial_rewatch(
     tmp_path: Path,
 ) -> None:
     database = await database_at(tmp_path / "db.sqlite")
@@ -314,10 +465,77 @@ async def test_completed_season_stays_completed_during_partial_rewatch(
         await database.record_progress(123, catalogue(), 1, 120.0, 1500, False)
 
         entry = (await database.continue_watching(123))[0]
-        assert entry["status"] == "completed"
+        assert entry["status"] == "in_progress"
         assert entry["next_episode"] == 12
         assert entry["resume_episode"] == 1
         assert entry["position"] == 120.0
+    finally:
+        await database.close()
+
+
+async def test_old_playback_generation_cannot_overwrite_new_player(
+    tmp_path: Path,
+) -> None:
+    database = await database_at(tmp_path / "db.sqlite")
+    try:
+        old = await database.create_playback(
+            123,
+            catalogue(),
+            6,
+            media_url="https://cdn.example/old.mp4",
+            media_headers={},
+            media_kind="mp4",
+            source_name="Old",
+            ttl_seconds=600,
+        )
+        assert await database.record_progress(
+            123,
+            catalogue(),
+            6,
+            300,
+            1500,
+            False,
+            observed_at_ms=2_000,
+            event_sequence=1,
+            playback_id=old.id,
+            playback_generation=old.generation,
+        )
+        new = await database.create_playback(
+            123,
+            catalogue(),
+            6,
+            media_url="https://cdn.example/new.mp4",
+            media_headers={},
+            media_kind="mp4",
+            source_name="New",
+            ttl_seconds=600,
+        )
+        assert new.generation == old.generation + 1
+        assert await database.record_progress(
+            123,
+            catalogue(),
+            6,
+            600,
+            1500,
+            False,
+            observed_at_ms=100,
+            event_sequence=1,
+            playback_id=new.id,
+            playback_generation=new.generation,
+        )
+        assert not await database.record_progress(
+            123,
+            catalogue(),
+            6,
+            120,
+            1500,
+            False,
+            observed_at_ms=3_000,
+            event_sequence=2,
+            playback_id=old.id,
+            playback_generation=old.generation,
+        )
+        assert await database.episode_position(123, catalogue(), 6) == 600
     finally:
         await database.close()
 
@@ -497,5 +715,55 @@ async def test_disabled_user_loses_existing_web_session(tmp_path: Path) -> None:
         assert await database.get_web_session(raw) is not None
         await database.set_allowed(123, False)
         assert await database.get_web_session(raw) is None
+    finally:
+        await database.close()
+
+
+async def test_media_authorization_uses_one_joined_database_query(
+    tmp_path: Path,
+) -> None:
+    database = await database_at(tmp_path / "db.sqlite")
+    try:
+        await database.set_allowed(123, True)
+        raw, _ = await database.create_web_session(123, {}, ttl_seconds=600)
+        playback = await database.create_playback(
+            123,
+            catalogue(),
+            1,
+            media_url="https://cdn.example/video.mp4",
+            media_headers={},
+            media_kind="mp4",
+            source_name="Test",
+            ttl_seconds=600,
+        )
+        statements: list[str] = []
+
+        def before_cursor_execute(
+            _connection,
+            _cursor,
+            statement,
+            _parameters,
+            _context,
+            _executemany,
+        ) -> None:
+            if statement.lstrip().upper().startswith("SELECT"):
+                statements.append(statement)
+
+        event.listen(
+            database.engine.sync_engine,
+            "before_cursor_execute",
+            before_cursor_execute,
+        )
+        try:
+            authorized = await database.get_media_playback(raw, playback.id)
+        finally:
+            event.remove(
+                database.engine.sync_engine,
+                "before_cursor_execute",
+                before_cursor_execute,
+            )
+        assert authorized is not None
+        assert authorized[1].id == playback.id
+        assert len(statements) == 1
     finally:
         await database.close()

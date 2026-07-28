@@ -21,6 +21,7 @@ from anistream_telegram.media import (
     PLAYBACK_SESSION_IDLE_SECONDS,
     MediaGateway,
 )
+from anistream.models import ResolvedMedia
 
 
 class FakeContent:
@@ -39,6 +40,20 @@ class FakeResponse:
 
     def release(self) -> None:
         self.released = True
+
+
+class ProbeResponse(FakeResponse):
+    def __init__(
+        self,
+        body: bytes,
+        url: str,
+        *,
+        status: int = 200,
+        content_type: str = "application/vnd.apple.mpegurl",
+    ) -> None:
+        super().__init__(body, url)
+        self.status = status
+        self.headers = {"Content-Type": content_type}
 
 
 async def test_stream_limit_counts_sessions_not_hls_requests(tmp_path: Path) -> None:
@@ -143,6 +158,52 @@ async def test_hls_playlist_urls_are_opaque_and_bound(tmp_path: Path) -> None:
     token = parse_qs(urlparse(resource).query)["t"][0]
     assert gateway.tokens.parse(token, "playback-id").endswith("/path/segment-001.ts")
     assert len(re.findall(r"/media/playback-id/resource", response.text)) == 2
+
+
+async def test_gateway_probe_reuses_transport_and_checks_cold_hls_startup(
+    tmp_path: Path,
+) -> None:
+    gateway = MediaGateway(config(tmp_path), Database(config(tmp_path).database_url))
+    master = ProbeResponse(
+        b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nquality.m3u8\n",
+        "https://cdn.example/master.m3u8",
+    )
+    variant = ProbeResponse(
+        b'#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n'
+        b"#EXTINF:10,\nsegment.ts\n",
+        "https://cdn.example/quality.m3u8",
+    )
+    key = ProbeResponse(
+        b"0" * 16,
+        "https://cdn.example/key.bin",
+        status=206,
+        content_type="application/octet-stream",
+    )
+    segment = ProbeResponse(
+        b"segment",
+        "https://cdn.example/segment.ts",
+        status=206,
+        content_type="video/mp2t",
+    )
+    gateway.upstream.request = AsyncMock(
+        side_effect=[master, variant, key, segment]
+    )
+
+    result = await gateway.probe(
+        ResolvedMedia(
+            master.url,
+            "https://embed.example/player",
+            "Test",
+            {},
+            "hls",
+        ),
+        True,
+    )
+
+    assert result.valid is True
+    assert result.prefetched_playlist == master.content.value
+    assert gateway.upstream.request.await_count == 4
+    assert all(item.released for item in (master, variant, key, segment))
 
 
 async def test_master_reuses_the_prefetched_hls_manifest_once(

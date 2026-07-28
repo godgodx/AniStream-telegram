@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import threading
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
+from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import urlparse
 
@@ -19,6 +24,12 @@ from anistream.resolvers import ResolverRegistry, default_resolvers
 from anistream.services.media_probe import RemoteMediaProbe
 from anistream.utils.http import DEFAULT_USER_AGENT, HttpClient
 from anistream_telegram.limits import CapacityLimiter
+from anistream_telegram.source_health import SourceHealthTracker
+
+
+LOGGER = logging.getLogger(__name__)
+PREPARATION_DEADLINE_SECONDS = 24.0
+CANDIDATE_DEADLINE_SECONDS = 8.0
 
 
 def search_result_payload(item: SearchResult) -> dict[str, Any]:
@@ -120,7 +131,13 @@ def catalogue_from_payload(payload: dict[str, Any]) -> Catalogue:
 
 
 class CoreService:
-    def __init__(self, *, user_agent: str = "", cf_clearance: str = "") -> None:
+    def __init__(
+        self,
+        *,
+        user_agent: str = "",
+        cf_clearance: str = "",
+        source_health: SourceHealthTracker | None = None,
+    ) -> None:
         cookie = f"cf_clearance={cf_clearance}" if cf_clearance else ""
         self.http = HttpClient(
             user_agent=user_agent or DEFAULT_USER_AGENT,
@@ -140,15 +157,53 @@ class CoreService:
             user_agent=user_agent or DEFAULT_USER_AGENT,
             cookie=cookie,
             cookie_hosts={"anime-sama.to", "www.anime-sama.to"},
-            timeout=(5.0, 10.0),
+            timeout=(3.0, 5.0),
             retry_total=0,
         )
         self.resolvers = ResolverRegistry(default_resolvers(media_http))
         self.probe = RemoteMediaProbe(media_http)
+        self.source_health = source_health or SourceHealthTracker()
+        self._async_probe: (
+            Callable[[ResolvedMedia, bool], Awaitable[Any]] | None
+        ) = None
+        self._resolver_executor = ThreadPoolExecutor(
+            max_workers=4,
+            thread_name_prefix="anistream-resolver",
+        )
+        self._resolver_jobs = 0
+        self._resolver_jobs_lock = threading.Lock()
         self.provider_capacity = CapacityLimiter(
             total_limit=4,
             per_key_limit=1,
         )
+
+    def set_async_probe(
+        self,
+        probe: Callable[[ResolvedMedia, bool], Awaitable[Any]],
+    ) -> None:
+        """Use the media gateway transport so its warm connection is reusable."""
+
+        self._async_probe = probe
+
+    async def close(self) -> None:
+        self._resolver_executor.shutdown(wait=False, cancel_futures=True)
+
+    async def _resolve_candidate(self, url: str) -> ResolvedMedia:
+        with self._resolver_jobs_lock:
+            if self._resolver_jobs >= 4:
+                raise RuntimeError("resolver worker capacity is exhausted")
+            self._resolver_jobs += 1
+        future: Future[ResolvedMedia] = self._resolver_executor.submit(
+            self.resolvers.resolve,
+            url,
+        )
+
+        def finished(_: Future[ResolvedMedia]) -> None:
+            with self._resolver_jobs_lock:
+                self._resolver_jobs = max(0, self._resolver_jobs - 1)
+
+        future.add_done_callback(finished)
+        return await asyncio.wrap_future(future)
 
     def provider_alias(self, provider_id: str) -> str:
         return self._provider_aliases.get(str(provider_id), "Provider")
@@ -235,21 +290,25 @@ class CoreService:
         fallback_from_preferred: bool = False,
     ) -> ResolvedMedia:
         async with self.provider_capacity.slot(str(actor_key)):
-            return await asyncio.to_thread(
-                self._prepare_media_sync,
-                payload,
-                episode_number,
-                preferred_source_index,
-                fallback_from_preferred,
-            )
+            try:
+                async with asyncio.timeout(PREPARATION_DEADLINE_SECONDS):
+                    return await self._prepare_media(
+                        payload,
+                        episode_number,
+                        preferred_source_index,
+                        fallback_from_preferred,
+                    )
+            except TimeoutError as exc:
+                raise RuntimeError("source preparation deadline exceeded") from exc
 
-    def _prepare_media_sync(
+    async def _prepare_media(
         self,
         payload: dict[str, Any],
         episode_number: int,
         preferred_source_index: int | None = None,
         fallback_from_preferred: bool = False,
     ) -> ResolvedMedia:
+        started = time.monotonic()
         catalogue = catalogue_from_payload(payload)
         if not 1 <= episode_number <= len(catalogue.episodes):
             raise ValueError("episode is outside the catalogue")
@@ -268,24 +327,60 @@ class CoreService:
                     raise ValueError("source is outside the available range")
                 preferred_source_index = None
 
-        errors: list[str] = []
-        # SourcePlanner is useful for multi-episode CLI planning, but for one
-        # Mini App playback it preflights failed candidates and then retries
-        # them during route selection. Resolve each supported source exactly
-        # once and return the first verified playable result.
-        source_order = list(range(len(supported)))
-        if preferred_source_index is not None:
-            source_order.remove(preferred_source_index)
-            source_order.insert(0, preferred_source_index)
+        if preferred_source_index is None:
+            source_order = self.source_health.rank_urls(
+                [candidate.url for candidate in supported]
+            )
+        else:
+            ranked = self.source_health.rank_urls(
+                [candidate.url for candidate in supported]
+            )
+            ranked.remove(preferred_source_index)
+            source_order = [preferred_source_index, *ranked]
             if not fallback_from_preferred:
                 source_order = source_order[:1]
+
+        errors: list[str] = []
         for source_index in source_order:
             candidate = supported[source_index]
+            candidate_started = time.monotonic()
+            resolve_seconds = 0.0
+            probe_seconds = 0.0
             try:
-                media = self.resolvers.resolve(candidate.url)
-                probe = self.probe.probe(media)
-                if not probe.valid:
-                    raise ValueError(probe.detail)
+                async with asyncio.timeout(CANDIDATE_DEADLINE_SECONDS):
+                    resolve_started = time.monotonic()
+                    media = await self._resolve_candidate(candidate.url)
+                    resolve_seconds = time.monotonic() - resolve_started
+                    self.source_health.bind(candidate.url, media.url)
+                    cold_host = not self.source_health.has_recent_delivery(
+                        media.url
+                    )
+                    if self._async_probe is None:
+                        probe_started = time.monotonic()
+                        probe = await asyncio.to_thread(self.probe.probe, media)
+                    else:
+                        probe_started = time.monotonic()
+                        probe = await self._async_probe(media, cold_host)
+                    probe_seconds = time.monotonic() - probe_started
+                    if not probe.valid:
+                        raise ValueError(probe.detail)
+                elapsed = time.monotonic() - candidate_started
+                self.source_health.observe(
+                    candidate.url,
+                    latency_seconds=elapsed,
+                    success=True,
+                )
+                LOGGER.info(
+                    "Playback source selected source_index=%s candidates=%s "
+                    "resolve_seconds=%.3f probe_seconds=%.3f "
+                    "candidate_seconds=%.3f total_seconds=%.3f",
+                    source_index,
+                    len(supported),
+                    resolve_seconds,
+                    probe_seconds,
+                    elapsed,
+                    time.monotonic() - started,
+                )
                 return replace(
                     media,
                     kind=probe.kind if probe.kind != "unknown" else media.kind,
@@ -295,7 +390,19 @@ class CoreService:
                     prefetched_playlist_url=probe.prefetched_playlist_url,
                 )
             except Exception as exc:
+                elapsed = time.monotonic() - candidate_started
+                self.source_health.observe(
+                    candidate.url,
+                    latency_seconds=elapsed,
+                    success=False,
+                )
                 errors.append(f"{candidate.player}: {exc}")
+                LOGGER.info(
+                    "Playback source rejected source_index=%s seconds=%.3f error=%s",
+                    source_index,
+                    elapsed,
+                    type(exc).__name__,
+                )
         prefix = (
             "selected source failed: "
             if preferred_source_index is not None and not fallback_from_preferred
