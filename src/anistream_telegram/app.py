@@ -80,7 +80,14 @@ def build_application(config: Config) -> web.Application:
         return web.json_response({"ok": True})
 
     app.router.add_post(config.webhook_path, webhook)
-    WebRoutes(config, database, core, media).register(app)
+    WebRoutes(
+        config,
+        database,
+        core,
+        media,
+        bot=bot,
+        background_tasks=app[BACKGROUND_UPDATES_KEY],
+    ).register(app)
 
     async def startup(_: web.Application) -> None:
         await database.initialize(config.allowed_users)

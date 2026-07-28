@@ -1490,13 +1490,23 @@ class BotHandlers:
                 catalogue,
                 episode,
             )
+        launch_payload: dict[str, Any] = {
+            "catalogue": catalogue,
+            "episode": episode,
+            "start_position": max(0.0, start_position),
+        }
+        if callback.message:
+            chat_id = getattr(getattr(callback.message, "chat", None), "id", None)
+            message_id = getattr(callback.message, "message_id", None)
+            if isinstance(chat_id, int) and isinstance(message_id, int):
+                # These values are created from the authenticated Telegram
+                # callback, stored server-side in the one-time ticket, and
+                # removed before the playback session is created.
+                launch_payload["_menu_chat_id"] = chat_id
+                launch_payload["_menu_message_id"] = message_id
         ticket = await self.database.create_launch_ticket(
             callback.from_user.id,
-            {
-                "catalogue": catalogue,
-                "episode": episode,
-                "start_position": max(0.0, start_position),
-            },
+            launch_payload,
         )
         url = f"{self.config.public_base_url}/app/?launch={quote(ticket)}"
         actions = [

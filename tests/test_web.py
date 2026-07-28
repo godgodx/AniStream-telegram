@@ -4,8 +4,10 @@ import hashlib
 import hmac
 import json
 import time
+from http.cookies import SimpleCookie
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from urllib.parse import urlencode
 
 from aiohttp import web
@@ -21,6 +23,7 @@ from anistream_telegram.web import (
     error_boundary,
     security_headers,
 )
+from anistream_telegram.bot import MAIN_MENU_TEXT
 
 
 BOT_TOKEN = "123456789:test-token"
@@ -184,6 +187,66 @@ async def test_auth_endpoint_sets_host_cookie_and_consumes_ticket(tmp_path: Path
             },
         )
         assert replay.status == 403
+    finally:
+        await client.close()
+        await database.close()
+
+
+async def test_successful_launch_restores_main_menu_without_leaking_message_ids(
+    tmp_path: Path,
+) -> None:
+    settings = config(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize(settings.allowed_users)
+    media = MediaGateway(settings, database)
+    bot = SimpleNamespace(edit_message_text=AsyncMock())
+    background_tasks: set = set()
+    app = web.Application(middlewares=[error_boundary, security_headers])
+    app[CONFIG_KEY] = settings
+    WebRoutes(
+        settings,
+        database,
+        None,  # type: ignore[arg-type]
+        media,
+        bot=bot,  # type: ignore[arg-type]
+        background_tasks=background_tasks,
+    ).register(app)
+    ticket = await database.create_launch_ticket(
+        123,
+        {
+            "catalogue": {"title": "Test"},
+            "episode": 1,
+            "_menu_chat_id": 456,
+            "_menu_message_id": 789,
+        },
+    )
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.post(
+            "/api/auth/telegram",
+            headers={"Origin": settings.public_origin},
+            json={
+                "init_data": signed_init_data(123),
+                "launch_token": ticket,
+            },
+        )
+        assert response.status == 200
+        pending = tuple(background_tasks)
+        if pending:
+            await __import__("asyncio").gather(*pending)
+        bot.edit_message_text.assert_awaited_once()
+        assert bot.edit_message_text.await_args.kwargs["chat_id"] == 456
+        assert bot.edit_message_text.await_args.kwargs["message_id"] == 789
+        assert bot.edit_message_text.await_args.kwargs["text"] == MAIN_MENU_TEXT
+
+        cookies = SimpleCookie()
+        cookies.load(response.headers["Set-Cookie"])
+        raw_session = cookies[settings.cookie_name].value
+        session = await database.get_web_session(raw_session)
+        assert session is not None
+        assert "_menu_chat_id" not in session.payload
+        assert "_menu_message_id" not in session.payload
     finally:
         await client.close()
         await database.close()

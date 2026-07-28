@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 from pathlib import Path
 from typing import Any
 
 from aiohttp import web
+from aiogram import Bot
+from aiogram.exceptions import TelegramAPIError
 
+from anistream_telegram.bot import MAIN_MENU_TEXT, main_keyboard
 from anistream_telegram.config import Config
 from anistream_telegram.core import CoreService
 from anistream_telegram.database import Database, WebSession
@@ -32,15 +36,51 @@ class WebRoutes:
         database: Database,
         core: CoreService,
         media: MediaGateway,
+        bot: Bot | None = None,
+        background_tasks: set[asyncio.Task[Any]] | None = None,
     ) -> None:
         self.config = config
         self.database = database
         self.core = core
         self.media = media
+        self.bot = bot
+        self.background_tasks = background_tasks
         self.auth_limiter = SlidingWindowLimiter(12, 60)
         self.progress_limiter = SlidingWindowLimiter(120, 60)
         self.playback_limiter = SlidingWindowLimiter(12, 60)
         self.cast_limiter = SlidingWindowLimiter(10, 60)
+
+    async def _restore_main_menu(self, chat_id: int, message_id: int) -> None:
+        if self.bot is None:
+            return
+        try:
+            await self.bot.edit_message_text(
+                text=MAIN_MENU_TEXT,
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=main_keyboard(),
+            )
+        except TelegramAPIError as exc:
+            # Playback must remain available even if Telegram briefly rejects
+            # or cannot deliver this purely presentational menu update.
+            LOGGER.info("Main menu could not be restored after launch: %s", type(exc).__name__)
+
+    def _schedule_main_menu_restore(self, launch: dict[str, Any]) -> None:
+        chat_id = launch.pop("_menu_chat_id", None)
+        message_id = launch.pop("_menu_message_id", None)
+        if (
+            self.bot is None
+            or not isinstance(chat_id, int)
+            or not isinstance(message_id, int)
+        ):
+            return
+        task = asyncio.create_task(
+            self._restore_main_menu(chat_id, message_id),
+            name=f"restore-main-menu-{chat_id}-{message_id}",
+        )
+        if self.background_tasks is not None:
+            self.background_tasks.add(task)
+            task.add_done_callback(self.background_tasks.discard)
 
     def register(self, app: web.Application) -> None:
         app.router.add_post("/api/auth/telegram", self.authenticate)
@@ -125,10 +165,20 @@ class WebRoutes:
         launch = await self.database.exchange_launch_ticket(launch_token, identity.user_id)
         if launch is None:
             raise web.HTTPForbidden(text="Launch link is invalid or expired")
+        menu_chat_id = launch.get("_menu_chat_id")
+        menu_message_id = launch.get("_menu_message_id")
+        launch.pop("_menu_chat_id", None)
+        launch.pop("_menu_message_id", None)
         raw_session, csrf = await self.database.create_web_session(
             identity.user_id,
             launch,
             ttl_seconds=self.config.session_ttl_seconds,
+        )
+        self._schedule_main_menu_restore(
+            {
+                "_menu_chat_id": menu_chat_id,
+                "_menu_message_id": menu_message_id,
+            }
         )
         response = web.json_response(
             {

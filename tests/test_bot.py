@@ -474,6 +474,9 @@ async def test_https_watch_selection_builds_web_app_and_back_button() -> None:
     )
 
     handlers.database.create_launch_ticket.assert_awaited_once()
+    launch_payload = handlers.database.create_launch_ticket.await_args.args[1]
+    assert launch_payload["_menu_chat_id"] == 456
+    assert launch_payload["_menu_message_id"] == 789
     event.message.answer.assert_not_awaited()
     keyboard = event.message.edit_text.await_args.kwargs["reply_markup"]
     assert keyboard.inline_keyboard[0][0].web_app.url == (
