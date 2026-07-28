@@ -18,12 +18,24 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     delete,
+    event,
     select,
 )
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from anistream.models import MAX_PREFETCHED_PLAYLIST_BYTES
+
+
+def enable_sqlite_foreign_keys(
+    dbapi_connection: Any,
+    _connection_record: Any,
+) -> None:
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys=ON")
+    finally:
+        cursor.close()
 
 
 def utcnow() -> datetime:
@@ -207,6 +219,12 @@ class Database:
             pool_pre_ping=True,
             connect_args=connect_args,
         )
+        if url.startswith("sqlite"):
+            event.listen(
+                self.engine.sync_engine,
+                "connect",
+                enable_sqlite_foreign_keys,
+            )
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
 
     async def initialize(self, bootstrap_users: tuple[int, ...] = ()) -> None:
@@ -538,6 +556,10 @@ class Database:
         )
         async with self.sessions.begin() as session:
             session.add(item)
+            # These tables deliberately use lightweight foreign-key columns
+            # without ORM relationships. Materialize the parent first so
+            # PostgreSQL cannot schedule either child INSERT ahead of it.
+            await session.flush()
             if prefetched_playlist:
                 session.add(
                     PlaybackManifest(

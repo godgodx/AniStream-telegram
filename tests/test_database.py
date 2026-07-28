@@ -25,6 +25,16 @@ async def database_at(path: Path) -> Database:
     return database
 
 
+async def test_sqlite_enforces_foreign_keys(tmp_path: Path) -> None:
+    database = await database_at(tmp_path / "db.sqlite")
+    try:
+        async with database.engine.connect() as connection:
+            result = await connection.exec_driver_sql("PRAGMA foreign_keys")
+            assert result.scalar_one() == 1
+    finally:
+        await database.close()
+
+
 async def test_whitelist_and_one_time_launch_ticket(tmp_path: Path) -> None:
     database = await database_at(tmp_path / "db.sqlite")
     try:
