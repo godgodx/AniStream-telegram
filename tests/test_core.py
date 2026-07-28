@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from unittest.mock import Mock
 
 import pytest
 
@@ -59,6 +60,43 @@ def test_registered_providers_receive_stable_anonymous_aliases() -> None:
     assert service._with_provider_alias(
         {"provider_id": service.providers.providers[0].id}
     )["provider_alias"] == "Provider 1"
+    assert service.provider_profiles() == (
+        {
+            "provider_id": "anime_sama",
+            "provider_alias": "Provider 1",
+            "content_types": ("Anime",),
+            "languages": ("French",),
+        },
+        {
+            "provider_id": "french_stream",
+            "provider_alias": "Provider 2",
+            "content_types": ("Movies", "Series", "Anime"),
+            "languages": ("French",),
+        },
+    )
+
+
+async def test_core_searches_only_the_selected_providers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = CoreService()
+    anime_search = Mock(return_value=[])
+    french_stream_search = Mock(return_value=[])
+    monkeypatch.setattr(service.providers.providers[0], "search", anime_search)
+    monkeypatch.setattr(
+        service.providers.providers[1],
+        "search",
+        french_stream_search,
+    )
+
+    assert await service.search(
+        "Tokyo Ghoul",
+        actor_key=123,
+        provider_ids=("anime_sama",),
+    ) == ([], [])
+
+    anime_search.assert_called_once_with("Tokyo Ghoul")
+    french_stream_search.assert_not_called()
 
 
 async def test_core_rejects_concurrent_provider_work_for_same_user(

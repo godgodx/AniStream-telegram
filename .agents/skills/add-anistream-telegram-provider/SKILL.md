@@ -43,6 +43,12 @@ Implement the four `Provider` methods in a dedicated module under
 4. `catalogue(url)` must return one language-specific `Catalogue` with
    contiguous episode numbers and ordered embed candidates.
 
+Also declare concise `content_types` and `search_languages` tuples on the
+provider class. These values power the anonymous two-row capability summary in
+Telegram Settings and Search. Use broad user-facing labels such as `Movies`,
+`Series`, `Anime`, `French`, or `English`; never put the real provider name,
+domain, internal language code, or marketing copy in these fields.
+
 Keep HTML, JavaScript, API, route, and language-code knowledge inside the
 provider. Do not add provider names, route shapes, or language codes to the
 Telegram bot, web routes, history, database, player, or planner.
@@ -84,7 +90,9 @@ canonicalization deterministic.
 
 Export the provider and instantiate it in `default_providers()` in
 `src/anistream/providers/__init__.py`. Every registered provider participates
-in Telegram Search; there is no CLI Settings source selector in this edition.
+in Telegram Search by default. Each Telegram user can disable individual
+providers under **Settings → Manage providers**; the provider registry must
+honor that per-user selection before starting any upstream search work.
 
 Use a stable lowercase `provider.id` and keep the real provider display name
 available internally for diagnostics. The Telegram product must never expose
@@ -100,6 +108,8 @@ Every Telegram button that combines a title with an alias must reserve room for
 the complete `Provider N` suffix. Truncate only the title with an ellipsis.
 A new provider should not require provider-specific conditional code in
 `CoreService`, `BotHandlers`, `WebRoutes`, or the Mini App.
+Its anonymous Settings and Search summaries must come entirely from the
+provider's generic capability metadata.
 
 If provider-specific configuration is genuinely required:
 
@@ -190,6 +200,8 @@ Cover at least:
 - accepted canonical/alternate domains and rejected lookalikes;
 - empty search, stable anonymous provider attribution, and long-title
   truncation that preserves the alias;
+- anonymous provider capability metadata, default-enabled behavior, per-user
+  enable/disable persistence, and exclusion before upstream search;
 - root catalogue discovery and direct deep links;
 - separate related seasons, including optional partial failures;
 - every supported language mapping and label;

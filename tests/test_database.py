@@ -78,6 +78,44 @@ async def test_autoplay_defaults_on_and_persists_per_user(tmp_path: Path) -> Non
         await reopened.close()
 
 
+async def test_provider_preferences_default_on_and_persist_per_user(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "db.sqlite"
+    provider_ids = ("anime_sama", "french_stream")
+    database = await database_at(path)
+    try:
+        assert await database.provider_states(123, provider_ids) == {
+            "anime_sama": True,
+            "french_stream": True,
+        }
+        assert await database.enabled_provider_ids(123, provider_ids) == provider_ids
+        assert (
+            await database.toggle_provider_enabled(123, "anime_sama")
+            is False
+        )
+        assert await database.enabled_provider_ids(123, provider_ids) == (
+            "french_stream",
+        )
+        assert await database.enabled_provider_ids(999, provider_ids) == provider_ids
+    finally:
+        await database.close()
+
+    reopened = await database_at(path)
+    try:
+        assert await reopened.provider_states(123, provider_ids) == {
+            "anime_sama": False,
+            "french_stream": True,
+        }
+        assert (
+            await reopened.toggle_provider_enabled(123, "anime_sama")
+            is True
+        )
+        assert await reopened.enabled_provider_ids(123, provider_ids) == provider_ids
+    finally:
+        await reopened.close()
+
+
 async def test_selection_payload_updates_are_user_and_kind_scoped(
     tmp_path: Path,
 ) -> None:

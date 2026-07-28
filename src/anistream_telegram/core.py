@@ -153,6 +153,17 @@ class CoreService:
     def provider_alias(self, provider_id: str) -> str:
         return self._provider_aliases.get(str(provider_id), "Provider")
 
+    def provider_profiles(self) -> tuple[dict[str, Any], ...]:
+        return tuple(
+            {
+                "provider_id": provider.id,
+                "provider_alias": self.provider_alias(provider.id),
+                "content_types": tuple(provider.content_types),
+                "languages": tuple(provider.search_languages),
+            }
+            for provider in self.providers.providers
+        )
+
     def _with_provider_alias(self, payload: dict[str, Any]) -> dict[str, Any]:
         return {
             **payload,
@@ -164,9 +175,20 @@ class CoreService:
         query: str,
         *,
         actor_key: object = "internal",
+        provider_ids: tuple[str, ...] | None = None,
     ) -> tuple[list[dict[str, Any]], list[str]]:
         async with self.provider_capacity.slot(str(actor_key)):
-            results, errors = await asyncio.to_thread(self.providers.search, query)
+            if provider_ids is None:
+                results, errors = await asyncio.to_thread(
+                    self.providers.search,
+                    query,
+                )
+            else:
+                results, errors = await asyncio.to_thread(
+                    self.providers.search,
+                    query,
+                    provider_ids=provider_ids,
+                )
         return [
             self._with_provider_alias(search_result_payload(item))
             for item in results

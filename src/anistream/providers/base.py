@@ -8,6 +8,8 @@ from anistream.models import Catalogue, CatalogueVariant, SearchResult
 class Provider(ABC):
     id: str
     name: str
+    content_types: tuple[str, ...]
+    search_languages: tuple[str, ...]
 
     @abstractmethod
     def matches(self, url: str) -> bool:

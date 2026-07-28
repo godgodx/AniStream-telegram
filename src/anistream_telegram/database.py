@@ -52,6 +52,21 @@ class UserPreference(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
 
 
+class UserProviderPreference(Base):
+    __tablename__ = "user_provider_preferences"
+
+    telegram_user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+    )
+    provider_id: Mapped[str] = mapped_column(
+        String(64),
+        primary_key=True,
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
 class EphemeralSelection(Base):
     __tablename__ = "ephemeral_selections"
 
@@ -240,6 +255,65 @@ class Database:
                 preference.autoplay_next = not preference.autoplay_next
                 preference.updated_at = utcnow()
             return bool(preference.autoplay_next)
+
+    async def provider_states(
+        self,
+        user_id: int,
+        provider_ids: tuple[str, ...],
+    ) -> dict[str, bool]:
+        normalized = tuple(dict.fromkeys(str(item) for item in provider_ids))
+        if not normalized:
+            return {}
+        async with self.sessions() as session:
+            result = await session.scalars(
+                select(UserProviderPreference).where(
+                    UserProviderPreference.telegram_user_id == user_id,
+                    UserProviderPreference.provider_id.in_(normalized),
+                )
+            )
+            saved = {item.provider_id: bool(item.enabled) for item in result}
+        return {
+            provider_id: saved.get(provider_id, True)
+            for provider_id in normalized
+        }
+
+    async def enabled_provider_ids(
+        self,
+        user_id: int,
+        provider_ids: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        states = await self.provider_states(user_id, provider_ids)
+        return tuple(
+            provider_id
+            for provider_id in provider_ids
+            if states.get(provider_id, True)
+        )
+
+    async def toggle_provider_enabled(
+        self,
+        user_id: int,
+        provider_id: str,
+    ) -> bool:
+        async with self.sessions.begin() as session:
+            preference = await session.scalar(
+                select(UserProviderPreference)
+                .where(
+                    UserProviderPreference.telegram_user_id == user_id,
+                    UserProviderPreference.provider_id == provider_id,
+                )
+                .with_for_update()
+            )
+            if preference is None:
+                preference = UserProviderPreference(
+                    telegram_user_id=user_id,
+                    provider_id=provider_id,
+                    enabled=False,
+                )
+                session.add(preference)
+            else:
+                preference.enabled = not preference.enabled
+                preference.updated_at = utcnow()
+            return bool(preference.enabled)
 
     async def create_selection(
         self,

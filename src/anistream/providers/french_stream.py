@@ -27,6 +27,8 @@ class _Page:
 class FrenchStreamProvider(Provider):
     id = "french_stream"
     name = "French Stream"
+    content_types = ("Movies", "Series", "Anime")
+    search_languages = ("French",)
     base_url = "https://french-stream.one/"
     search_url = "https://french-stream.one/engine/ajax/search.php"
 

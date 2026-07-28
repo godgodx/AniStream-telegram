@@ -36,9 +36,11 @@ workflow.
   preview, Settings, Help, paginated episodes, anonymous provider attribution,
   and breadcrumb-style Back buttons use styled inline keyboards that replace
   the current panel instead of flooding the conversation with new messages.
-- **Multi-provider search** — query every registered catalogue concurrently and
-  expose stable `Provider 1`, `Provider 2`, and subsequent aliases without
-  revealing catalogue names in the Telegram interface.
+- **Personalized multi-provider search** — query only the catalogues enabled in
+  the user's Settings and expose stable `Provider 1`, `Provider 2`, and
+  subsequent aliases without revealing catalogue names in the Telegram
+  interface. Anonymous provider cards summarize supported content and
+  languages before a result is selected.
 - **Structured seasons and languages** — providers expose one neutral variant
   per season/language pair without global language assumptions.
 - **Source preflight planning** — resolve and probe ordered candidates before
@@ -194,11 +196,17 @@ Whitelisted Telegram user
 
 ### Search
 
-Search runs across all registered providers concurrently. Results include the
-provider's stable anonymous alias, so adding more sites never makes the choices
-ambiguous or reveals catalogue names to Telegram users. Selections are stored
-server-side under short-lived opaque IDs instead of being serialized into
-Telegram callback data.
+Search runs concurrently across the providers enabled for that Telegram
+account. Every provider is enabled by default and can be turned on or off under
+**Settings → Manage providers**. Results include the provider's stable
+anonymous alias plus concise content and language coverage, so adding more
+sites never makes the choices ambiguous or reveals catalogue names to Telegram
+users. Selections are stored server-side under short-lived opaque IDs instead
+of being serialized into Telegram callback data.
+
+The search prompt reminds users that provider search engines can require exact
+spelling. If every provider is disabled, Search opens provider management
+instead of issuing an empty upstream request.
 
 Season and language variants lead to a paginated episode keyboard. Every level
 includes a Back action so an accidental selection can be corrected without

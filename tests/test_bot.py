@@ -25,10 +25,33 @@ def handler(public_base_url: str) -> BotHandlers:
         create_launch_ticket=AsyncMock(return_value="launch-ticket"),
         autoplay_enabled=AsyncMock(return_value=True),
         toggle_autoplay=AsyncMock(return_value=False),
+        provider_states=AsyncMock(
+            side_effect=lambda _user_id, provider_ids: {
+                provider_id: True for provider_id in provider_ids
+            }
+        ),
+        enabled_provider_ids=AsyncMock(
+            side_effect=lambda _user_id, provider_ids: provider_ids
+        ),
+        toggle_provider_enabled=AsyncMock(return_value=False),
         update_selection_payload=AsyncMock(return_value=True),
     )
     instance.core = SimpleNamespace(
         provider_alias=lambda _provider_id: "Provider 1",
+        provider_profiles=lambda: (
+            {
+                "provider_id": "anime_sama",
+                "provider_alias": "Provider 1",
+                "content_types": ("Anime",),
+                "languages": ("French",),
+            },
+            {
+                "provider_id": "french_stream",
+                "provider_alias": "Provider 2",
+                "content_types": ("Movies", "Series", "Anime"),
+                "languages": ("French",),
+            },
+        ),
     )
     instance.provider_limiter = SlidingWindowLimiter(1_000, 60)
     return instance
@@ -137,6 +160,8 @@ def test_only_id_handler_is_registered_on_public_router() -> None:
         "watch_list_coming_soon",
         "settings",
         "toggle_autoplay",
+        "manage_providers",
+        "toggle_provider",
         "select_episode",
         "select_continue",
     } <= protected_callbacks
@@ -189,6 +214,9 @@ def test_settings_keyboard_reflects_autoplay_state() -> None:
     assert disabled.text == "Autoplay next episode · Off"
     assert disabled.style is None
     assert enabled.callback_data == disabled.callback_data == "settings:autoplay"
+    manage = settings_keyboard(True).inline_keyboard[1][0]
+    assert manage.text == "🧩 Manage providers"
+    assert manage.callback_data == "settings:providers"
 
 
 def test_long_button_title_preserves_anonymous_provider_suffix() -> None:
@@ -256,7 +284,8 @@ async def test_settings_panel_reads_saved_autoplay_state() -> None:
     keyboard = event.message.edit_text.await_args.kwargs["reply_markup"]
     assert text.startswith("⚙ Settings")
     assert keyboard.inline_keyboard[0][0].text.endswith("· Off")
-    assert keyboard.inline_keyboard[1][0].callback_data == "menu:main"
+    assert keyboard.inline_keyboard[1][0].callback_data == "settings:providers"
+    assert keyboard.inline_keyboard[2][0].callback_data == "menu:main"
 
 
 @pytest.mark.asyncio
@@ -271,6 +300,69 @@ async def test_settings_toggle_persists_and_refreshes_panel() -> None:
     event.answer.assert_awaited_once_with("Autoplay disabled.")
     keyboard = event.message.edit_text.await_args.kwargs["reply_markup"]
     assert keyboard.inline_keyboard[0][0].text.endswith("· Off")
+
+
+@pytest.mark.asyncio
+async def test_provider_settings_are_anonymous_clear_and_enabled_by_default() -> None:
+    handlers = handler("https://watch.example")
+    event = callback()
+
+    await handlers.manage_providers(event)
+
+    event.answer.assert_awaited_once()
+    handlers.database.provider_states.assert_awaited_once_with(
+        123,
+        ("anime_sama", "french_stream"),
+    )
+    text = event.message.edit_text.await_args.args[0]
+    keyboard = event.message.edit_text.await_args.kwargs["reply_markup"]
+    assert "Provider 1" in text
+    assert "Content · Anime" in text
+    assert "Provider 2" in text
+    assert "Content · Movies · Series · Anime" in text
+    assert text.count("Language · French") == 2
+    assert "Anime-Sama" not in text
+    assert "French Stream" not in text
+    assert keyboard.inline_keyboard[0][0].text == "✅ Provider 1 · On"
+    assert keyboard.inline_keyboard[1][0].text == "✅ Provider 2 · On"
+    assert keyboard.inline_keyboard[2][0].callback_data == "menu:settings"
+
+
+@pytest.mark.asyncio
+async def test_provider_toggle_is_user_scoped_and_refreshes_the_panel() -> None:
+    handlers = handler("https://watch.example")
+    handlers.database.toggle_provider_enabled = AsyncMock(return_value=False)
+    handlers.database.provider_states = AsyncMock(
+        return_value={"anime_sama": False, "french_stream": True}
+    )
+    event = callback()
+    event.data = "settings:provider:0"
+
+    await handlers.toggle_provider(event)
+
+    handlers.database.toggle_provider_enabled.assert_awaited_once_with(
+        123,
+        "anime_sama",
+    )
+    event.answer.assert_awaited_once_with("Provider 1 disabled.")
+    keyboard = event.message.edit_text.await_args.kwargs["reply_markup"]
+    assert keyboard.inline_keyboard[0][0].text == "Provider 1 · Off"
+    assert keyboard.inline_keyboard[1][0].text == "✅ Provider 2 · On"
+
+
+@pytest.mark.asyncio
+async def test_invalid_provider_toggle_does_not_reach_the_database() -> None:
+    handlers = handler("https://watch.example")
+    event = callback()
+    event.data = "settings:provider:-1"
+
+    await handlers.toggle_provider(event)
+
+    handlers.database.toggle_provider_enabled.assert_not_awaited()
+    event.answer.assert_awaited_once_with(
+        "This provider is no longer available.",
+        show_alert=True,
+    )
 
 
 @pytest.mark.asyncio
@@ -292,6 +384,30 @@ async def test_search_prompt_replaces_menu_and_remembers_panel() -> None:
     )
     keyboard = event.message.edit_text.await_args.kwargs["reply_markup"]
     assert keyboard.inline_keyboard[0][0].text == "‹ Cancel"
+    assert "Check the spelling carefully" in event.message.edit_text.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_search_redirects_to_provider_settings_when_all_are_disabled() -> None:
+    handlers = handler("https://watch.example")
+    handlers.database.enabled_provider_ids = AsyncMock(return_value=())
+    event = callback()
+    state = SimpleNamespace(
+        clear=AsyncMock(),
+        set_state=AsyncMock(),
+        update_data=AsyncMock(),
+    )
+
+    await handlers.search_prompt(event, state)
+
+    event.answer.assert_awaited_once_with(
+        "Enable at least one provider before searching.",
+        show_alert=True,
+    )
+    state.clear.assert_awaited_once()
+    state.set_state.assert_not_awaited()
+    text = event.message.edit_text.await_args.args[0]
+    assert text.startswith("⚙ Settings › Providers")
 
 
 @pytest.mark.asyncio
@@ -299,6 +415,20 @@ async def test_search_results_are_sent_below_query_and_grouped_by_provider() -> 
     handlers = handler("https://watch.example")
     handlers.core = SimpleNamespace(
         provider_alias=lambda _provider_id: "Provider 2",
+        provider_profiles=lambda: (
+            {
+                "provider_id": "anime-sama",
+                "provider_alias": "Provider 2",
+                "content_types": ("Anime",),
+                "languages": ("French",),
+            },
+            {
+                "provider_id": "french-stream",
+                "provider_alias": "Provider 1",
+                "content_types": ("Movies", "Series", "Anime"),
+                "languages": ("French",),
+            },
+        ),
         search=AsyncMock(
             return_value=(
                 [
@@ -360,6 +490,8 @@ async def test_search_results_are_sent_below_query_and_grouped_by_provider() -> 
     panel.edit_text.assert_awaited_once()
     assert "Results for" in panel.edit_text.await_args.args[0]
     assert "Provider 1" in panel.edit_text.await_args.args[0]
+    assert "Content · Movies · Series · Anime" in panel.edit_text.await_args.args[0]
+    assert "Language · French" in panel.edit_text.await_args.args[0]
     first_keyboard = panel.edit_text.await_args.kwargs["reply_markup"]
     assert first_keyboard.inline_keyboard[0][0].text == "Violet Evergarden"
     assert "Provider" not in first_keyboard.inline_keyboard[0][0].text
@@ -370,6 +502,11 @@ async def test_search_results_are_sent_below_query_and_grouped_by_provider() -> 
     result_label = second_keyboard.inline_keyboard[0][0].text
     assert "Provider" not in result_label
     assert len(result_label) <= 60
+    handlers.core.search.assert_awaited_once_with(
+        "Tokyo Ghoul",
+        actor_key=123,
+        provider_ids=("anime-sama", "french-stream"),
+    )
     handlers.database.update_selection_payload.assert_awaited_once()
     saved_payload = handlers.database.update_selection_payload.await_args.args[2]
     assert saved_payload["message_ids"] == [
@@ -383,7 +520,18 @@ async def test_search_rate_limit_rejects_before_provider_work() -> None:
     handlers = handler("https://watch.example")
     handlers.provider_limiter = SlidingWindowLimiter(1, 60)
     assert await handlers.provider_limiter.allow("123") is True
-    handlers.core = SimpleNamespace(search=AsyncMock())
+    handlers.core = SimpleNamespace(
+        provider_alias=lambda _provider_id: "Provider 1",
+        provider_profiles=lambda: (
+            {
+                "provider_id": "anime_sama",
+                "provider_alias": "Provider 1",
+                "content_types": ("Anime",),
+                "languages": ("French",),
+            },
+        ),
+        search=AsyncMock(),
+    )
     panel = MagicMock(spec=Message)
     panel.chat = SimpleNamespace(id=456)
     panel.message_id = 790

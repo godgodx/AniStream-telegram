@@ -153,6 +153,65 @@ def settings_keyboard(autoplay_enabled: bool) -> InlineKeyboardMarkup:
             [toggle],
             [
                 InlineKeyboardButton(
+                    text="🧩 Manage providers",
+                    callback_data="settings:providers",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="‹ Back to menu",
+                    callback_data="menu:main",
+                )
+            ],
+        ]
+    )
+
+
+def provider_management_keyboard(
+    profiles: tuple[dict[str, Any], ...],
+    states: dict[str, bool],
+) -> InlineKeyboardMarkup:
+    buttons: list[list[InlineKeyboardButton]] = []
+    for index, profile in enumerate(profiles):
+        provider_id = str(profile["provider_id"])
+        alias = str(profile["provider_alias"])
+        enabled = states.get(provider_id, True)
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=(
+                        f"✅ {alias} · On"
+                        if enabled
+                        else f"{alias} · Off"
+                    ),
+                    callback_data=f"settings:provider:{index}",
+                    style="success" if enabled else None,
+                )
+            ]
+        )
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="‹ Back to settings",
+                callback_data="menu:settings",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def provider_required_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🧩 Manage providers",
+                    callback_data="settings:providers",
+                    style="primary",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="‹ Back to menu",
                     callback_data="menu:main",
                 )
@@ -233,6 +292,14 @@ class BotHandlers:
         self.protected_router.callback_query.register(
             self.toggle_autoplay,
             F.data == "settings:autoplay",
+        )
+        self.protected_router.callback_query.register(
+            self.manage_providers,
+            F.data == "settings:providers",
+        )
+        self.protected_router.callback_query.register(
+            self.toggle_provider,
+            F.data.startswith("settings:provider:"),
         )
         self.protected_router.callback_query.register(
             self.help_callback,
@@ -335,6 +402,49 @@ class BotHandlers:
                 return alias
         return "Provider"
 
+    def _provider_profiles(self) -> tuple[dict[str, Any], ...]:
+        resolver = getattr(self.core, "provider_profiles", None)
+        if not callable(resolver):
+            return ()
+        profiles: list[dict[str, Any]] = []
+        for raw in resolver():
+            provider_id = str(raw.get("provider_id", "")).strip()
+            if not provider_id:
+                continue
+            alias = self._provider_alias(
+                {
+                    "provider_id": provider_id,
+                    "provider_alias": raw.get("provider_alias", ""),
+                }
+            )
+            content_types = tuple(
+                str(item).strip()
+                for item in raw.get("content_types", ())
+                if str(item).strip()
+            )
+            languages = tuple(
+                str(item).strip()
+                for item in raw.get("languages", ())
+                if str(item).strip()
+            )
+            profiles.append(
+                {
+                    "provider_id": provider_id,
+                    "provider_alias": alias,
+                    "content_types": content_types or ("Not specified",),
+                    "languages": languages or ("Not specified",),
+                }
+            )
+        return tuple(profiles)
+
+    @staticmethod
+    def _provider_profile_text(profile: dict[str, Any]) -> str:
+        return (
+            f"🎞 {profile['provider_alias']}\n"
+            f"🎬 Content · {' · '.join(profile['content_types'])}\n"
+            f"🌐 Language · {' · '.join(profile['languages'])}"
+        )
+
     @staticmethod
     async def _replace_callback_message(
         callback: CallbackQuery,
@@ -405,6 +515,59 @@ class BotHandlers:
         )
         await self._render_settings(callback, autoplay_enabled=enabled)
 
+    async def manage_providers(self, callback: CallbackQuery) -> None:
+        await callback.answer()
+        await self._render_provider_settings(callback)
+
+    async def toggle_provider(self, callback: CallbackQuery) -> None:
+        profiles = self._provider_profiles()
+        try:
+            index = int((callback.data or "").rsplit(":", 1)[1])
+            if index < 0:
+                raise IndexError
+            profile = profiles[index]
+        except (IndexError, TypeError, ValueError):
+            await callback.answer(
+                "This provider is no longer available.",
+                show_alert=True,
+            )
+            return
+
+        enabled = await self.database.toggle_provider_enabled(
+            callback.from_user.id,
+            str(profile["provider_id"]),
+        )
+        await callback.answer(
+            f"{profile['provider_alias']} "
+            f"{'enabled' if enabled else 'disabled'}.",
+        )
+        await self._render_provider_settings(callback, profiles=profiles)
+
+    async def _render_provider_settings(
+        self,
+        callback: CallbackQuery,
+        *,
+        profiles: tuple[dict[str, Any], ...] | None = None,
+    ) -> None:
+        profiles = profiles if profiles is not None else self._provider_profiles()
+        provider_ids = tuple(str(profile["provider_id"]) for profile in profiles)
+        states = await self.database.provider_states(
+            callback.from_user.id,
+            provider_ids,
+        )
+        cards = "\n\n".join(
+            self._provider_profile_text(profile)
+            for profile in profiles
+        )
+        await self._replace_callback_message(
+            callback,
+            "⚙ Settings › Providers\n\n"
+            "Choose which providers AniStream searches. "
+            "All providers are enabled by default."
+            + (f"\n\n{cards}" if cards else "\n\nNo providers are available."),
+            provider_management_keyboard(profiles, states),
+        )
+
     async def _render_settings(
         self,
         callback: CallbackQuery,
@@ -420,7 +583,9 @@ class BotHandlers:
             "⚙ Settings\n\n"
             "Autoplay next episode\n"
             "Automatically start the next episode when the current one ends.\n\n"
-            "This preference is saved to your Telegram account.",
+            "Providers\n"
+            "Choose which catalogues are included in your searches.\n\n"
+            "These preferences are saved to your Telegram account.",
             settings_keyboard(autoplay_enabled),
         )
 
@@ -444,6 +609,21 @@ class BotHandlers:
         )
 
     async def search_prompt(self, callback: CallbackQuery, state: FSMContext) -> None:
+        profiles = self._provider_profiles()
+        provider_ids = tuple(str(profile["provider_id"]) for profile in profiles)
+        enabled_provider_ids = await self.database.enabled_provider_ids(
+            callback.from_user.id,
+            provider_ids,
+        )
+        if not enabled_provider_ids:
+            await callback.answer(
+                "Enable at least one provider before searching.",
+                show_alert=True,
+            )
+            await state.clear()
+            await self._render_provider_settings(callback, profiles=profiles)
+            return
+
         await callback.answer()
         await state.set_state(SearchFlow.waiting_query)
         if callback.message:
@@ -453,7 +633,10 @@ class BotHandlers:
             )
         await self._replace_callback_message(
             callback,
-            "🔎 Search\n\nSend the title you want to watch.",
+            "🔎 Search\n\n"
+            "Send the title you want to watch.\n\n"
+            "💡 Check the spelling carefully so providers can find the "
+            "right movie or series.",
             cancel_search_keyboard(),
         )
 
@@ -470,6 +653,22 @@ class BotHandlers:
             await state.update_data(
                 panel_chat_id=panel.chat.id,
                 panel_message_id=panel.message_id,
+            )
+            return
+        profiles = self._provider_profiles()
+        provider_ids = tuple(str(profile["provider_id"]) for profile in profiles)
+        enabled_provider_ids = await self.database.enabled_provider_ids(
+            message.from_user.id,
+            provider_ids,
+        )
+        if not enabled_provider_ids:
+            await state.clear()
+            await self._edit_flow_panel(
+                message,
+                flow_data,
+                "⚠ No providers are enabled.\n\n"
+                "Open Manage providers and enable at least one provider.",
+                provider_required_keyboard(),
             )
             return
         if not await self.provider_limiter.allow(str(message.from_user.id)):
@@ -491,6 +690,7 @@ class BotHandlers:
             results, errors = await self.core.search(
                 query,
                 actor_key=message.from_user.id,
+                provider_ids=enabled_provider_ids,
             )
         except CapacityExceeded:
             await status.edit_text(
@@ -552,8 +752,14 @@ class BotHandlers:
             return (int(number) if number.isdigit() else 10_000, alias)
 
         ordered_groups = sorted(groups.items(), key=provider_order)
+        profiles = {
+            str(profile["provider_id"]): profile
+            for profile in self._provider_profiles()
+        }
         rendered_messages: list[Message] = []
-        for group_index, (_, (alias, results)) in enumerate(ordered_groups):
+        for group_index, (item_provider_id, (alias, results)) in enumerate(
+            ordered_groups
+        ):
             buttons = [
                 [
                     InlineKeyboardButton(
@@ -572,9 +778,17 @@ class BotHandlers:
                         )
                     ]
                 )
+            profile = profiles.get(
+                item_provider_id,
+                {
+                    "provider_alias": alias,
+                    "content_types": ("Not specified",),
+                    "languages": ("Not specified",),
+                },
+            )
             text = (
                 f"🔎 Results for “{payload['query']}”\n\n"
-                f"🎞 {alias}"
+                f"{self._provider_profile_text(profile)}"
             )
             keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
             if group_index == 0:

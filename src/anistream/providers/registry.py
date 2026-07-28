@@ -21,11 +21,28 @@ class ProviderRegistry:
     def get(self, provider_id: str) -> Provider | None:
         return next((provider for provider in self._providers if provider.id == provider_id), None)
 
-    def search(self, query: str) -> tuple[list[SearchResult], list[str]]:
+    def search(
+        self,
+        query: str,
+        *,
+        provider_ids: tuple[str, ...] | None = None,
+    ) -> tuple[list[SearchResult], list[str]]:
+        allowed = None if provider_ids is None else frozenset(provider_ids)
+        providers = [
+            provider
+            for provider in self._providers
+            if allowed is None or provider.id in allowed
+        ]
+        if not providers:
+            return [], []
+
         results: list[SearchResult] = []
         errors: list[str] = []
-        with ThreadPoolExecutor(max_workers=max(1, len(self._providers))) as pool:
-            pending = {pool.submit(provider.search, query): provider for provider in self._providers}
+        with ThreadPoolExecutor(max_workers=len(providers)) as pool:
+            pending = {
+                pool.submit(provider.search, query): provider
+                for provider in providers
+            }
             for future in as_completed(pending):
                 provider = pending[future]
                 try:

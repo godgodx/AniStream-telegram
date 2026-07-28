@@ -16,6 +16,8 @@ from anistream.utils.http import HttpClient
 class AnimeSamaProvider(Provider):
     id = "anime_sama"
     name = "Anime-Sama"
+    content_types = ("Anime",)
+    search_languages = ("French",)
     base_url = "https://anime-sama.to/"
     search_url = "https://anime-sama.to/template-php/defaut/fetch.php"
     language_codes = ("vostfr", "vf", "va", "var", "vkr", "vcn", "vqc", "vf1", "vf2")
