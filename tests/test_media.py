@@ -277,6 +277,73 @@ async def test_invalid_hls_playlist_is_never_scored_as_healthy(
     assert health.observe.call_args.kwargs["success"] is False
 
 
+def test_gateway_rejects_incomplete_vod_media_playlist(tmp_path: Path) -> None:
+    gateway = MediaGateway(config(tmp_path), Database(config(tmp_path).database_url))
+    playback = PlaybackSession(
+        id="playback-id",
+        telegram_user_id=123,
+        catalogue_payload={},
+        episode=1,
+        media_url="https://cdn.example/master.m3u8",
+        media_headers={},
+        media_kind="hls",
+        source_name="Test",
+        expires_at=utcnow() + timedelta(minutes=10),
+    )
+    incomplete = (
+        b"#EXTM3U\n"
+        b"#EXT-X-PLAYLIST-TYPE:VOD\n"
+        b"#EXTINF:10,\nsegment-001.ts\n"
+    )
+
+    with pytest.raises(web.HTTPBadGateway) as error:
+        gateway._playlist_body_response(
+            playback,
+            incomplete,
+            "https://cdn.example/path/quality.m3u8",
+        )
+
+    assert "incomplete" in (error.value.text or "")
+
+
+async def test_probe_rejects_incomplete_vod_variant(tmp_path: Path) -> None:
+    gateway = MediaGateway(config(tmp_path), Database(config(tmp_path).database_url))
+    master = ProbeResponse(
+        b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nquality.m3u8\n",
+        "https://cdn.example/master.m3u8",
+    )
+    variant = ProbeResponse(
+        (
+            b"#EXTM3U\n"
+            b"#EXT-X-PLAYLIST-TYPE:VOD\n"
+            b"#EXTINF:10,\nsegment.ts\n"
+        ),
+        "https://cdn.example/quality.m3u8",
+    )
+    segment = ProbeResponse(
+        b"media-bytes",
+        "https://cdn.example/segment.ts",
+        content_type="video/mp2t",
+    )
+    gateway.upstream.request = AsyncMock(
+        side_effect=[master, variant, segment]
+    )
+
+    result = await gateway.probe(
+        ResolvedMedia(
+            "https://cdn.example/master.m3u8",
+            "https://embed.example/",
+            "Test",
+            {},
+            "hls",
+        ),
+        True,
+    )
+
+    assert result.valid is False
+    assert "incomplete" in result.detail
+
+
 def config(tmp_path: Path) -> Config:
     return Config(
         bot_token="123456789:test",
@@ -320,6 +387,7 @@ async def test_hls_playlist_urls_are_opaque_and_bound(tmp_path: Path) -> None:
             b"#EXT-X-START:TIME-OFFSET=120.0\n"
             b'#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n'
             b"#EXTINF:10,\nsegment-001.ts\n"
+            b"#EXT-X-ENDLIST\n"
         ),
         "https://cdn.example/path/master.m3u8",
     )
@@ -348,7 +416,7 @@ async def test_gateway_probe_reuses_transport_and_checks_cold_hls_startup(
     )
     variant = ProbeResponse(
         b'#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n'
-        b"#EXTINF:10,\nsegment.ts\n",
+        b"#EXTINF:10,\nsegment.ts\n#EXT-X-ENDLIST\n",
         "https://cdn.example/quality.m3u8",
     )
     key = ProbeResponse(
@@ -395,7 +463,7 @@ async def test_master_reuses_the_prefetched_hls_manifest_once(
         {},
         ttl_seconds=600,
     )
-    body = b"#EXTM3U\n#EXTINF:10,\nsegment-001.ts\n"
+    body = b"#EXTM3U\n#EXTINF:10,\nsegment-001.ts\n#EXT-X-ENDLIST\n"
     playback = await database.create_playback(
         123,
         {},
@@ -451,7 +519,7 @@ async def test_cast_hls_playlist_propagates_grant_and_cors(tmp_path: Path) -> No
         expires_at=utcnow() + timedelta(minutes=10),
     )
     upstream = FakeResponse(
-        b"#EXTM3U\n#EXTINF:10,\nsegment-001.ts\n",
+        b"#EXTM3U\n#EXTINF:10,\nsegment-001.ts\n#EXT-X-ENDLIST\n",
         "https://cdn.example/path/master.m3u8",
     )
 

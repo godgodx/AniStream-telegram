@@ -64,6 +64,11 @@ COLD_HLS_PROBE_SECONDS = 4.0
 TRANSIENT_UPSTREAM_STATUSES = {502, 503, 504}
 
 
+def incomplete_vod_media_playlist(text: str) -> bool:
+    upper = text.upper()
+    return "#EXTINF:" in upper and "#EXT-X-ENDLIST" not in upper
+
+
 def expected_stream_bytes(status: int, headers: Any) -> int | None:
     """Return the exact advertised body size, rejecting contradictory headers."""
 
@@ -407,6 +412,9 @@ class MediaGateway:
                 if not plain_uris:
                     raise ValueError("HLS variant has no media segment")
 
+            if incomplete_vod_media_playlist(text):
+                raise ValueError("HLS VOD playlist is incomplete")
+
             targets = [urljoin(playlist_url, plain_uris[0])]
             key_match = URI_ATTRIBUTE.search(
                 next(
@@ -701,6 +709,8 @@ class MediaGateway:
             raise web.HTTPBadGateway(text="Upstream playlist is not UTF-8") from exc
         if not text.lstrip().startswith("#EXTM3U"):
             raise web.HTTPBadGateway(text="Upstream response is not an HLS playlist")
+        if incomplete_vod_media_playlist(text):
+            raise web.HTTPBadGateway(text="Upstream VOD playlist is incomplete")
 
         expires_at = int(playback.expires_at.timestamp())
         reference_count = 0
