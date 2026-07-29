@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from urllib.parse import parse_qs, urlparse
 
+import aiohttp
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -208,6 +209,52 @@ async def test_truncated_segment_is_force_closed_and_penalized(
     assert downstream.force_closed is True
     assert downstream.eof is False
     assert upstream.released is True
+    assert health.observe.call_args.kwargs["success"] is False
+
+
+async def test_chunked_upstream_failure_aborts_real_downstream_response(
+    tmp_path: Path,
+) -> None:
+    class FailingChunkedContent:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def read(self, _maximum: int) -> bytes:
+            self.calls += 1
+            if self.calls == 1:
+                return b"abc"
+            raise aiohttp.ClientPayloadError("premature chunked EOF")
+
+    upstream = SimpleNamespace(
+        status=200,
+        headers={"Content-Type": "video/mp2t"},
+        content=FailingChunkedContent(),
+        release=Mock(),
+    )
+    health = SimpleNamespace(observe=Mock())
+    gateway = MediaGateway(
+        config(tmp_path),
+        Database(config(tmp_path).database_url),
+        health,
+    )
+
+    async def segment(request: web.Request) -> web.StreamResponse:
+        return await gateway._stream_response(
+            request,
+            upstream,
+            playback_id="playback-id",
+            target_url="https://cdn.example/segment.ts",
+            measure_startup=False,
+        )
+
+    app = web.Application()
+    app.router.add_get("/segment", segment)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get("/segment")
+        with pytest.raises(aiohttp.ClientError):
+            await response.read()
+
+    upstream.release.assert_called_once_with()
     assert health.observe.call_args.kwargs["success"] is False
 
 

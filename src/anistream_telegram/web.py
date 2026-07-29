@@ -346,14 +346,23 @@ class WebRoutes:
             effective_start_position = (
                 0.0 if stored_position is None else stored_position
             )
-            await self.database.record_progress(
+            accepted = await self.database.record_progress(
                 session.telegram_user_id,
                 catalogue,
                 episode,
                 effective_start_position,
                 0.0,
                 False,
+                playback_id=playback.id,
+                playback_generation=max(
+                    0,
+                    int(getattr(playback, "generation", 0)),
+                ),
             )
+            if not accepted:
+                raise web.HTTPConflict(
+                    text="This playback was replaced by a newer player"
+                )
         return await self._playback_payload(
             session,
             catalogue,
@@ -630,14 +639,23 @@ class WebRoutes:
             expected_episode,
         )
         start_position = 0.0 if stored_position is None else stored_position
-        await self.database.record_progress(
+        accepted = await self.database.record_progress(
             session.telegram_user_id,
             catalogue,
             expected_episode,
             start_position,
             0.0,
             False,
+            playback_id=playback.id,
+            playback_generation=max(
+                0,
+                int(getattr(playback, "generation", 0)),
+            ),
         )
+        if not accepted:
+            raise web.HTTPConflict(
+                text="This playback was replaced by a newer player"
+            )
         await self._update_session_playback(
             request,
             session,

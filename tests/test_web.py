@@ -963,6 +963,79 @@ async def test_playback_reloads_progress_after_slow_source_preparation(
         await database.close()
 
 
+async def test_playback_rejects_stale_initial_progress_after_replacement(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings = config(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize(settings.allowed_users)
+    await database.record_progress(123, catalogue(), 3, 300.0, 1500, False)
+    raw_session, csrf = await database.create_web_session(
+        123,
+        {
+            "catalogue": catalogue(),
+            "episode": 3,
+            "start_position": 300.0,
+        },
+        ttl_seconds=600,
+    )
+    original_saved_position = database.saved_episode_position
+    reads = 0
+
+    async def replace_after_second_read(*args, **kwargs):
+        nonlocal reads
+        value = await original_saved_position(*args, **kwargs)
+        reads += 1
+        if reads == 2:
+            replacement = await database.create_playback(
+                123,
+                catalogue(),
+                3,
+                media_url="https://cdn.example/replacement.mp4",
+                media_headers={},
+                media_kind="mp4",
+                source_name="Replacement",
+                ttl_seconds=600,
+            )
+            assert await database.record_progress(
+                123,
+                catalogue(),
+                3,
+                500.0,
+                1500.0,
+                False,
+                playback_id=replacement.id,
+                playback_generation=replacement.generation,
+                observed_at_ms=3_000,
+                event_sequence=1,
+            )
+        return value
+
+    monkeypatch.setattr(database, "saved_episode_position", replace_after_second_read)
+    media = MediaGateway(settings, database)
+    app = web.Application(middlewares=[error_boundary, security_headers])
+    app[CONFIG_KEY] = settings
+    WebRoutes(settings, database, FakeCore(), media).register(app)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.post(
+            "/api/playback",
+            headers={
+                "Origin": settings.public_origin,
+                "X-CSRF-Token": csrf,
+                "Cookie": f"{settings.cookie_name}={raw_session}",
+            },
+        )
+
+        assert response.status == 409
+        assert await database.episode_position(123, catalogue(), 3) == 500.0
+    finally:
+        await client.close()
+        await database.close()
+
+
 async def test_source_change_keeps_saved_progress_and_selects_requested_source(
     tmp_path: Path,
 ) -> None:

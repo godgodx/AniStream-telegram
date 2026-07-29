@@ -894,10 +894,15 @@ class MediaGateway:
                     not upstream_failed,
                 )
         if upstream_failed and not client_disconnected:
-            # Headers may already have reached Caddy/browser. Closing the
-            # response instead of emitting a clean EOF makes the advertised
-            # length mismatch visible so HLS can retry the segment.
+            # Headers may already have reached Caddy/browser. force_close()
+            # only disables keep-alive; aiohttp can still append a clean
+            # chunked terminator when the handler returns. Abort the actual
+            # downstream transport so a truncated body is observable and the
+            # media client can retry it.
             response.force_close()
+            transport = getattr(request, "transport", None)
+            if transport is not None:
+                transport.abort()
         elif not client_disconnected:
             try:
                 await response.write_eof()
