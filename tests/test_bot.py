@@ -175,6 +175,7 @@ def test_only_id_handler_is_registered_on_public_router() -> None:
         "continue_watching",
         "watchlist",
         "manage_watchlist",
+        "watchlist_help",
         "delete_watchlist_entry",
         "search_watchlist_entry",
         "settings",
@@ -293,9 +294,13 @@ async def test_watch_list_button_replaces_menu_with_saved_titles() -> None:
     text = event.message.edit_text.await_args.args[0]
     keyboard = event.message.edit_text.await_args.kwargs["reply_markup"]
     assert text.startswith("⭐ Watch list")
-    assert keyboard.inline_keyboard[0][0].text == "🔎 Tokyo Ghoul"
+    assert keyboard.inline_keyboard[0][0].text == "🔎 Tokyo Ghoul · Search"
     assert keyboard.inline_keyboard[0][0].callback_data == "watchlist:search:7"
-    assert keyboard.inline_keyboard[1][0].callback_data == "watchlist:manage"
+    manage, back = keyboard.inline_keyboard[1]
+    assert manage.text == "⚙ Manage list"
+    assert manage.callback_data == "watchlist:manage"
+    assert back.text == "‹ Back"
+    assert back.callback_data == "menu:main"
 
 
 def test_watchlist_manage_keyboard_is_clear_and_user_scoped_by_id() -> None:
@@ -306,11 +311,40 @@ def test_watchlist_manage_keyboard_is_clear_and_user_scoped_by_id() -> None:
 
     remove = keyboard.inline_keyboard[0][0]
     assert remove.text.startswith("🗑 ")
-    assert len(remove.text) <= 62
+    assert remove.text.endswith(" · Remove")
+    assert len(remove.text) <= 60
     assert remove.callback_data == "watchlist:delete:42"
     assert remove.style == "danger"
-    assert keyboard.inline_keyboard[1][0].callback_data == "watchlist:open"
-    assert keyboard.inline_keyboard[2][0].callback_data == "menu:main"
+    done, menu = keyboard.inline_keyboard[1]
+    assert done.text == "✓ Done"
+    assert done.style == "primary"
+    assert done.callback_data == "watchlist:open"
+    assert menu.text == "🏠 Main menu"
+    assert menu.callback_data == "menu:main"
+
+
+def test_empty_watchlist_uses_a_balanced_two_action_footer() -> None:
+    keyboard = watchlist_keyboard([])
+
+    assert len(keyboard.inline_keyboard) == 1
+    help_button, menu = keyboard.inline_keyboard[0]
+    assert help_button.text == "❔ How to add"
+    assert help_button.callback_data == "watchlist:help"
+    assert menu.text == "🏠 Main menu"
+    assert menu.callback_data == "menu:main"
+
+
+@pytest.mark.asyncio
+async def test_watchlist_help_keeps_the_command_example_in_one_alert() -> None:
+    handlers = handler("https://watch.example")
+    event = callback()
+
+    await handlers.watchlist_help(event)
+
+    event.answer.assert_awaited_once_with(
+        "Send /watchlist followed by a title. Example: /watchlist Tokyo Ghoul",
+        show_alert=True,
+    )
 
 
 @pytest.mark.asyncio

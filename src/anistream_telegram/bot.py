@@ -146,11 +146,14 @@ def watchlist_keyboard(
     buttons: list[list[InlineKeyboardButton]] = []
     for entry in entries:
         entry_id = int(entry["id"])
-        title = button_label(entry["title"])
+        title = button_label_with_suffix(
+            f"🗑 {entry['title']}" if manage else f"🔎 {entry['title']}",
+            "Remove" if manage else "Search",
+        )
         buttons.append(
             [
                 InlineKeyboardButton(
-                    text=f"🗑 {title}" if manage else f"🔎 {title}",
+                    text=title,
                     callback_data=(
                         f"watchlist:delete:{entry_id}"
                         if manage
@@ -164,26 +167,41 @@ def watchlist_keyboard(
         buttons.append(
             [
                 InlineKeyboardButton(
-                    text="‹ Back to Watch list",
+                    text="✓ Done",
                     callback_data="watchlist:open",
-                )
+                    style="primary",
+                ),
+                InlineKeyboardButton(
+                    text="🏠 Main menu",
+                    callback_data="menu:main",
+                ),
             ]
         )
-    elif entries:
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
+    if entries:
         buttons.append(
             [
                 InlineKeyboardButton(
-                    text="🗑 Manage",
+                    text="⚙ Manage list",
                     callback_data="watchlist:manage",
-                )
+                ),
+                InlineKeyboardButton(
+                    text="‹ Back",
+                    callback_data="menu:main",
+                ),
             ]
         )
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
     buttons.append(
         [
             InlineKeyboardButton(
-                text="‹ Back to menu",
+                text="❔ How to add",
+                callback_data="watchlist:help",
+            ),
+            InlineKeyboardButton(
+                text="🏠 Main menu",
                 callback_data="menu:main",
-            )
+            ),
         ]
     )
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -365,6 +383,10 @@ class BotHandlers:
         self.protected_router.callback_query.register(
             self.manage_watchlist,
             F.data == "watchlist:manage",
+        )
+        self.protected_router.callback_query.register(
+            self.watchlist_help,
+            F.data == "watchlist:help",
         )
         self.protected_router.callback_query.register(
             self.delete_watchlist_entry,
@@ -637,6 +659,12 @@ class BotHandlers:
         await callback.answer()
         await self._render_watchlist(callback, manage=True)
 
+    async def watchlist_help(self, callback: CallbackQuery) -> None:
+        await callback.answer(
+            "Send /watchlist followed by a title. Example: /watchlist Tokyo Ghoul",
+            show_alert=True,
+        )
+
     async def _render_watchlist(
         self,
         callback: CallbackQuery,
@@ -647,20 +675,18 @@ class BotHandlers:
         if manage:
             text = (
                 "🗑 Manage Watch list\n\n"
-                "Tap a title to remove it from your list."
+                "Choose a title to remove:"
                 if entries
                 else
-                "🗑 Manage Watch list\n\nYour Watch list is already empty."
+                "🗑 Manage Watch list\n\nNo saved titles to remove."
             )
         else:
             text = (
-                "⭐ Watch list\n\n"
-                "Choose a saved title to search for it."
+                "⭐ Watch list\n\nChoose a title to search:"
                 if entries
                 else
                 "⭐ Watch list\n\n"
-                "Your list is empty.\n\n"
-                "Add a title with:\n/watchlist <title>"
+                "No saved titles yet. Add one anytime with /watchlist."
             )
         await self._replace_callback_message(
             callback,
