@@ -58,12 +58,12 @@ async def test_schema_versions_are_recorded_and_idempotent(tmp_path: Path) -> No
                     )
                 )
             )
-        assert versions == [1, 2, 3, 4]
+        assert versions == [1, 2, 3, 4, 5]
         await database.initialize()
         async with database.sessions() as session:
             assert list(
                 await session.scalars(select(SchemaMigration.version))
-            ) == [1, 2, 3, 4]
+            ) == [1, 2, 3, 4, 5]
     finally:
         await database.close()
 
@@ -187,6 +187,83 @@ async def test_provider_preferences_default_on_and_persist_per_user(
         assert await reopened.enabled_provider_ids(123, provider_ids) == provider_ids
     finally:
         await reopened.close()
+
+
+async def test_watchlist_is_normalized_persistent_and_user_scoped(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "db.sqlite"
+    database = await database_at(path)
+    try:
+        assert await database.add_to_watchlist(123, "Tokyo Ghoul") == "forbidden"
+        await database.set_allowed(123, True)
+        await database.set_allowed(999, True)
+        assert await database.add_to_watchlist(
+            123,
+            "  Tokyo   Ghoul  ",
+        ) == "added"
+        assert await database.add_to_watchlist(
+            123,
+            "TOKYO GHOUL",
+        ) == "exists"
+        assert await database.add_to_watchlist(999, "Another title") == "added"
+
+        entries = await database.list_watchlist(123)
+        assert [(item["id"], item["title"]) for item in entries] == [
+            (entries[0]["id"], "Tokyo Ghoul")
+        ]
+        assert await database.get_watchlist_entry(
+            999,
+            entries[0]["id"],
+        ) is None
+    finally:
+        await database.close()
+
+    reopened = await database_at(path)
+    try:
+        entries = await reopened.list_watchlist(123)
+        assert [item["title"] for item in entries] == ["Tokyo Ghoul"]
+        assert await reopened.remove_from_watchlist(
+            999,
+            entries[0]["id"],
+        ) is False
+        assert await reopened.remove_from_watchlist(
+            123,
+            entries[0]["id"],
+        ) is True
+        assert await reopened.list_watchlist(123) == []
+    finally:
+        await reopened.close()
+
+
+async def test_revoked_user_cannot_read_or_mutate_watchlist(tmp_path: Path) -> None:
+    database = await database_at(tmp_path / "db.sqlite")
+    try:
+        await database.set_allowed(123, True)
+        assert await database.add_to_watchlist(123, "Tokyo Ghoul") == "added"
+        entry_id = (await database.list_watchlist(123))[0]["id"]
+
+        await database.set_allowed(123, False)
+
+        assert await database.list_watchlist(123) == []
+        assert await database.get_watchlist_entry(123, entry_id) is None
+        assert await database.add_to_watchlist(123, "Another title") == "forbidden"
+        assert await database.remove_from_watchlist(123, entry_id) is False
+    finally:
+        await database.close()
+
+
+async def test_watchlist_limit_is_bounded(tmp_path: Path) -> None:
+    database = await database_at(tmp_path / "db.sqlite")
+    try:
+        await database.set_allowed(123, True)
+        assert await database.add_to_watchlist(123, "First", limit=1) == "added"
+        assert await database.add_to_watchlist(123, "Second", limit=1) == "full"
+        assert [item["title"] for item in await database.list_watchlist(123)] == [
+            "First"
+        ]
+    finally:
+        await database.close()
 
 
 async def test_selection_payload_updates_are_user_and_kind_scoped(

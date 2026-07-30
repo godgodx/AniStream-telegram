@@ -13,6 +13,7 @@ from anistream_telegram.bot import (
     button_label_with_suffix,
     main_keyboard,
     settings_keyboard,
+    watchlist_keyboard,
 )
 from anistream_telegram.limits import SlidingWindowLimiter
 
@@ -35,6 +36,14 @@ def handler(public_base_url: str) -> BotHandlers:
         ),
         toggle_provider_enabled=AsyncMock(return_value=False),
         update_selection_payload=AsyncMock(return_value=True),
+        normalize_watchlist_title=lambda title: (
+            " ".join(title.split()),
+            " ".join(title.split()).casefold(),
+        ),
+        add_to_watchlist=AsyncMock(return_value="added"),
+        list_watchlist=AsyncMock(return_value=[]),
+        get_watchlist_entry=AsyncMock(return_value=None),
+        remove_from_watchlist=AsyncMock(return_value=False),
     )
     instance.core = SimpleNamespace(
         provider_alias=lambda _provider_id: "Provider 1",
@@ -92,6 +101,7 @@ async def test_unlisted_user_is_always_blocked_by_protected_middleware() -> None
         telegram_message("/id@another_bot"),
         telegram_message("id"),
         telegram_message("/start"),
+        telegram_message("/watchlist Tokyo Ghoul"),
         telegram_message("/id", chat_type="group"),
         MagicMock(spec=CallbackQuery),
     ]
@@ -149,7 +159,13 @@ def test_only_id_handler_is_registered_on_public_router() -> None:
     protected_messages = {
         item.callback.__name__ for item in handlers.protected_router.message.handlers
     }
-    assert {"start", "help_command", "cancel", "search_query"} <= protected_messages
+    assert {
+        "start",
+        "help_command",
+        "watchlist_command",
+        "cancel",
+        "search_query",
+    } <= protected_messages
     protected_callbacks = {
         item.callback.__name__
         for item in handlers.protected_router.callback_query.handlers
@@ -157,7 +173,10 @@ def test_only_id_handler_is_registered_on_public_router() -> None:
     assert {
         "search_prompt",
         "continue_watching",
-        "watch_list_coming_soon",
+        "watchlist",
+        "manage_watchlist",
+        "delete_watchlist_entry",
+        "search_watchlist_entry",
         "settings",
         "toggle_autoplay",
         "manage_providers",
@@ -256,18 +275,130 @@ async def test_main_menu_replaces_the_clicked_message() -> None:
 
 
 @pytest.mark.asyncio
-async def test_watch_list_button_shows_coming_soon_alert_without_new_message() -> None:
+async def test_watch_list_button_replaces_menu_with_saved_titles() -> None:
     handlers = handler("https://watch.example")
+    handlers.database.list_watchlist = AsyncMock(
+        return_value=[
+            {"id": 7, "title": "Tokyo Ghoul", "created_at": "2026-07-30"}
+        ]
+    )
     event = callback()
 
-    await handlers.watch_list_coming_soon(event)
+    await handlers.watchlist(event)
 
-    event.answer.assert_awaited_once_with(
-        "Watch List is coming soon.",
-        show_alert=True,
-    )
+    event.answer.assert_awaited_once()
+    handlers.database.list_watchlist.assert_awaited_once_with(123)
     event.message.answer.assert_not_awaited()
-    event.message.edit_text.assert_not_awaited()
+    event.message.edit_text.assert_awaited_once()
+    text = event.message.edit_text.await_args.args[0]
+    keyboard = event.message.edit_text.await_args.kwargs["reply_markup"]
+    assert text.startswith("⭐ Watch list")
+    assert keyboard.inline_keyboard[0][0].text == "🔎 Tokyo Ghoul"
+    assert keyboard.inline_keyboard[0][0].callback_data == "watchlist:search:7"
+    assert keyboard.inline_keyboard[1][0].callback_data == "watchlist:manage"
+
+
+def test_watchlist_manage_keyboard_is_clear_and_user_scoped_by_id() -> None:
+    keyboard = watchlist_keyboard(
+        [{"id": 42, "title": "A very long title " * 8}],
+        manage=True,
+    )
+
+    remove = keyboard.inline_keyboard[0][0]
+    assert remove.text.startswith("🗑 ")
+    assert len(remove.text) <= 62
+    assert remove.callback_data == "watchlist:delete:42"
+    assert remove.style == "danger"
+    assert keyboard.inline_keyboard[1][0].callback_data == "watchlist:open"
+    assert keyboard.inline_keyboard[2][0].callback_data == "menu:main"
+
+
+@pytest.mark.asyncio
+async def test_watchlist_command_adds_a_clean_title_and_clears_search_state() -> None:
+    handlers = handler("https://watch.example")
+    message = SimpleNamespace(
+        text="/watchlist  «  Tokyo   Ghoul  » ",
+        chat=SimpleNamespace(type="private"),
+        from_user=SimpleNamespace(id=123),
+        answer=AsyncMock(),
+    )
+    state = SimpleNamespace(clear=AsyncMock())
+
+    await handlers.watchlist_command(message, state)
+
+    state.clear.assert_awaited_once()
+    handlers.database.add_to_watchlist.assert_awaited_once_with(123, "Tokyo Ghoul")
+    assert "was added" in message.answer.await_args.args[0]
+    keyboard = message.answer.await_args.kwargs["reply_markup"]
+    assert keyboard.inline_keyboard[0][0].callback_data == "watchlist:open"
+
+
+@pytest.mark.asyncio
+async def test_watchlist_command_requires_a_title_without_provider_work() -> None:
+    handlers = handler("https://watch.example")
+    message = SimpleNamespace(
+        text="/watchlist",
+        chat=SimpleNamespace(type="private"),
+        from_user=SimpleNamespace(id=123),
+        answer=AsyncMock(),
+    )
+    state = SimpleNamespace(clear=AsyncMock())
+
+    await handlers.watchlist_command(message, state)
+
+    handlers.database.add_to_watchlist.assert_not_awaited()
+    assert "/watchlist Tokyo Ghoul" in message.answer.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_manage_watchlist_removes_only_the_clicked_entry() -> None:
+    handlers = handler("https://watch.example")
+    handlers.database.remove_from_watchlist = AsyncMock(return_value=True)
+    handlers.database.list_watchlist = AsyncMock(return_value=[])
+    event = callback()
+    event.data = "watchlist:delete:42"
+
+    await handlers.delete_watchlist_entry(event)
+
+    handlers.database.remove_from_watchlist.assert_awaited_once_with(123, 42)
+    event.answer.assert_awaited_once_with("Removed from Watch list.")
+    text = event.message.edit_text.await_args.args[0]
+    assert text.startswith("🗑 Manage Watch list")
+
+
+@pytest.mark.asyncio
+async def test_watchlist_title_runs_the_existing_search_pipeline() -> None:
+    handlers = handler("https://watch.example")
+    handlers.database.get_watchlist_entry = AsyncMock(
+        return_value={"id": 7, "title": "Tokyo Ghoul"}
+    )
+    handlers.database.create_selection = AsyncMock(return_value="selection")
+    handlers.core.search = AsyncMock(
+        return_value=(
+            [
+                {
+                    "title": "Tokyo Ghoul",
+                    "provider_id": "anime_sama",
+                    "provider_alias": "Provider 1",
+                    "url": "https://example.test/tokyo-ghoul",
+                }
+            ],
+            [],
+        )
+    )
+    event = callback()
+    event.data = "watchlist:search:7"
+
+    await handlers.search_watchlist_entry(event)
+
+    handlers.database.get_watchlist_entry.assert_awaited_once_with(123, 7)
+    handlers.core.search.assert_awaited_once_with(
+        "Tokyo Ghoul",
+        actor_key=123,
+        provider_ids=("anime_sama", "french_stream"),
+    )
+    handlers.database.create_selection.assert_awaited_once()
+    assert "Results for" in event.message.edit_text.await_args_list[-1].args[0]
 
 
 @pytest.mark.asyncio

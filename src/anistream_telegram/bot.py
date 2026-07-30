@@ -138,6 +138,77 @@ def back_to_menu_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def watchlist_keyboard(
+    entries: list[dict[str, Any]],
+    *,
+    manage: bool = False,
+) -> InlineKeyboardMarkup:
+    buttons: list[list[InlineKeyboardButton]] = []
+    for entry in entries:
+        entry_id = int(entry["id"])
+        title = button_label(entry["title"])
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=f"🗑 {title}" if manage else f"🔎 {title}",
+                    callback_data=(
+                        f"watchlist:delete:{entry_id}"
+                        if manage
+                        else f"watchlist:search:{entry_id}"
+                    ),
+                    style="danger" if manage else None,
+                )
+            ]
+        )
+    if manage:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text="‹ Back to Watch list",
+                    callback_data="watchlist:open",
+                )
+            ]
+        )
+    elif entries:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text="🗑 Manage",
+                    callback_data="watchlist:manage",
+                )
+            ]
+        )
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="‹ Back to menu",
+                callback_data="menu:main",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def watchlist_added_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⭐ Open Watch list",
+                    callback_data="watchlist:open",
+                    style="primary",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⌂ Main menu",
+                    callback_data="menu:main",
+                )
+            ],
+        ]
+    )
+
+
 def settings_keyboard(autoplay_enabled: bool) -> InlineKeyboardMarkup:
     toggle = InlineKeyboardButton(
         text=(
@@ -239,6 +310,8 @@ HELP_TEXT = (
     "Find a title, then choose its provider, season, language and episode.\n\n"
     "▶ Continue watching\n"
     "Resume a saved episode from your last position.\n\n"
+    "⭐ Watch list\n"
+    "Save a title with /watchlist <title>, then search it again in one tap.\n\n"
     "🔒 Private access\n"
     "Playback is tied to your Telegram account and opens in the secure Mini App.\n\n"
     "Use /cancel at any time while entering a search."
@@ -268,6 +341,10 @@ class BotHandlers:
         )
         self.protected_router.message.register(self.start, CommandStart())
         self.protected_router.message.register(self.help_command, Command("help"))
+        self.protected_router.message.register(
+            self.watchlist_command,
+            Command("watchlist"),
+        )
         self.protected_router.message.register(self.cancel, Command("cancel"))
         self.protected_router.callback_query.register(
             self.search_prompt,
@@ -282,8 +359,20 @@ class BotHandlers:
             F.data == "menu:continue",
         )
         self.protected_router.callback_query.register(
-            self.watch_list_coming_soon,
-            F.data == "menu:watchlist",
+            self.watchlist,
+            (F.data == "menu:watchlist") | (F.data == "watchlist:open"),
+        )
+        self.protected_router.callback_query.register(
+            self.manage_watchlist,
+            F.data == "watchlist:manage",
+        )
+        self.protected_router.callback_query.register(
+            self.delete_watchlist_entry,
+            F.data.startswith("watchlist:delete:"),
+        )
+        self.protected_router.callback_query.register(
+            self.search_watchlist_entry,
+            F.data.startswith("watchlist:search:"),
         )
         self.protected_router.callback_query.register(
             self.settings,
@@ -501,8 +590,149 @@ class BotHandlers:
             back_to_menu_keyboard(),
         )
 
-    async def watch_list_coming_soon(self, callback: CallbackQuery) -> None:
-        await callback.answer("Watch List is coming soon.", show_alert=True)
+    async def watchlist_command(self, message: Message, state: FSMContext) -> None:
+        if message.chat.type != "private" or message.from_user is None:
+            return
+        await state.clear()
+        parts = (message.text or "").split(maxsplit=1)
+        title = parts[1].strip() if len(parts) == 2 else ""
+        if len(title) >= 2 and (title[0], title[-1]) in {
+            ('"', '"'),
+            ("“", "”"),
+            ("«", "»"),
+        }:
+            title = title[1:-1].strip()
+        clean_title, _ = self.database.normalize_watchlist_title(title)
+        if not 2 <= len(clean_title) <= 120:
+            await message.answer(
+                "⭐ Add to Watch list\n\n"
+                "Use /watchlist followed by a movie or series title.\n\n"
+                "Example:\n/watchlist Tokyo Ghoul",
+                reply_markup=watchlist_added_keyboard(),
+            )
+            return
+
+        result = await self.database.add_to_watchlist(
+            message.from_user.id,
+            clean_title,
+        )
+        if result == "forbidden":
+            return
+        if result == "full":
+            text = (
+                "⚠ Your Watch list is full.\n\n"
+                "Open Manage and remove a title before adding another."
+            )
+        elif result == "exists":
+            text = f"⭐ “{clean_title}” is already in your Watch list."
+        else:
+            text = f"✅ “{clean_title}” was added to your Watch list."
+        await message.answer(text, reply_markup=watchlist_added_keyboard())
+
+    async def watchlist(self, callback: CallbackQuery) -> None:
+        await callback.answer()
+        await self._render_watchlist(callback)
+
+    async def manage_watchlist(self, callback: CallbackQuery) -> None:
+        await callback.answer()
+        await self._render_watchlist(callback, manage=True)
+
+    async def _render_watchlist(
+        self,
+        callback: CallbackQuery,
+        *,
+        manage: bool = False,
+    ) -> None:
+        entries = await self.database.list_watchlist(callback.from_user.id)
+        if manage:
+            text = (
+                "🗑 Manage Watch list\n\n"
+                "Tap a title to remove it from your list."
+                if entries
+                else
+                "🗑 Manage Watch list\n\nYour Watch list is already empty."
+            )
+        else:
+            text = (
+                "⭐ Watch list\n\n"
+                "Choose a saved title to search for it."
+                if entries
+                else
+                "⭐ Watch list\n\n"
+                "Your list is empty.\n\n"
+                "Add a title with:\n/watchlist <title>"
+            )
+        await self._replace_callback_message(
+            callback,
+            text,
+            watchlist_keyboard(entries, manage=manage),
+        )
+
+    async def delete_watchlist_entry(self, callback: CallbackQuery) -> None:
+        try:
+            entry_id = int((callback.data or "").rsplit(":", 1)[1])
+            if entry_id <= 0:
+                raise ValueError
+        except (IndexError, ValueError):
+            await callback.answer("This Watch list entry is invalid.", show_alert=True)
+            return
+        removed = await self.database.remove_from_watchlist(
+            callback.from_user.id,
+            entry_id,
+        )
+        await callback.answer(
+            "Removed from Watch list." if removed else "Already removed."
+        )
+        await self._render_watchlist(callback, manage=True)
+
+    async def search_watchlist_entry(self, callback: CallbackQuery) -> None:
+        try:
+            entry_id = int((callback.data or "").rsplit(":", 1)[1])
+            if entry_id <= 0:
+                raise ValueError
+        except (IndexError, ValueError):
+            await callback.answer("This Watch list entry is invalid.", show_alert=True)
+            return
+        entry = await self.database.get_watchlist_entry(
+            callback.from_user.id,
+            entry_id,
+        )
+        if entry is None or callback.message is None:
+            await callback.answer(
+                "This title is no longer in your Watch list.",
+                show_alert=True,
+            )
+            return
+
+        profiles = self._provider_profiles()
+        provider_ids = tuple(str(profile["provider_id"]) for profile in profiles)
+        enabled_provider_ids = await self.database.enabled_provider_ids(
+            callback.from_user.id,
+            provider_ids,
+        )
+        if not enabled_provider_ids:
+            await callback.answer(
+                "Enable at least one provider before searching.",
+                show_alert=True,
+            )
+            await self._render_provider_settings(callback, profiles=profiles)
+            return
+        if not await self.provider_limiter.allow(str(callback.from_user.id)):
+            await callback.answer(
+                "Too many provider requests. Please wait a minute.",
+                show_alert=True,
+            )
+            return
+
+        await callback.answer()
+        query = str(entry["title"])
+        await callback.message.edit_text(f"🔎 Searching for “{query}”…")
+        await self._execute_search(
+            callback.message,
+            callback.from_user.id,
+            query,
+            enabled_provider_ids,
+        )
 
     async def settings(self, callback: CallbackQuery) -> None:
         await callback.answer()
@@ -686,10 +916,24 @@ class BotHandlers:
             flow_data,
             f"🔎 Searching for “{query}”…",
         )
+        await self._execute_search(
+            status,
+            message.from_user.id,
+            query,
+            enabled_provider_ids,
+        )
+
+    async def _execute_search(
+        self,
+        status: Message,
+        user_id: int,
+        query: str,
+        enabled_provider_ids: tuple[str, ...],
+    ) -> None:
         try:
             results, errors = await self.core.search(
                 query,
-                actor_key=message.from_user.id,
+                actor_key=user_id,
                 provider_ids=enabled_provider_ids,
             )
         except CapacityExceeded:
@@ -713,7 +957,7 @@ class BotHandlers:
             return
         search_payload = {"query": query, "results": results[:20]}
         selection_id = await self.database.create_selection(
-            message.from_user.id,
+            user_id,
             "search_results",
             search_payload,
             ttl_seconds=1200,
@@ -724,7 +968,7 @@ class BotHandlers:
             status,
             selection_id,
             search_payload,
-            message.from_user.id,
+            user_id,
         )
 
     async def _render_search_results(

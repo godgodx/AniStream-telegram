@@ -32,10 +32,13 @@ workflow.
   App session, API request, media request, and cast grant is bound to an allowed
   numeric Telegram user ID. The only public command is `/id`, which reveals
   only the sender's own ID for access requests.
-- **Clean native Telegram navigation** — Search, Continue Watching, Watch List
-  preview, Settings, Help, paginated episodes, anonymous provider attribution,
+- **Clean native Telegram navigation** — Search, Continue Watching, Watch List,
+  Settings, Help, paginated episodes, anonymous provider attribution,
   and breadcrumb-style Back buttons use styled inline keyboards that replace
   the current panel instead of flooding the conversation with new messages.
+- **Personal Watch List** — save up to 50 movie or series names with
+  `/watchlist <title>`, reopen the list from the main menu, search any saved
+  title in one tap, and remove entries from a dedicated Manage view.
 - **Personalized multi-provider search** — query only the catalogues enabled in
   the user's Settings and expose stable `Provider 1`, `Provider 2`, and
   subsequent aliases without revealing catalogue names in the Telegram
@@ -180,7 +183,7 @@ The main menu keeps the watch flow intentionally small:
 
 1. **Continue Watching** — reopen the last interrupted episode and position;
 2. **Search** — discover a title across every registered provider;
-3. **Watch List** — reserved for the upcoming personal watch list;
+3. **Watch List** — reopen, search, or manage personally saved titles;
 4. **Settings** — enable or disable next-episode autoplay;
 5. **Help** — explain access and playback behavior.
 
@@ -188,6 +191,8 @@ The main menu keeps the watch flow intentionally small:
 Whitelisted Telegram user
           |
           +--> Continue Watching -> per-user history -> launch exact episode
+          |
+          +--> Watch List -> saved title -> existing Search flow
           |
           `--> Search -> concurrent provider search
                          |
@@ -223,6 +228,21 @@ instead of issuing an empty upstream request.
 Season and language variants lead to a paginated episode keyboard. Every level
 includes a Back action so an accidental selection can be corrected without
 starting over.
+
+### Watch List
+
+Whitelisted users can save a movie or series name with:
+
+```text
+/watchlist Tokyo Ghoul
+```
+
+The Watch List button displays the account's saved names in newest-first order.
+Selecting one runs the normal Search flow with the user's currently enabled
+providers and the same request limits. **Manage** removes individual entries.
+Titles are normalized to avoid duplicate entries with different casing or
+spacing, capped at 50 per account, and never grant access to a revoked or
+unlisted Telegram user.
 
 ### Continue Watching
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+import unicodedata
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -84,6 +85,33 @@ class UserProviderPreference(Base):
     )
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+
+
+class WatchlistEntry(Base):
+    __tablename__ = "watchlist_entries"
+    __table_args__ = (
+        UniqueConstraint(
+            "telegram_user_id",
+            "normalized_title",
+            name="uq_watchlist_user_title",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    telegram_user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        index=True,
+        nullable=False,
+    )
+    title: Mapped[str] = mapped_column(String(120), nullable=False)
+    # Unicode case-folding can expand a title beyond its visible 120 characters.
+    normalized_title: Mapped[str] = mapped_column(String(384), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=utcnow,
+        index=True,
+        nullable=False,
+    )
 
 
 class EphemeralSelection(Base):
@@ -278,6 +306,7 @@ SCHEMA_MIGRATIONS = (
     (2, "ordered progress cursors"),
     (3, "active playback generations"),
     (4, "per-playback progress cursors"),
+    (5, "user watchlists"),
 )
 POSTGRES_MIGRATION_LOCK_ID = 4_712_958_475_264_321_857
 
@@ -321,6 +350,11 @@ def apply_schema_migrations(connection: Any) -> None:
             )
         elif version == 4:
             PlaybackProgressCursor.__table__.create(
+                connection,
+                checkfirst=True,
+            )
+        elif version == 5:
+            WatchlistEntry.__table__.create(
                 connection,
                 checkfirst=True,
             )
@@ -549,6 +583,139 @@ class Database:
             preference.enabled = not preference.enabled
             preference.updated_at = utcnow()
             return bool(preference.enabled)
+
+    @staticmethod
+    def normalize_watchlist_title(title: str) -> tuple[str, str]:
+        clean = " ".join(unicodedata.normalize("NFKC", title).split())
+        return clean, clean.casefold()
+
+    async def add_to_watchlist(
+        self,
+        user_id: int,
+        title: str,
+        *,
+        limit: int = 50,
+    ) -> str:
+        """Add one user-scoped title and return added, exists, full or forbidden."""
+
+        clean, normalized = self.normalize_watchlist_title(title)
+        if not 2 <= len(clean) <= 120:
+            raise ValueError("watchlist title must contain 2 to 120 characters")
+        async with self.sessions.begin() as session:
+            allowed = await session.scalar(
+                select(AllowedUser)
+                .where(AllowedUser.telegram_user_id == user_id)
+                .with_for_update()
+            )
+            if allowed is None or not allowed.enabled:
+                return "forbidden"
+            existing = await session.scalar(
+                select(WatchlistEntry.id).where(
+                    WatchlistEntry.telegram_user_id == user_id,
+                    WatchlistEntry.normalized_title == normalized,
+                )
+            )
+            if existing is not None:
+                return "exists"
+            entry_ids = list(
+                await session.scalars(
+                    select(WatchlistEntry.id)
+                    .where(WatchlistEntry.telegram_user_id == user_id)
+                    .limit(max(1, limit))
+                )
+            )
+            if len(entry_ids) >= limit:
+                return "full"
+            session.add(
+                WatchlistEntry(
+                    telegram_user_id=user_id,
+                    title=clean,
+                    normalized_title=normalized,
+                    created_at=utcnow(),
+                )
+            )
+            return "added"
+
+    async def list_watchlist(
+        self,
+        user_id: int,
+        *,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        async with self.sessions() as session:
+            entries = await session.scalars(
+                select(WatchlistEntry)
+                .join(
+                    AllowedUser,
+                    AllowedUser.telegram_user_id
+                    == WatchlistEntry.telegram_user_id,
+                )
+                .where(
+                    WatchlistEntry.telegram_user_id == user_id,
+                    AllowedUser.enabled.is_(True),
+                )
+                .order_by(
+                    WatchlistEntry.created_at.desc(),
+                    WatchlistEntry.id.desc(),
+                )
+                .limit(max(1, limit))
+            )
+            return [
+                {
+                    "id": entry.id,
+                    "title": entry.title,
+                    "created_at": entry.created_at.isoformat(),
+                }
+                for entry in entries
+            ]
+
+    async def get_watchlist_entry(
+        self,
+        user_id: int,
+        entry_id: int,
+    ) -> dict[str, Any] | None:
+        async with self.sessions() as session:
+            entry = await session.scalar(
+                select(WatchlistEntry)
+                .join(
+                    AllowedUser,
+                    AllowedUser.telegram_user_id
+                    == WatchlistEntry.telegram_user_id,
+                )
+                .where(
+                    WatchlistEntry.id == entry_id,
+                    WatchlistEntry.telegram_user_id == user_id,
+                    AllowedUser.enabled.is_(True),
+                )
+            )
+            if entry is None:
+                return None
+            return {
+                "id": entry.id,
+                "title": entry.title,
+                "created_at": entry.created_at.isoformat(),
+            }
+
+    async def remove_from_watchlist(
+        self,
+        user_id: int,
+        entry_id: int,
+    ) -> bool:
+        async with self.sessions.begin() as session:
+            allowed = await session.scalar(
+                select(AllowedUser)
+                .where(AllowedUser.telegram_user_id == user_id)
+                .with_for_update()
+            )
+            if allowed is None or not allowed.enabled:
+                return False
+            result = await session.execute(
+                delete(WatchlistEntry).where(
+                    WatchlistEntry.id == entry_id,
+                    WatchlistEntry.telegram_user_id == user_id,
+                )
+            )
+            return bool(result.rowcount)
 
     async def create_selection(
         self,
