@@ -686,7 +686,8 @@ class BotHandlers:
                 if entries
                 else
                 "⭐ Watch list\n\n"
-                "No saved titles yet. Add one anytime with /watchlist."
+                "No saved titles yet.\n\n"
+                "Use /watchlist to add one."
             )
         await self._replace_callback_message(
             callback,

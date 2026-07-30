@@ -335,6 +335,21 @@ def test_empty_watchlist_uses_a_balanced_two_action_footer() -> None:
 
 
 @pytest.mark.asyncio
+async def test_empty_watchlist_keeps_command_on_a_short_dedicated_line() -> None:
+    handlers = handler("https://watch.example")
+    handlers.database.list_watchlist = AsyncMock(return_value=[])
+    event = callback()
+
+    await handlers.watchlist(event)
+
+    assert event.message.edit_text.await_args.args[0] == (
+        "⭐ Watch list\n\n"
+        "No saved titles yet.\n\n"
+        "Use /watchlist to add one."
+    )
+
+
+@pytest.mark.asyncio
 async def test_watchlist_help_keeps_the_command_example_in_one_alert() -> None:
     handlers = handler("https://watch.example")
     event = callback()
