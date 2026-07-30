@@ -146,9 +146,10 @@ def watchlist_keyboard(
     buttons: list[list[InlineKeyboardButton]] = []
     for entry in entries:
         entry_id = int(entry["id"])
-        title = button_label_with_suffix(
-            f"🗑 {entry['title']}" if manage else f"🔎 {entry['title']}",
-            "Remove" if manage else "Search",
+        title = (
+            button_label_with_suffix(f"🗑 {entry['title']}", "Remove")
+            if manage
+            else button_label(f"🔎 {entry['title']}")
         )
         buttons.append(
             [

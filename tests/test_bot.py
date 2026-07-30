@@ -294,7 +294,7 @@ async def test_watch_list_button_replaces_menu_with_saved_titles() -> None:
     text = event.message.edit_text.await_args.args[0]
     keyboard = event.message.edit_text.await_args.kwargs["reply_markup"]
     assert text.startswith("⭐ Watch list")
-    assert keyboard.inline_keyboard[0][0].text == "🔎 Tokyo Ghoul · Search"
+    assert keyboard.inline_keyboard[0][0].text == "🔎 Tokyo Ghoul"
     assert keyboard.inline_keyboard[0][0].callback_data == "watchlist:search:7"
     manage, back = keyboard.inline_keyboard[1]
     assert manage.text == "⚙ Manage list"
