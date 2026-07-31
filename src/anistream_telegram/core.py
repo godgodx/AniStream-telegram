@@ -29,11 +29,12 @@ from anistream_telegram.source_health import SourceHealthTracker
 
 LOGGER = logging.getLogger(__name__)
 PREPARATION_DEADLINE_SECONDS = 40.0
-CANDIDATE_DEADLINE_SECONDS = 12.0
-# Current providers expose at most five candidates per episode. Eight slots let
-# every real candidate race while retaining a bounded process/memory ceiling if
-# an upstream catalogue is unexpectedly large.
-RESOLVER_PROCESS_LIMIT = 8
+CANDIDATE_DEADLINE_SECONDS = 20.0
+# Current providers expose at most five candidates per episode, but five spawned
+# Python interpreters plus the long-lived app exceeded the former 1 GiB
+# production cgroup. Three slots retain safety headroom even after increasing
+# the deployment limit and start queued fallbacks as soon as a resolver exits.
+RESOLVER_PROCESS_LIMIT = 3
 
 
 def _send_resolver_result(
@@ -221,9 +222,11 @@ class CoreService:
         self._resolver_user_agent = resolved_user_agent
         self._resolver_cookie = cookie
         self._resolver_context = multiprocessing.get_context("spawn")
-        # A single user can only prepare once concurrently. Two isolated
-        # resolvers still serve separate users without multiplying VPS memory
-        # by the four-request provider admission limit.
+        # Bound both complete candidate attempts and their disposable resolver
+        # processes. Waiting for a candidate slot must not consume that
+        # candidate's own resolve+probe deadline; the global preparation
+        # deadline still bounds the whole queue.
+        self._candidate_slots = asyncio.Semaphore(RESOLVER_PROCESS_LIMIT)
         self._resolver_slots = asyncio.Semaphore(RESOLVER_PROCESS_LIMIT)
         self._resolver_processes: set[Any] = set()
         self._resolver_tasks: set[asyncio.Task[Any]] = set()
@@ -448,57 +451,58 @@ class CoreService:
         source_index: int,
         source_count: int,
     ) -> tuple[ResolvedMedia, float, float, float]:
-        candidate_started = time.monotonic()
-        resolve_seconds = 0.0
-        probe_seconds = 0.0
-        try:
-            async with asyncio.timeout(CANDIDATE_DEADLINE_SECONDS):
-                resolve_started = time.monotonic()
-                media = await self._resolve_candidate(candidate.url)
-                resolve_seconds = time.monotonic() - resolve_started
-                self.source_health.bind(candidate.url, media.url)
-                cold_host = not self.source_health.has_recent_delivery(media.url)
-                probe_started = time.monotonic()
-                if self._async_probe is None:
-                    probe = await asyncio.to_thread(self.probe.probe, media)
-                else:
-                    probe = await self._async_probe(media, cold_host)
-                probe_seconds = time.monotonic() - probe_started
-                if not probe.valid:
-                    raise ValueError(probe.detail)
-            elapsed = time.monotonic() - candidate_started
-            self.source_health.observe(
-                candidate.url,
-                latency_seconds=elapsed,
-                success=True,
-            )
-            return (
-                replace(
-                    media,
-                    kind=probe.kind if probe.kind != "unknown" else media.kind,
-                    source_index=source_index,
-                    source_count=source_count,
-                    prefetched_playlist=probe.prefetched_playlist,
-                    prefetched_playlist_url=probe.prefetched_playlist_url,
-                ),
-                resolve_seconds,
-                probe_seconds,
-                elapsed,
-            )
-        except Exception as exc:
-            elapsed = time.monotonic() - candidate_started
-            self.source_health.observe(
-                candidate.url,
-                latency_seconds=elapsed,
-                success=False,
-            )
-            LOGGER.info(
-                "Playback source rejected source_index=%s seconds=%.3f error=%s",
-                source_index,
-                elapsed,
-                type(exc).__name__,
-            )
-            raise
+        async with self._candidate_slots:
+            candidate_started = time.monotonic()
+            resolve_seconds = 0.0
+            probe_seconds = 0.0
+            try:
+                async with asyncio.timeout(CANDIDATE_DEADLINE_SECONDS):
+                    resolve_started = time.monotonic()
+                    media = await self._resolve_candidate(candidate.url)
+                    resolve_seconds = time.monotonic() - resolve_started
+                    self.source_health.bind(candidate.url, media.url)
+                    cold_host = not self.source_health.has_recent_delivery(media.url)
+                    probe_started = time.monotonic()
+                    if self._async_probe is None:
+                        probe = await asyncio.to_thread(self.probe.probe, media)
+                    else:
+                        probe = await self._async_probe(media, cold_host)
+                    probe_seconds = time.monotonic() - probe_started
+                    if not probe.valid:
+                        raise ValueError(probe.detail)
+                elapsed = time.monotonic() - candidate_started
+                self.source_health.observe(
+                    candidate.url,
+                    latency_seconds=elapsed,
+                    success=True,
+                )
+                return (
+                    replace(
+                        media,
+                        kind=probe.kind if probe.kind != "unknown" else media.kind,
+                        source_index=source_index,
+                        source_count=source_count,
+                        prefetched_playlist=probe.prefetched_playlist,
+                        prefetched_playlist_url=probe.prefetched_playlist_url,
+                    ),
+                    resolve_seconds,
+                    probe_seconds,
+                    elapsed,
+                )
+            except Exception as exc:
+                elapsed = time.monotonic() - candidate_started
+                self.source_health.observe(
+                    candidate.url,
+                    latency_seconds=elapsed,
+                    success=False,
+                )
+                LOGGER.info(
+                    "Playback source rejected source_index=%s seconds=%.3f error=%s",
+                    source_index,
+                    elapsed,
+                    type(exc).__name__,
+                )
+                raise
 
     @staticmethod
     def _selected_media(

@@ -335,6 +335,61 @@ async def test_core_automatic_source_selection_races_all_candidates_and_cancels_
     ) == [1, 0, 2]
 
 
+async def test_queued_source_gets_its_full_candidate_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = CoreService()
+    payload = catalogue_payload(
+        Catalogue(
+            provider_id="provider",
+            provider_name="Provider",
+            title="Title",
+            url="https://provider.example/title",
+            season="Movie",
+            language=MediaLanguage("vf", "VF"),
+            episodes=(
+                Episode(
+                    1,
+                    tuple(
+                        EmbedCandidate(
+                            f"Player {index + 1}",
+                            f"https://source-{index}.example/embed",
+                        )
+                        for index in range(5)
+                    ),
+                ),
+            ),
+        )
+    )
+    monkeypatch.setattr(service.resolvers, "supports", lambda _url: True)
+    monkeypatch.setattr(core_module, "CANDIDATE_DEADLINE_SECONDS", 0.08)
+
+    async def resolve(url: str) -> ResolvedMedia:
+        source_index = int(url.split("source-", 1)[1].split(".", 1)[0])
+        async with service._resolver_slots:
+            if source_index < 3:
+                await asyncio.sleep(0.06)
+                raise RuntimeError("source unavailable")
+            await asyncio.sleep(0.04)
+            return ResolvedMedia(
+                f"{url}/video.mp4",
+                url,
+                "Test resolver",
+                {},
+                "mp4",
+            )
+
+    async def probe(_media: ResolvedMedia, _cold_host: bool) -> ProbeResult:
+        return ProbeResult(True, "mp4", "ok")
+
+    monkeypatch.setattr(service, "_resolve_candidate", resolve)
+    service.set_async_probe(probe)
+
+    media = await service.prepare_media(payload, 1, actor_key=123)
+
+    assert media.source_index in {3, 4}
+
+
 async def test_core_prefers_the_same_source_then_falls_back_for_next_episode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -399,6 +454,37 @@ async def test_core_prefers_the_same_source_then_falls_back_for_next_episode(
         "https://video.example/embed/working",
     ]
     assert media.source_index == 0
+
+
+async def test_resolver_concurrency_is_bounded_for_container_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = CoreService()
+    monkeypatch.setattr(
+        core_module,
+        "_resolver_process_entry",
+        _blocking_resolver_process,
+    )
+    resolutions = [
+        asyncio.create_task(
+            service._resolve_candidate(f"https://cdn.example/video-{index}.mp4")
+        )
+        for index in range(5)
+    ]
+    try:
+        for _ in range(100):
+            if len(service._resolver_processes) >= 3:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        assert len(service._resolver_processes) == 3
+    finally:
+        for resolution in resolutions:
+            resolution.cancel()
+        await asyncio.gather(*resolutions, return_exceptions=True)
+        await service.close()
+
+    assert service._resolver_processes == set()
 
 
 async def test_cancelled_resolver_workers_are_terminated_and_reaped(
