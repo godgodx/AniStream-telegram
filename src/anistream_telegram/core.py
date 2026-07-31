@@ -30,7 +30,10 @@ from anistream_telegram.source_health import SourceHealthTracker
 LOGGER = logging.getLogger(__name__)
 PREPARATION_DEADLINE_SECONDS = 40.0
 CANDIDATE_DEADLINE_SECONDS = 12.0
-RESOLVER_PROCESS_LIMIT = 2
+# Current providers expose at most five candidates per episode. Eight slots let
+# every real candidate race while retaining a bounded process/memory ceiling if
+# an upstream catalogue is unexpectedly large.
+RESOLVER_PROCESS_LIMIT = 8
 
 
 def _send_resolver_result(
@@ -439,6 +442,84 @@ class CoreService:
             [candidate.url for candidate in episode.candidates]
         )
 
+    async def _prepare_candidate(
+        self,
+        candidate: EmbedCandidate,
+        source_index: int,
+        source_count: int,
+    ) -> tuple[ResolvedMedia, float, float, float]:
+        candidate_started = time.monotonic()
+        resolve_seconds = 0.0
+        probe_seconds = 0.0
+        try:
+            async with asyncio.timeout(CANDIDATE_DEADLINE_SECONDS):
+                resolve_started = time.monotonic()
+                media = await self._resolve_candidate(candidate.url)
+                resolve_seconds = time.monotonic() - resolve_started
+                self.source_health.bind(candidate.url, media.url)
+                cold_host = not self.source_health.has_recent_delivery(media.url)
+                probe_started = time.monotonic()
+                if self._async_probe is None:
+                    probe = await asyncio.to_thread(self.probe.probe, media)
+                else:
+                    probe = await self._async_probe(media, cold_host)
+                probe_seconds = time.monotonic() - probe_started
+                if not probe.valid:
+                    raise ValueError(probe.detail)
+            elapsed = time.monotonic() - candidate_started
+            self.source_health.observe(
+                candidate.url,
+                latency_seconds=elapsed,
+                success=True,
+            )
+            return (
+                replace(
+                    media,
+                    kind=probe.kind if probe.kind != "unknown" else media.kind,
+                    source_index=source_index,
+                    source_count=source_count,
+                    prefetched_playlist=probe.prefetched_playlist,
+                    prefetched_playlist_url=probe.prefetched_playlist_url,
+                ),
+                resolve_seconds,
+                probe_seconds,
+                elapsed,
+            )
+        except Exception as exc:
+            elapsed = time.monotonic() - candidate_started
+            self.source_health.observe(
+                candidate.url,
+                latency_seconds=elapsed,
+                success=False,
+            )
+            LOGGER.info(
+                "Playback source rejected source_index=%s seconds=%.3f error=%s",
+                source_index,
+                elapsed,
+                type(exc).__name__,
+            )
+            raise
+
+    @staticmethod
+    def _selected_media(
+        prepared: tuple[ResolvedMedia, float, float, float],
+        *,
+        total_seconds: float,
+    ) -> ResolvedMedia:
+        media, resolve_seconds, probe_seconds, elapsed = prepared
+        LOGGER.info(
+            "Playback source selected source_index=%s candidates=%s "
+            "resolve_seconds=%.3f probe_seconds=%.3f "
+            "candidate_seconds=%.3f total_seconds=%.3f",
+            media.source_index,
+            media.source_count,
+            resolve_seconds,
+            probe_seconds,
+            elapsed,
+            total_seconds,
+        )
+        return media
+
     async def _prepare_media(
         self,
         payload: dict[str, Any],
@@ -465,82 +546,79 @@ class CoreService:
                     raise ValueError("source is outside the available range")
                 preferred_source_index = None
 
+        ranked = self.source_health.rank_urls(
+            [candidate.url for candidate in supported]
+        )
         if preferred_source_index is None:
-            source_order = self.source_health.rank_urls(
-                [candidate.url for candidate in supported]
-            )
+            source_order = ranked
         else:
-            ranked = self.source_health.rank_urls(
-                [candidate.url for candidate in supported]
-            )
             ranked.remove(preferred_source_index)
             source_order = [preferred_source_index, *ranked]
             if not fallback_from_preferred:
                 source_order = source_order[:1]
 
-        errors: list[str] = []
-        for source_index in source_order:
-            candidate = supported[source_index]
-            candidate_started = time.monotonic()
-            resolve_seconds = 0.0
-            probe_seconds = 0.0
-            try:
-                async with asyncio.timeout(CANDIDATE_DEADLINE_SECONDS):
-                    resolve_started = time.monotonic()
-                    media = await self._resolve_candidate(candidate.url)
-                    resolve_seconds = time.monotonic() - resolve_started
-                    self.source_health.bind(candidate.url, media.url)
-                    cold_host = not self.source_health.has_recent_delivery(
-                        media.url
+        errors: dict[int, Exception] = {}
+        if preferred_source_index is not None:
+            # Explicit source selection must remain deterministic. The preferred
+            # source is tried first; only an opted-in fallback checks the rest.
+            for source_index in source_order:
+                candidate = supported[source_index]
+                try:
+                    prepared = await self._prepare_candidate(
+                        candidate,
+                        source_index,
+                        len(supported),
                     )
-                    if self._async_probe is None:
-                        probe_started = time.monotonic()
-                        probe = await asyncio.to_thread(self.probe.probe, media)
-                    else:
-                        probe_started = time.monotonic()
-                        probe = await self._async_probe(media, cold_host)
-                    probe_seconds = time.monotonic() - probe_started
-                    if not probe.valid:
-                        raise ValueError(probe.detail)
-                elapsed = time.monotonic() - candidate_started
-                self.source_health.observe(
-                    candidate.url,
-                    latency_seconds=elapsed,
-                    success=True,
+                except Exception as exc:
+                    errors[source_index] = exc
+                    continue
+                return self._selected_media(
+                    prepared,
+                    total_seconds=time.monotonic() - started,
                 )
-                LOGGER.info(
-                    "Playback source selected source_index=%s candidates=%s "
-                    "resolve_seconds=%.3f probe_seconds=%.3f "
-                    "candidate_seconds=%.3f total_seconds=%.3f",
-                    source_index,
-                    len(supported),
-                    resolve_seconds,
-                    probe_seconds,
-                    elapsed,
-                    time.monotonic() - started,
+        else:
+            async def attempt(
+                source_index: int,
+            ) -> tuple[
+                int,
+                tuple[ResolvedMedia, float, float, float] | None,
+                Exception | None,
+            ]:
+                try:
+                    prepared = await self._prepare_candidate(
+                        supported[source_index],
+                        source_index,
+                        len(supported),
+                    )
+                    return source_index, prepared, None
+                except Exception as exc:
+                    return source_index, None, exc
+
+            tasks = [
+                asyncio.create_task(
+                    attempt(source_index),
+                    name=f"anistream-source-{source_index}",
                 )
-                return replace(
-                    media,
-                    kind=probe.kind if probe.kind != "unknown" else media.kind,
-                    source_index=source_index,
-                    source_count=len(supported),
-                    prefetched_playlist=probe.prefetched_playlist,
-                    prefetched_playlist_url=probe.prefetched_playlist_url,
-                )
-            except Exception as exc:
-                elapsed = time.monotonic() - candidate_started
-                self.source_health.observe(
-                    candidate.url,
-                    latency_seconds=elapsed,
-                    success=False,
-                )
-                errors.append(f"{candidate.player}: {exc}")
-                LOGGER.info(
-                    "Playback source rejected source_index=%s seconds=%.3f error=%s",
-                    source_index,
-                    elapsed,
-                    type(exc).__name__,
-                )
+                for source_index in source_order
+            ]
+            try:
+                for completed in asyncio.as_completed(tasks):
+                    source_index, prepared, error = await completed
+                    if error is not None:
+                        errors[source_index] = error
+                        continue
+                    if prepared is None:  # pragma: no cover - outcome invariant.
+                        raise RuntimeError("source attempt returned no result")
+                    return self._selected_media(
+                        prepared,
+                        total_seconds=time.monotonic() - started,
+                    )
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
         prefix = (
             "selected source failed: "
             if preferred_source_index is not None and not fallback_from_preferred
@@ -549,4 +627,9 @@ class CoreService:
         self.source_health.forget_urls(
             [candidate.url for candidate in supported]
         )
-        raise RuntimeError(prefix + "; ".join(errors))
+        details = "; ".join(
+            f"{supported[source_index].player}: {errors[source_index]}"
+            for source_index in source_order
+            if source_index in errors
+        )
+        raise RuntimeError(prefix + details)

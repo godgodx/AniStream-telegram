@@ -253,6 +253,88 @@ async def test_core_automatic_source_fallback_checks_each_candidate_once(
     assert media.source_count == 2
 
 
+async def test_core_automatic_source_selection_races_all_candidates_and_cancels_losers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = CoreService()
+    payload = catalogue_payload(
+        Catalogue(
+            provider_id="provider",
+            provider_name="Provider",
+            title="Title",
+            url="https://provider.example/title",
+            season="Movie",
+            language=MediaLanguage("vf", "VF"),
+            episodes=(
+                Episode(
+                    1,
+                    (
+                        EmbedCandidate("Slow player", "https://slow.example/embed"),
+                        EmbedCandidate("Working player", "https://working.example/embed"),
+                        EmbedCandidate("Other slow player", "https://other.example/embed"),
+                    ),
+                ),
+            ),
+        )
+    )
+    started: set[str] = set()
+    cancelled: set[str] = set()
+    all_started = asyncio.Event()
+
+    monkeypatch.setattr(service.resolvers, "supports", lambda _url: True)
+
+    async def resolve(url: str) -> ResolvedMedia:
+        started.add(url)
+        if len(started) == 3:
+            all_started.set()
+        await all_started.wait()
+        if "working.example" in url:
+            return ResolvedMedia(
+                f"{url}/video.mp4",
+                url,
+                "Test resolver",
+                {},
+                "mp4",
+            )
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.add(url)
+            raise
+        raise AssertionError("slow resolver unexpectedly resumed")
+
+    async def probe(media: ResolvedMedia, _cold_host: bool) -> ProbeResult:
+        assert "working.example" in media.url
+        return ProbeResult(True, "mp4", "ok")
+
+    monkeypatch.setattr(service, "_resolve_candidate", resolve)
+    service.set_async_probe(probe)
+
+    media = await asyncio.wait_for(
+        service.prepare_media(payload, 1, actor_key=123),
+        timeout=0.5,
+    )
+
+    assert started == {
+        "https://slow.example/embed",
+        "https://working.example/embed",
+        "https://other.example/embed",
+    }
+    assert cancelled == {
+        "https://slow.example/embed",
+        "https://other.example/embed",
+    }
+    assert media.source_index == 1
+    assert media.source_count == 3
+    assert service.source_health.rank_urls(
+        [
+            "https://slow.example/embed",
+            "https://working.example/embed",
+            "https://other.example/embed",
+        ]
+    ) == [1, 0, 2]
+
+
 async def test_core_prefers_the_same_source_then_falls_back_for_next_episode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
