@@ -4,6 +4,7 @@ import {
   progressPersistenceAccepted,
   runCurrentPlaybackCompletion,
   sleepModeConfigurationChanged,
+  sleepModeStatusText,
 } from "./playback-policy.js";
 
 const telegram = window.Telegram?.WebApp;
@@ -713,15 +714,10 @@ function updateSourceUi(info) {
 function updateAutoplayUi(info) {
   const isSeries = Number(info.total_episodes) > 1;
   autoplayStatus.hidden = !isSeries;
-  if (info.autoplay_enabled === false) {
-    autoplayStatus.textContent = "Autoplay next is off";
-  } else if (info.sleep_mode_enabled === true) {
-    const count = Math.max(1, Number(info.sleep_mode_episodes) || 3);
-    const episodeLabel = `${count} ${count === 1 ? "episode" : "episodes"}`;
-    autoplayStatus.textContent = `Autoplay on · Sleep after ${episodeLabel}`;
-  } else {
-    autoplayStatus.textContent = "Autoplay next is on";
-  }
+  autoplayStatus.textContent = sleepModeStatusText(
+    info,
+    sleepModeCompletedEpisodes,
+  );
 }
 
 function updateEpisodeUi(info) {
@@ -774,6 +770,7 @@ function hideSleepPrompt({ resetCounter = false } = {}) {
 
 function resetSleepModeCounter() {
   hideSleepPrompt({ resetCounter: true });
+  if (currentInfo) updateAutoplayUi(currentInfo);
 }
 
 function showSleepPrompt(info) {
@@ -1846,17 +1843,47 @@ video.addEventListener("seeked", () => {
   }
 });
 
+function browserFullscreenElement() {
+  return document.fullscreenElement || document.webkitFullscreenElement || null;
+}
+
+function updateFullscreenUi() {
+  const active = telegram?.isFullscreen === true || Boolean(browserFullscreenElement());
+  fullscreen.setAttribute("aria-label", active ? "Exit fullscreen" : "Enter fullscreen");
+  fullscreen.setAttribute("aria-pressed", String(active));
+}
+
 fullscreen.addEventListener("click", async () => {
   try {
-    if (telegram?.requestFullscreen) {
-      telegram.requestFullscreen();
-    } else if (video.requestFullscreen) {
+    if (typeof telegram?.requestFullscreen === "function") {
+      if (
+        telegram.isFullscreen === true &&
+        typeof telegram.exitFullscreen === "function"
+      ) {
+        telegram.exitFullscreen();
+      } else {
+        telegram.requestFullscreen();
+      }
+    } else if (browserFullscreenElement()) {
+      if (typeof document.exitFullscreen === "function") {
+        await document.exitFullscreen();
+      } else if (typeof document.webkitExitFullscreen === "function") {
+        document.webkitExitFullscreen();
+      }
+    } else if (typeof video.requestFullscreen === "function") {
       await video.requestFullscreen();
+    } else if (typeof video.webkitRequestFullscreen === "function") {
+      video.webkitRequestFullscreen();
     }
   } catch {
     // Fullscreen is optional and platform-dependent.
   }
 });
+
+telegram?.onEvent?.("fullscreenChanged", updateFullscreenUi);
+document.addEventListener("fullscreenchange", updateFullscreenUi);
+document.addEventListener("webkitfullscreenchange", updateFullscreenUi);
+updateFullscreenUi();
 
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") {

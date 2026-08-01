@@ -32,6 +32,24 @@ test("close completion and Sleep Mode policy are wired into player lifecycle", (
   );
 });
 
+test("the episode navigation shows the live Sleep Mode countdown", () => {
+  const html = source("index.html");
+  const script = source("src/main.js");
+  assert.match(html, /id="autoplay-status">Sleep mode: off</);
+  assert.match(script, /sleepModeStatusText\([\s\S]*sleepModeCompletedEpisodes/);
+});
+
+test("the fullscreen button toggles both Telegram and browser fullscreen", () => {
+  const html = source("index.html");
+  const script = source("src/main.js");
+  assert.match(html, /id="fullscreen"[\s\S]*aria-pressed="false"/);
+  assert.match(script, /telegram\.isFullscreen === true/);
+  assert.match(script, /telegram\.exitFullscreen\(\)/);
+  assert.match(script, /telegram\.requestFullscreen\(\)/);
+  assert.match(script, /document\.exitFullscreen\(\)/);
+  assert.match(script, /"fullscreenChanged", updateFullscreenUi/);
+});
+
 test("a failed completion is retried and confirmed before Next navigates", () => {
   const script = source("src/main.js");
   assert.match(script, /pendingCompletionRetry/);

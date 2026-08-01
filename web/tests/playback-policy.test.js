@@ -7,6 +7,7 @@ import {
   progressPersistenceAccepted,
   runCurrentPlaybackCompletion,
   sleepModeConfigurationChanged,
+  sleepModeStatusText,
 } from "../src/playback-policy.js";
 
 const finalEpisode = {
@@ -67,6 +68,29 @@ test("sleep mode pauses autoplay after the configured consecutive episode count"
     completedEpisodes: 3,
     shouldPause: true,
   });
+});
+
+test("sleep mode status counts down and marks the final episode before pausing", () => {
+  const active = { ...finalEpisode, episode: 9, has_next: true };
+  assert.equal(sleepModeStatusText(active, 0), "Sleep mode: 3");
+  assert.equal(sleepModeStatusText(active, 1), "Sleep mode: 2");
+  assert.equal(sleepModeStatusText(active, 2), "Sleep mode: last");
+  assert.equal(
+    sleepModeStatusText({ ...active, sleep_mode_enabled: false }, 0),
+    "Sleep mode: off",
+  );
+});
+
+test("sleep mode status safely handles a one-episode limit and invalid counters", () => {
+  const active = {
+    ...finalEpisode,
+    episode: 9,
+    has_next: true,
+    sleep_mode_episodes: 1,
+  };
+  assert.equal(sleepModeStatusText(active, 0), "Sleep mode: last");
+  assert.equal(sleepModeStatusText(active, -4), "Sleep mode: last");
+  assert.equal(sleepModeStatusText(active, "invalid"), "Sleep mode: last");
 });
 
 test("sleep mode is inert for movies, final episodes, disabled autoplay, or disabled mode", () => {

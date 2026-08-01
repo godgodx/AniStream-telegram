@@ -46,6 +46,24 @@ export function sleepModeConfigurationChanged(previousInfo, nextInfo) {
   );
 }
 
+export function sleepModeStatusText(info, completedEpisodesValue) {
+  if (info?.sleep_mode_enabled !== true) return "Sleep mode: off";
+
+  const completedEpisodes = Math.max(
+    0,
+    Number.isInteger(Number(completedEpisodesValue))
+      ? Number(completedEpisodesValue)
+      : 0,
+  );
+  const remainingEpisodes = Math.max(
+    1,
+    sleepModeEpisodeLimit(info.sleep_mode_episodes) - completedEpisodes,
+  );
+  return remainingEpisodes === 1
+    ? "Sleep mode: last"
+    : `Sleep mode: ${remainingEpisodes}`;
+}
+
 export function progressPersistenceAccepted(response) {
   return response?.accepted === true;
 }

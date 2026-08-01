@@ -231,7 +231,10 @@ video {
 #autoplay-status {
   color: var(--tg-theme-hint-color, #9ba4b5);
   font-size: 0.78rem;
+  font-weight: 600;
+  line-height: 1.3;
   text-align: center;
+  white-space: nowrap;
 }
 
 .stream-controls {
