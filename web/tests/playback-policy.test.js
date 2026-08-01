@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   completionOnClose,
   nextSleepModeState,
+  progressPersistenceAccepted,
   runCurrentPlaybackCompletion,
   sleepModeConfigurationChanged,
 } from "../src/playback-policy.js";
@@ -180,4 +181,40 @@ test("a completion never advances when persistence fails", async () => {
     false,
   );
   assert.deepEqual(applied, []);
+});
+
+test("progress persistence requires the server to accept the write", () => {
+  assert.equal(progressPersistenceAccepted({ ok: true, accepted: true }), true);
+  assert.equal(progressPersistenceAccepted({ ok: true, accepted: false }), false);
+  assert.equal(progressPersistenceAccepted({ ok: true }), false);
+  assert.equal(progressPersistenceAccepted(null), false);
+});
+
+test("a delayed completion uses the latest autoplay preferences", async () => {
+  const completion = {
+    playbackId: "playback-1",
+    playbackGeneration: 1,
+    workflowEpoch: 4,
+    info: { episode: 3, autoplay_enabled: true },
+  };
+  const currentPlayback = {
+    playbackId: "playback-1",
+    playbackGeneration: 1,
+    workflowEpoch: 4,
+    info: { episode: 3, autoplay_enabled: false },
+  };
+  let appliedAutoplayPreference = null;
+
+  assert.equal(
+    await runCurrentPlaybackCompletion({
+      completion,
+      persist: async () => true,
+      current: () => currentPlayback,
+      apply: async (info) => {
+        appliedAutoplayPreference = info.autoplay_enabled;
+      },
+    }),
+    true,
+  );
+  assert.equal(appliedAutoplayPreference, false);
 });

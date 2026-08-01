@@ -1,6 +1,7 @@
 import {
   completionOnClose,
   nextSleepModeState,
+  progressPersistenceAccepted,
   runCurrentPlaybackCompletion,
   sleepModeConfigurationChanged,
 } from "./playback-policy.js";
@@ -71,6 +72,7 @@ let resumeAfterBfcacheRestore = false;
 let sleepModeCompletedEpisodes = 0;
 let sleepPromptInfo = null;
 let playbackWorkflowEpoch = 0;
+let pendingCompletionRetry = null;
 
 performance.mark?.("anistream-init");
 
@@ -317,12 +319,12 @@ async function saveProgress(
   lastSavedAt = now;
   lastSavedPlaybackId = targetPlaybackId;
   try {
-    await api("/api/progress", {
+    const result = await api("/api/progress", {
       method: "POST",
       body: JSON.stringify(snapshot),
       keepalive: force,
     });
-    return true;
+    return progressPersistenceAccepted(result);
   } catch {
     // A transient progress failure must never interrupt playback.
     return false;
@@ -729,6 +731,7 @@ function updateEpisodeUi(info) {
     hideSleepPrompt();
   }
   currentInfo = info;
+  pendingCompletionRetry = null;
   playbackId = info.playback_id;
   playbackGeneration = Math.max(
     0,
@@ -807,11 +810,13 @@ async function handleCompletedEpisode(info, { cast = false } = {}) {
   }
 }
 
-function capturePlaybackCompletion(info) {
+function capturePlaybackCompletion(info, observation = reliablePlaybackPosition()) {
   return {
     playbackId: info.playback_id,
     playbackGeneration,
     workflowEpoch: playbackWorkflowEpoch,
+    position: observation.position,
+    duration: observation.duration,
     info: { ...info },
   };
 }
@@ -821,6 +826,7 @@ function currentPlaybackCompletion() {
     playbackId,
     playbackGeneration,
     workflowEpoch: playbackWorkflowEpoch,
+    info: currentInfo ? { ...currentInfo } : null,
   };
 }
 
@@ -836,9 +842,31 @@ function playbackCompletionIsStillCurrent(completion) {
 function handleCompletionSaveFailure(completion) {
   if (!playbackCompletionIsStillCurrent(completion)) return;
   completed = false;
+  pendingCompletionRetry = completion;
   setCastStatus(
     "Completion could not be saved. Choose Next episode to retry safely.",
   );
+}
+
+async function retryPendingCompletion() {
+  const completion = pendingCompletionRetry;
+  if (!completion || !playbackCompletionIsStillCurrent(completion)) return true;
+  const persisted = await saveProgress(
+    true,
+    true,
+    completion.position,
+    completion.duration,
+    completion.playbackId,
+  );
+  if (!persisted) {
+    showError(
+      "Completion still could not be saved. Check your connection and choose Next to retry.",
+    );
+    return false;
+  }
+  completed = true;
+  pendingCompletionRetry = null;
+  return true;
 }
 
 function attachPlayer(
@@ -1070,7 +1098,13 @@ function attachPlayer(
       const transitioned = await runCurrentPlaybackCompletion({
         completion,
         persist: () =>
-          saveProgress(true, true, null, null, completion.playbackId),
+          saveProgress(
+            true,
+            true,
+            completion.position,
+            completion.duration,
+            completion.playbackId,
+          ),
         current: currentPlaybackCompletion,
         apply: (finishedInfo) => handleCompletedEpisode(finishedInfo),
       });
@@ -1249,9 +1283,12 @@ async function handleRemoteCastFinished() {
     remotePlayer.playerState === window.chrome.cast.media.PlayerState.IDLE &&
     mediaSession?.idleReason === window.chrome.cast.media.IdleReason.FINISHED;
   if (!finished) return;
-  const completion = capturePlaybackCompletion(currentInfo);
   const finishedPosition = remotePlayer.currentTime;
   const finishedDuration = remotePlayer.duration;
+  const completion = capturePlaybackCompletion(currentInfo, {
+    position: finishedPosition,
+    duration: finishedDuration,
+  });
   castEndHandled = true;
   completed = true;
   const transitioned = await runCurrentPlaybackCompletion({
@@ -1414,7 +1451,15 @@ async function changeEpisode(targetEpisode, { autoplay = false } = {}) {
   ) {
     return;
   }
-  playbackWorkflowEpoch += 1;
+  const shouldRetryCompletion = Boolean(
+    pendingCompletionRetry &&
+      target === Number(currentInfo.episode) + 1 &&
+      playbackCompletionIsStillCurrent(pendingCompletionRetry),
+  );
+  if (!shouldRetryCompletion) {
+    pendingCompletionRetry = null;
+    playbackWorkflowEpoch += 1;
+  }
   changingEpisode = true;
   previous.disabled = true;
   next.disabled = true;
@@ -1423,7 +1468,14 @@ async function changeEpisode(targetEpisode, { autoplay = false } = {}) {
   loading.hidden = false;
   status.textContent = `Preparing episode ${target}…`;
   try {
-    if (!completed) {
+    if (shouldRetryCompletion) {
+      if (!(await retryPendingCompletion())) {
+        previous.disabled = !currentInfo.has_previous;
+        next.disabled = !currentInfo.has_next;
+        return;
+      }
+      playbackWorkflowEpoch += 1;
+    } else if (!completed) {
       if (googleCastConnected() && remotePlayer?.isMediaLoaded) {
         await saveProgress(
           true,

@@ -46,6 +46,10 @@ export function sleepModeConfigurationChanged(previousInfo, nextInfo) {
   );
 }
 
+export function progressPersistenceAccepted(response) {
+  return response?.accepted === true;
+}
+
 function playbackCompletionIsCurrent(completion, current) {
   return (
     completion?.playbackId === current?.playbackId &&
@@ -62,8 +66,9 @@ export async function runCurrentPlaybackCompletion({
 }) {
   const persisted = await persist();
   if (persisted !== true) return false;
-  if (!playbackCompletionIsCurrent(completion, current())) return false;
-  await apply(completion.info);
+  const latest = current();
+  if (!playbackCompletionIsCurrent(completion, latest)) return false;
+  await apply(latest.info || completion.info);
   return true;
 }
 

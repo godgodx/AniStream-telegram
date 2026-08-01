@@ -31,3 +31,10 @@ test("close completion and Sleep Mode policy are wired into player lifecycle", (
     "local and Cast completion paths must both revalidate playback identity",
   );
 });
+
+test("a failed completion is retried and confirmed before Next navigates", () => {
+  const script = source("src/main.js");
+  assert.match(script, /pendingCompletionRetry/);
+  assert.match(script, /retryPendingCompletion/);
+  assert.match(script, /Completion still could not be saved/);
+});
