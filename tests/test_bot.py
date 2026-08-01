@@ -5,6 +5,7 @@ import pytest
 from aiogram.types import CallbackQuery, Message
 
 from anistream_telegram.bot import (
+    HELP_TEXT,
     MAIN_MENU_TEXT,
     BotHandlers,
     PublicIdCommandFilter,
@@ -68,6 +69,13 @@ def handler(public_base_url: str) -> BotHandlers:
     )
     instance.provider_limiter = SlidingWindowLimiter(1_000, 60)
     return instance
+
+
+def test_help_text_documents_sleep_mode_and_close_completion() -> None:
+    assert "Sleep Mode" in HELP_TEXT
+    assert "consecutive episodes" in HELP_TEXT
+    assert "ten minutes or less remaining" in HELP_TEXT
+    assert "Other episodes keep their saved position" in HELP_TEXT
 
 
 def callback() -> SimpleNamespace:
