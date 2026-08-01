@@ -85,6 +85,31 @@
           <span class="spinner" aria-hidden="true"></span>
           <span id="status">Authenticating with Telegram…</span>
         </div>
+        <dialog
+          id="sleep-prompt"
+          class="sleep-prompt"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="sleep-prompt-title"
+          aria-describedby="sleep-prompt-copy"
+        >
+          <div class="sleep-prompt-card">
+            <span class="sleep-prompt-icon" aria-hidden="true">🌙</span>
+            <p class="sleep-prompt-eyebrow">SLEEP MODE</p>
+            <h2 id="sleep-prompt-title">Still watching?</h2>
+            <p id="sleep-prompt-copy">
+              Autoplay paused after your selected number of episodes.
+            </p>
+            <div class="sleep-prompt-actions">
+              <button id="sleep-continue" class="sleep-continue" type="button">
+                Continue watching
+              </button>
+              <button id="sleep-stop" class="sleep-stop" type="button">
+                Stop for now
+              </button>
+            </div>
+          </div>
+        </dialog>
       </section>
 
       <section class="episode-controls" aria-label="Episode navigation">

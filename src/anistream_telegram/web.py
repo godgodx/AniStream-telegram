@@ -388,6 +388,9 @@ class WebRoutes:
         autoplay_enabled = await self.database.autoplay_enabled(
             session.telegram_user_id
         )
+        sleep_mode_enabled, sleep_mode_episodes = await self.database.sleep_mode(
+            session.telegram_user_id
+        )
         return {
             "playback_id": playback.id,
             "playback_generation": max(
@@ -405,6 +408,8 @@ class WebRoutes:
             "has_previous": episode > 1,
             "has_next": episode < total,
             "autoplay_enabled": autoplay_enabled,
+            "sleep_mode_enabled": sleep_mode_enabled,
+            "sleep_mode_episodes": sleep_mode_episodes,
             "start_position": max(0.0, float(start_position or 0.0)),
             "title": str(catalogue.get("title", ""))[:200],
             "season": str(catalogue.get("season", ""))[:100],
@@ -678,6 +683,9 @@ class WebRoutes:
 
     async def session_info(self, request: web.Request) -> web.Response:
         session = await self._authenticated(request)
+        sleep_mode_enabled, sleep_mode_episodes = await self.database.sleep_mode(
+            session.telegram_user_id
+        )
         return web.json_response(
             {
                 "ok": True,
@@ -686,6 +694,8 @@ class WebRoutes:
                 "autoplay_enabled": await self.database.autoplay_enabled(
                     session.telegram_user_id
                 ),
+                "sleep_mode_enabled": sleep_mode_enabled,
+                "sleep_mode_episodes": sleep_mode_episodes,
             }
         )
 

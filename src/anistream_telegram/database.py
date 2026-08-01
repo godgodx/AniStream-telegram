@@ -21,6 +21,7 @@ from sqlalchemy import (
     delete,
     event,
     insert,
+    inspect as sqlalchemy_inspect,
     select,
     update,
 )
@@ -69,6 +70,16 @@ class UserPreference(Base):
 
     telegram_user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     autoplay_next: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    sleep_mode_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        nullable=False,
+    )
+    sleep_mode_episodes: Mapped[int] = mapped_column(
+        Integer,
+        default=3,
+        nullable=False,
+    )
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
 
 
@@ -307,6 +318,7 @@ SCHEMA_MIGRATIONS = (
     (3, "active playback generations"),
     (4, "per-playback progress cursors"),
     (5, "user watchlists"),
+    (6, "sleep mode preferences"),
 )
 POSTGRES_MIGRATION_LOCK_ID = 4_712_958_475_264_321_857
 
@@ -358,6 +370,23 @@ def apply_schema_migrations(connection: Any) -> None:
                 connection,
                 checkfirst=True,
             )
+        elif version == 6:
+            preference_columns = {
+                column["name"]
+                for column in sqlalchemy_inspect(connection).get_columns(
+                    UserPreference.__tablename__
+                )
+            }
+            if "sleep_mode_enabled" not in preference_columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE user_preferences ADD COLUMN "
+                    "sleep_mode_enabled BOOLEAN NOT NULL DEFAULT FALSE"
+                )
+            if "sleep_mode_episodes" not in preference_columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE user_preferences ADD COLUMN "
+                    "sleep_mode_episodes INTEGER NOT NULL DEFAULT 3"
+                )
         else:  # pragma: no cover - guards future registry mistakes.
             raise RuntimeError(f"unknown schema migration {version}")
         connection.execute(
@@ -517,6 +546,73 @@ class Database:
             preference.autoplay_next = not preference.autoplay_next
             preference.updated_at = utcnow()
             return bool(preference.autoplay_next)
+
+    async def sleep_mode(self, user_id: int) -> tuple[bool, int]:
+        async with self.sessions() as session:
+            preference = await session.get(UserPreference, user_id)
+            if preference is None:
+                return False, 3
+            episodes = max(1, min(12, int(preference.sleep_mode_episodes or 3)))
+            return bool(preference.sleep_mode_enabled), episodes
+
+    async def toggle_sleep_mode(self, user_id: int) -> bool:
+        async with self.sessions.begin() as session:
+            await session.execute(
+                self._insert_do_nothing(
+                    session,
+                    UserPreference,
+                    {
+                        "telegram_user_id": user_id,
+                        "autoplay_next": True,
+                        "sleep_mode_enabled": False,
+                        "sleep_mode_episodes": 3,
+                        "updated_at": utcnow(),
+                    },
+                    ("telegram_user_id",),
+                )
+            )
+            preference = await session.scalar(
+                select(UserPreference)
+                .where(UserPreference.telegram_user_id == user_id)
+                .with_for_update()
+            )
+            if preference is None:  # pragma: no cover - insert/select invariant.
+                raise RuntimeError("sleep mode preference could not be created")
+            preference.sleep_mode_enabled = not preference.sleep_mode_enabled
+            preference.updated_at = utcnow()
+            return bool(preference.sleep_mode_enabled)
+
+    async def set_sleep_mode_episodes(self, user_id: int, episodes: int) -> int:
+        if isinstance(episodes, bool):
+            raise ValueError("sleep mode episodes must be between 1 and 12")
+        count = int(episodes)
+        if not 1 <= count <= 12:
+            raise ValueError("sleep mode episodes must be between 1 and 12")
+        async with self.sessions.begin() as session:
+            now = utcnow()
+            await session.execute(
+                self._insert_do_nothing(
+                    session,
+                    UserPreference,
+                    {
+                        "telegram_user_id": user_id,
+                        "autoplay_next": True,
+                        "sleep_mode_enabled": False,
+                        "sleep_mode_episodes": count,
+                        "updated_at": now,
+                    },
+                    ("telegram_user_id",),
+                )
+            )
+            await session.execute(
+                update(UserPreference)
+                .where(UserPreference.telegram_user_id == user_id)
+                .values(
+                    sleep_mode_episodes=count,
+                    updated_at=now,
+                )
+            )
+        return count
 
     async def provider_states(
         self,

@@ -228,7 +228,11 @@ def watchlist_added_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def settings_keyboard(autoplay_enabled: bool) -> InlineKeyboardMarkup:
+def settings_keyboard(
+    autoplay_enabled: bool,
+    sleep_mode_enabled: bool = False,
+    sleep_mode_episodes: int = 3,
+) -> InlineKeyboardMarkup:
     toggle = InlineKeyboardButton(
         text=(
             "✅ Autoplay next episode · On"
@@ -243,6 +247,19 @@ def settings_keyboard(autoplay_enabled: bool) -> InlineKeyboardMarkup:
             [toggle],
             [
                 InlineKeyboardButton(
+                    text=(
+                        "🌙 Sleep mode · "
+                        f"{sleep_mode_episodes} "
+                        f"{'episode' if sleep_mode_episodes == 1 else 'episodes'}"
+                        if sleep_mode_enabled
+                        else "🌙 Sleep mode · Off"
+                    ),
+                    callback_data="settings:sleep",
+                    style="success" if sleep_mode_enabled else None,
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="🧩 Manage providers",
                     callback_data="settings:providers",
                 )
@@ -251,6 +268,42 @@ def settings_keyboard(autoplay_enabled: bool) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="‹ Back to menu",
                     callback_data="menu:main",
+                )
+            ],
+        ]
+    )
+
+
+def sleep_mode_keyboard(
+    enabled: bool,
+    episodes: int,
+) -> InlineKeyboardMarkup:
+    episode_buttons: list[InlineKeyboardButton] = []
+    for count in range(1, 7):
+        selected = count == episodes
+        label = f"{count} {'episode' if count == 1 else 'episodes'}"
+        episode_buttons.append(
+            InlineKeyboardButton(
+                text=f"✓ {label}" if selected else label,
+                callback_data=f"settings:sleep-count:{count}",
+                style="success" if selected else None,
+            )
+        )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Sleep mode · On" if enabled else "Sleep mode · Off",
+                    callback_data="settings:sleep-toggle",
+                    style="success" if enabled else None,
+                )
+            ],
+            episode_buttons[:3],
+            episode_buttons[3:],
+            [
+                InlineKeyboardButton(
+                    text="‹ Back to settings",
+                    callback_data="menu:settings",
                 )
             ],
         ]
@@ -404,6 +457,18 @@ class BotHandlers:
         self.protected_router.callback_query.register(
             self.toggle_autoplay,
             F.data == "settings:autoplay",
+        )
+        self.protected_router.callback_query.register(
+            self.sleep_mode_settings,
+            F.data == "settings:sleep",
+        )
+        self.protected_router.callback_query.register(
+            self.toggle_sleep_mode,
+            F.data == "settings:sleep-toggle",
+        )
+        self.protected_router.callback_query.register(
+            self.set_sleep_mode_episodes,
+            F.data.startswith("settings:sleep-count:"),
         )
         self.protected_router.callback_query.register(
             self.manage_providers,
@@ -773,6 +838,38 @@ class BotHandlers:
         )
         await self._render_settings(callback, autoplay_enabled=enabled)
 
+    async def sleep_mode_settings(self, callback: CallbackQuery) -> None:
+        await callback.answer()
+        await self._render_sleep_mode_settings(callback)
+
+    async def toggle_sleep_mode(self, callback: CallbackQuery) -> None:
+        enabled = await self.database.toggle_sleep_mode(callback.from_user.id)
+        await callback.answer(
+            "Sleep mode enabled." if enabled else "Sleep mode disabled."
+        )
+        await self._render_sleep_mode_settings(callback)
+
+    async def set_sleep_mode_episodes(self, callback: CallbackQuery) -> None:
+        try:
+            episodes = int((callback.data or "").rsplit(":", 1)[1])
+        except (IndexError, TypeError, ValueError):
+            episodes = 0
+        if not 1 <= episodes <= 6:
+            await callback.answer(
+                "Choose between 1 and 6 episodes.",
+                show_alert=True,
+            )
+            return
+        await self.database.set_sleep_mode_episodes(
+            callback.from_user.id,
+            episodes,
+        )
+        await callback.answer(
+            f"Sleep mode will pause after {episodes} "
+            f"{'episode' if episodes == 1 else 'episodes'}."
+        )
+        await self._render_sleep_mode_settings(callback)
+
     async def manage_providers(self, callback: CallbackQuery) -> None:
         await callback.answer()
         await self._render_provider_settings(callback)
@@ -836,15 +933,46 @@ class BotHandlers:
             autoplay_enabled = await self.database.autoplay_enabled(
                 callback.from_user.id
             )
+        sleep_mode_enabled, sleep_mode_episodes = await self.database.sleep_mode(
+            callback.from_user.id
+        )
         await self._replace_callback_message(
             callback,
             "⚙ Settings\n\n"
             "Autoplay next episode\n"
             "Automatically start the next episode when the current one ends.\n\n"
+            "Sleep mode\n"
+            "Pause autoplay after a chosen number of consecutive episodes.\n\n"
             "Providers\n"
             "Choose which catalogues are included in your searches.\n\n"
             "These preferences are saved to your Telegram account.",
-            settings_keyboard(autoplay_enabled),
+            settings_keyboard(
+                autoplay_enabled,
+                sleep_mode_enabled,
+                sleep_mode_episodes,
+            ),
+        )
+
+    async def _render_sleep_mode_settings(self, callback: CallbackQuery) -> None:
+        enabled, episodes = await self.database.sleep_mode(callback.from_user.id)
+        autoplay_enabled = await self.database.autoplay_enabled(
+            callback.from_user.id
+        )
+        dependency_note = (
+            "Autoplay is currently off, so Sleep Mode will wait until you "
+            "turn autoplay back on."
+            if not autoplay_enabled
+            else "Autoplay is on, so this safeguard is active for series."
+        )
+        await self._replace_callback_message(
+            callback,
+            "🌙 Sleep mode\n\n"
+            f"AniStream will check that you are still watching after {episodes} "
+            f"consecutive {'episode' if episodes == 1 else 'episodes'}.\n\n"
+            "It only affects series with autoplay enabled. Movies are never "
+            "interrupted by Sleep Mode.\n\n"
+            f"{dependency_note}",
+            sleep_mode_keyboard(enabled, episodes),
         )
 
     async def main_menu(self, callback: CallbackQuery, state: FSMContext) -> None:

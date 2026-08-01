@@ -13,6 +13,7 @@ from anistream_telegram.bot import (
     button_label_with_suffix,
     main_keyboard,
     settings_keyboard,
+    sleep_mode_keyboard,
     watchlist_keyboard,
 )
 from anistream_telegram.limits import SlidingWindowLimiter
@@ -26,6 +27,9 @@ def handler(public_base_url: str) -> BotHandlers:
         create_launch_ticket=AsyncMock(return_value="launch-ticket"),
         autoplay_enabled=AsyncMock(return_value=True),
         toggle_autoplay=AsyncMock(return_value=False),
+        sleep_mode=AsyncMock(return_value=(False, 3)),
+        toggle_sleep_mode=AsyncMock(return_value=True),
+        set_sleep_mode_episodes=AsyncMock(side_effect=lambda _user_id, count: count),
         provider_states=AsyncMock(
             side_effect=lambda _user_id, provider_ids: {
                 provider_id: True for provider_id in provider_ids
@@ -180,6 +184,9 @@ def test_only_id_handler_is_registered_on_public_router() -> None:
         "search_watchlist_entry",
         "settings",
         "toggle_autoplay",
+        "sleep_mode_settings",
+        "toggle_sleep_mode",
+        "set_sleep_mode_episodes",
         "manage_providers",
         "toggle_provider",
         "select_episode",
@@ -234,9 +241,35 @@ def test_settings_keyboard_reflects_autoplay_state() -> None:
     assert disabled.text == "Autoplay next episode · Off"
     assert disabled.style is None
     assert enabled.callback_data == disabled.callback_data == "settings:autoplay"
-    manage = settings_keyboard(True).inline_keyboard[1][0]
+    manage = settings_keyboard(True).inline_keyboard[2][0]
     assert manage.text == "🧩 Manage providers"
     assert manage.callback_data == "settings:providers"
+
+
+def test_settings_keyboard_summarizes_sleep_mode_state() -> None:
+    enabled = settings_keyboard(True, True, 3).inline_keyboard[1][0]
+    disabled = settings_keyboard(True, False, 3).inline_keyboard[1][0]
+
+    assert enabled.text == "🌙 Sleep mode · 3 episodes"
+    assert enabled.style == "success"
+    assert disabled.text == "🌙 Sleep mode · Off"
+    assert disabled.style is None
+    assert enabled.callback_data == disabled.callback_data == "settings:sleep"
+    assert settings_keyboard(True, True, 1).inline_keyboard[1][0].text == (
+        "🌙 Sleep mode · 1 episode"
+    )
+
+
+def test_sleep_mode_keyboard_marks_toggle_and_selected_episode_count() -> None:
+    keyboard = sleep_mode_keyboard(True, 3)
+
+    assert keyboard.inline_keyboard[0][0].text == "✅ Sleep mode · On"
+    assert keyboard.inline_keyboard[0][0].callback_data == "settings:sleep-toggle"
+    choices = [button for row in keyboard.inline_keyboard[1:3] for button in row]
+    selected = next(button for button in choices if button.callback_data.endswith(":3"))
+    assert selected.text == "✓ 3 episodes"
+    assert selected.style == "success"
+    assert keyboard.inline_keyboard[-1][0].callback_data == "menu:settings"
 
 
 def test_long_button_title_preserves_anonymous_provider_suffix() -> None:
@@ -454,18 +487,21 @@ async def test_watchlist_title_runs_the_existing_search_pipeline() -> None:
 async def test_settings_panel_reads_saved_autoplay_state() -> None:
     handlers = handler("https://watch.example")
     handlers.database.autoplay_enabled = AsyncMock(return_value=False)
+    handlers.database.sleep_mode = AsyncMock(return_value=(True, 4))
     event = callback()
 
     await handlers.settings(event)
 
     event.answer.assert_awaited_once()
     handlers.database.autoplay_enabled.assert_awaited_once_with(123)
+    handlers.database.sleep_mode.assert_awaited_once_with(123)
     text = event.message.edit_text.await_args.args[0]
     keyboard = event.message.edit_text.await_args.kwargs["reply_markup"]
     assert text.startswith("⚙ Settings")
     assert keyboard.inline_keyboard[0][0].text.endswith("· Off")
-    assert keyboard.inline_keyboard[1][0].callback_data == "settings:providers"
-    assert keyboard.inline_keyboard[2][0].callback_data == "menu:main"
+    assert keyboard.inline_keyboard[1][0].text == "🌙 Sleep mode · 4 episodes"
+    assert keyboard.inline_keyboard[2][0].callback_data == "settings:providers"
+    assert keyboard.inline_keyboard[3][0].callback_data == "menu:main"
 
 
 @pytest.mark.asyncio
@@ -480,6 +516,59 @@ async def test_settings_toggle_persists_and_refreshes_panel() -> None:
     event.answer.assert_awaited_once_with("Autoplay disabled.")
     keyboard = event.message.edit_text.await_args.kwargs["reply_markup"]
     assert keyboard.inline_keyboard[0][0].text.endswith("· Off")
+
+
+@pytest.mark.asyncio
+async def test_sleep_mode_panel_explains_autoplay_dependency() -> None:
+    handlers = handler("https://watch.example")
+    handlers.database.autoplay_enabled = AsyncMock(return_value=False)
+    handlers.database.sleep_mode = AsyncMock(return_value=(True, 3))
+    event = callback()
+
+    await handlers.sleep_mode_settings(event)
+
+    event.answer.assert_awaited_once()
+    text = event.message.edit_text.await_args.args[0]
+    assert "Autoplay is currently off" in text
+    assert "after 3 consecutive episodes" in text
+    keyboard = event.message.edit_text.await_args.kwargs["reply_markup"]
+    assert keyboard.inline_keyboard[0][0].text == "✅ Sleep mode · On"
+
+
+@pytest.mark.asyncio
+async def test_sleep_mode_toggle_persists_and_refreshes_panel() -> None:
+    handlers = handler("https://watch.example")
+    handlers.database.toggle_sleep_mode = AsyncMock(return_value=True)
+    handlers.database.sleep_mode = AsyncMock(return_value=(True, 3))
+    event = callback()
+
+    await handlers.toggle_sleep_mode(event)
+
+    handlers.database.toggle_sleep_mode.assert_awaited_once_with(123)
+    event.answer.assert_awaited_once_with("Sleep mode enabled.")
+    assert event.message.edit_text.await_args.args[0].startswith("🌙 Sleep mode")
+
+
+@pytest.mark.asyncio
+async def test_sleep_mode_episode_count_is_validated_and_saved() -> None:
+    handlers = handler("https://watch.example")
+    event = callback()
+    event.data = "settings:sleep-count:5"
+
+    await handlers.set_sleep_mode_episodes(event)
+
+    handlers.database.set_sleep_mode_episodes.assert_awaited_once_with(123, 5)
+    event.answer.assert_awaited_once_with("Sleep mode will pause after 5 episodes.")
+
+    handlers.database.set_sleep_mode_episodes.reset_mock()
+    event.answer.reset_mock()
+    event.data = "settings:sleep-count:99"
+    await handlers.set_sleep_mode_episodes(event)
+    handlers.database.set_sleep_mode_episodes.assert_not_awaited()
+    event.answer.assert_awaited_once_with(
+        "Choose between 1 and 6 episodes.",
+        show_alert=True,
+    )
 
 
 @pytest.mark.asyncio

@@ -67,8 +67,10 @@ workflow.
   private action.
 - **Series controls** — move to the previous, next, or any specific episode and
   optionally start the next episode after normal completion. Autoplay is enabled
-  by default and stored per Telegram account. Near the end of an episode,
-  AniStream safely prepares the next source without changing watch history.
+  by default and stored per Telegram account. Optional Sleep Mode pauses autoplay
+  after a user-selected number of consecutive episodes and asks before continuing.
+  Near the end of an episode, AniStream safely prepares the next source without
+  changing watch history.
 - **Adaptive playback controls** — HLS streams expose quality, audio-language,
   and subtitle selectors when the upstream playlist actually supplies those
   choices. A visible playback-options button reports when a source has no
@@ -184,7 +186,7 @@ The main menu keeps the watch flow intentionally small:
 1. **Continue Watching** — reopen the last interrupted episode and position;
 2. **Search** — discover a title across every registered provider;
 3. **Watch List** — reopen, search, or manage personally saved titles;
-4. **Settings** — enable or disable next-episode autoplay;
+4. **Settings** — configure autoplay, Sleep Mode, and search providers;
 5. **Help** — explain access and playback behavior.
 
 ```text
@@ -253,6 +255,10 @@ language. The data model stores:
 - the last selected or interrupted episode;
 - a separate position and duration for every episode;
 - completion state for episodes and seasons.
+
+Closing the player with at most ten minutes remaining marks a movie or the final
+episode of a series as completed. Intermediate episodes keep their normal saved
+position so the next launch still resumes or advances correctly.
 
 Skipping forward does not erase older positions. Rewatching an earlier episode
 does not move the main continuation backwards. If that rewatch is interrupted,

@@ -14,19 +14,27 @@ const assets = join(dist, "assets");
 rmSync(dist, { recursive: true, force: true });
 mkdirSync(assets, { recursive: true });
 
-function fingerprint(source, stem, extension) {
-  const body = readFileSync(source);
+function fingerprintBody(body, stem, extension) {
   const digest = createHash("sha256").update(body).digest("hex").slice(0, 12);
   const name = `${stem}.${digest}${extension}`;
   writeFileSync(join(assets, name), body);
   return name;
 }
 
-const mainName = fingerprint(
-  join(root, "src", "main.js"),
-  "main",
+function fingerprint(source, stem, extension) {
+  return fingerprintBody(readFileSync(source), stem, extension);
+}
+
+const policyName = fingerprint(
+  join(root, "src", "playback-policy.js"),
+  "playback-policy",
   ".js",
 );
+const mainBody = readFileSync(join(root, "src", "main.js"), "utf8").replace(
+  "./playback-policy.js",
+  `./${policyName}`,
+);
+const mainName = fingerprintBody(Buffer.from(mainBody), "main", ".js");
 const stylesName = fingerprint(
   join(root, "src", "styles.css"),
   "styles",

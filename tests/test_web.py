@@ -627,6 +627,8 @@ async def test_playback_and_session_expose_current_autoplay_setting(
     database = Database(settings.database_url)
     await database.initialize(settings.allowed_users)
     await database.set_autoplay_enabled(123, False)
+    await database.toggle_sleep_mode(123)
+    await database.set_sleep_mode_episodes(123, 4)
     raw_session, csrf = await database.create_web_session(
         123,
         {
@@ -646,7 +648,10 @@ async def test_playback_and_session_expose_current_autoplay_setting(
         cookie = {"Cookie": f"{settings.cookie_name}={raw_session}"}
         session_response = await client.get("/api/session", headers=cookie)
         assert session_response.status == 200
-        assert (await session_response.json())["autoplay_enabled"] is False
+        session_payload = await session_response.json()
+        assert session_payload["autoplay_enabled"] is False
+        assert session_payload["sleep_mode_enabled"] is True
+        assert session_payload["sleep_mode_episodes"] == 4
 
         playback_response = await client.post(
             "/api/playback",
@@ -657,7 +662,10 @@ async def test_playback_and_session_expose_current_autoplay_setting(
             },
         )
         assert playback_response.status == 200
-        assert (await playback_response.json())["autoplay_enabled"] is False
+        playback_payload = await playback_response.json()
+        assert playback_payload["autoplay_enabled"] is False
+        assert playback_payload["sleep_mode_enabled"] is True
+        assert playback_payload["sleep_mode_episodes"] == 4
     finally:
         await client.close()
         await database.close()

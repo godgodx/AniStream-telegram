@@ -1,3 +1,10 @@
+import {
+  completionOnClose,
+  nextSleepModeState,
+  runCurrentPlaybackCompletion,
+  sleepModeConfigurationChanged,
+} from "./playback-policy.js";
+
 const telegram = window.Telegram?.WebApp;
 const Hls = window.Hls;
 const video = document.querySelector("#video");
@@ -26,6 +33,10 @@ const streamControls = document.querySelector("#stream-controls");
 const qualityPicker = document.querySelector("#quality-picker");
 const audioPicker = document.querySelector("#audio-picker");
 const subtitlePicker = document.querySelector("#subtitle-picker");
+const sleepPrompt = document.querySelector("#sleep-prompt");
+const sleepPromptCopy = document.querySelector("#sleep-prompt-copy");
+const sleepContinue = document.querySelector("#sleep-continue");
+const sleepStop = document.querySelector("#sleep-stop");
 const NEXT_PREFETCH_WINDOW_SECONDS = 5 * 60;
 const PREFETCH_EXPIRY_MARGIN_MS = 30_000;
 const PREFETCH_RETRY_DELAY_MS = 60_000;
@@ -57,6 +68,9 @@ let localResumePending = false;
 let localResumeTarget = 0;
 let playerRecoveryState = null;
 let resumeAfterBfcacheRestore = false;
+let sleepModeCompletedEpisodes = 0;
+let sleepPromptInfo = null;
+let playbackWorkflowEpoch = 0;
 
 performance.mark?.("anistream-init");
 
@@ -319,10 +333,11 @@ function sendProgressBeacon(
   positionOverride = null,
   durationOverride = null,
   targetPlaybackId = playbackId,
+  isComplete = false,
 ) {
   if (!csrfToken || typeof navigator.sendBeacon !== "function") return false;
   const snapshot = progressSnapshot(
-    false,
+    isComplete,
     positionOverride,
     durationOverride,
     targetPlaybackId,
@@ -696,13 +711,23 @@ function updateSourceUi(info) {
 function updateAutoplayUi(info) {
   const isSeries = Number(info.total_episodes) > 1;
   autoplayStatus.hidden = !isSeries;
-  autoplayStatus.textContent =
-    info.autoplay_enabled === false
-      ? "Autoplay next is off"
-      : "Autoplay next is on";
+  if (info.autoplay_enabled === false) {
+    autoplayStatus.textContent = "Autoplay next is off";
+  } else if (info.sleep_mode_enabled === true) {
+    const count = Math.max(1, Number(info.sleep_mode_episodes) || 3);
+    const episodeLabel = `${count} ${count === 1 ? "episode" : "episodes"}`;
+    autoplayStatus.textContent = `Autoplay on · Sleep after ${episodeLabel}`;
+  } else {
+    autoplayStatus.textContent = "Autoplay next is on";
+  }
 }
 
 function updateEpisodeUi(info) {
+  if (sleepModeConfigurationChanged(currentInfo, info)) {
+    resetSleepModeCounter();
+  } else {
+    hideSleepPrompt();
+  }
   currentInfo = info;
   playbackId = info.playback_id;
   playbackGeneration = Math.max(
@@ -734,6 +759,88 @@ function updateEpisodeUi(info) {
   updateAutoplayUi(info);
 }
 
+function hideSleepPrompt({ resetCounter = false } = {}) {
+  if (typeof sleepPrompt.close === "function" && sleepPrompt.open) {
+    sleepPrompt.close();
+  } else {
+    sleepPrompt.removeAttribute("open");
+  }
+  sleepPromptInfo = null;
+  if (resetCounter) sleepModeCompletedEpisodes = 0;
+}
+
+function resetSleepModeCounter() {
+  hideSleepPrompt({ resetCounter: true });
+}
+
+function showSleepPrompt(info) {
+  sleepPromptInfo = info;
+  const count = Math.max(1, Number(info.sleep_mode_episodes) || 3);
+  sleepPromptCopy.textContent =
+    `Sleep Mode paused autoplay after ${count} ` +
+    `${count === 1 ? "episode" : "episodes"}.`;
+  if (typeof sleepPrompt.showModal === "function" && !sleepPrompt.open) {
+    sleepPrompt.showModal();
+  } else {
+    sleepPrompt.setAttribute("open", "");
+  }
+  setCastStatus("Sleep Mode paused autoplay. Are you still watching?");
+  telegram?.HapticFeedback?.notificationOccurred?.("warning");
+  sleepContinue.focus();
+}
+
+async function handleCompletedEpisode(info, { cast = false } = {}) {
+  if (info.has_next && info.autoplay_enabled !== false) {
+    const sleepState = nextSleepModeState(info, sleepModeCompletedEpisodes);
+    sleepModeCompletedEpisodes = sleepState.completedEpisodes;
+    if (sleepState.shouldPause) {
+      showSleepPrompt(info);
+      return;
+    }
+    await changeEpisode(info.episode + 1, { autoplay: true });
+  } else if (info.has_next) {
+    setCastStatus("Autoplay is off. Choose the next episode when ready.");
+  } else if (Number(info.total_episodes) > 1) {
+    setCastStatus(cast ? "Season completed on TV." : "Season completed.");
+  } else {
+    setCastStatus(cast ? "Movie completed on TV." : "Movie completed.");
+  }
+}
+
+function capturePlaybackCompletion(info) {
+  return {
+    playbackId: info.playback_id,
+    playbackGeneration,
+    workflowEpoch: playbackWorkflowEpoch,
+    info: { ...info },
+  };
+}
+
+function currentPlaybackCompletion() {
+  return {
+    playbackId,
+    playbackGeneration,
+    workflowEpoch: playbackWorkflowEpoch,
+  };
+}
+
+function playbackCompletionIsStillCurrent(completion) {
+  const current = currentPlaybackCompletion();
+  return (
+    completion.playbackId === current.playbackId &&
+    completion.playbackGeneration === current.playbackGeneration &&
+    completion.workflowEpoch === current.workflowEpoch
+  );
+}
+
+function handleCompletionSaveFailure(completion) {
+  if (!playbackCompletionIsStillCurrent(completion)) return;
+  completed = false;
+  setCastStatus(
+    "Completion could not be saved. Choose Next episode to retry safely.",
+  );
+}
+
 function attachPlayer(
   info,
   {
@@ -741,6 +848,7 @@ function attachPlayer(
     recoveryState = null,
   } = {},
 ) {
+  playbackWorkflowEpoch += 1;
   invalidateNextPrefetch();
   teardownPlayer();
   updateEpisodeUi(info);
@@ -957,15 +1065,16 @@ function attachPlayer(
     "ended",
     async () => {
       if (changingEpisode) return;
+      const completion = capturePlaybackCompletion(info);
       completed = true;
-      await saveProgress(true, true);
-      if (info.has_next && info.autoplay_enabled !== false) {
-        await changeEpisode(info.episode + 1, { autoplay: true });
-      } else if (info.has_next) {
-        setCastStatus("Autoplay is off. Choose the next episode when ready.");
-      } else {
-        setCastStatus("Season completed.");
-      }
+      const transitioned = await runCurrentPlaybackCompletion({
+        completion,
+        persist: () =>
+          saveProgress(true, true, null, null, completion.playbackId),
+        current: currentPlaybackCompletion,
+        apply: (finishedInfo) => handleCompletedEpisode(finishedInfo),
+      });
+      if (!transitioned) handleCompletionSaveFailure(completion);
     },
     options,
   );
@@ -1140,21 +1249,25 @@ async function handleRemoteCastFinished() {
     remotePlayer.playerState === window.chrome.cast.media.PlayerState.IDLE &&
     mediaSession?.idleReason === window.chrome.cast.media.IdleReason.FINISHED;
   if (!finished) return;
+  const completion = capturePlaybackCompletion(currentInfo);
+  const finishedPosition = remotePlayer.currentTime;
+  const finishedDuration = remotePlayer.duration;
   castEndHandled = true;
   completed = true;
-  await saveProgress(
-    true,
-    true,
-    remotePlayer.currentTime,
-    remotePlayer.duration,
-  );
-  if (currentInfo.has_next && currentInfo.autoplay_enabled !== false) {
-    await changeEpisode(currentInfo.episode + 1, { autoplay: true });
-  } else if (currentInfo.has_next) {
-    setCastStatus("Autoplay is off. Choose the next episode when ready.");
-  } else {
-    setCastStatus("Season completed on TV.");
-  }
+  const transitioned = await runCurrentPlaybackCompletion({
+    completion,
+    persist: () =>
+      saveProgress(
+        true,
+        true,
+        finishedPosition,
+        finishedDuration,
+        completion.playbackId,
+      ),
+    current: currentPlaybackCompletion,
+    apply: (finishedInfo) => handleCompletedEpisode(finishedInfo, { cast: true }),
+  });
+  if (!transitioned) handleCompletionSaveFailure(completion);
 }
 
 function setupRemoteCastController() {
@@ -1301,6 +1414,7 @@ async function changeEpisode(targetEpisode, { autoplay = false } = {}) {
   ) {
     return;
   }
+  playbackWorkflowEpoch += 1;
   changingEpisode = true;
   previous.disabled = true;
   next.disabled = true;
@@ -1385,6 +1499,7 @@ async function changeSource(
     sourcePicker.value = String(currentInfo.source_index);
     return;
   }
+  playbackWorkflowEpoch += 1;
   const wasPlaying = googleCastConnected()
     ? Boolean(remotePlayer?.isMediaLoaded && !remotePlayer.isPaused)
     : !video.paused;
@@ -1508,10 +1623,21 @@ async function refreshAutoplayPreference() {
   if (!currentInfo) return;
   try {
     const session = await api("/api/session");
+    const refreshedInfo = { ...currentInfo };
     if (typeof session.autoplay_enabled === "boolean") {
-      currentInfo.autoplay_enabled = session.autoplay_enabled;
-      updateAutoplayUi(currentInfo);
+      refreshedInfo.autoplay_enabled = session.autoplay_enabled;
     }
+    if (typeof session.sleep_mode_enabled === "boolean") {
+      refreshedInfo.sleep_mode_enabled = session.sleep_mode_enabled;
+    }
+    if (Number.isInteger(Number(session.sleep_mode_episodes))) {
+      refreshedInfo.sleep_mode_episodes = Number(session.sleep_mode_episodes);
+    }
+    if (sleepModeConfigurationChanged(currentInfo, refreshedInfo)) {
+      resetSleepModeCounter();
+    }
+    Object.assign(currentInfo, refreshedInfo);
+    updateAutoplayUi(currentInfo);
   } catch {
     // Keep the last known preference if Telegram briefly loses connectivity.
   }
@@ -1519,12 +1645,14 @@ async function refreshAutoplayPreference() {
 
 previous.addEventListener("click", () => {
   if (currentInfo?.has_previous) {
+    resetSleepModeCounter();
     void changeEpisode(currentInfo.episode - 1, { autoplay: true });
   }
 });
 
 next.addEventListener("click", () => {
   if (currentInfo?.has_next) {
+    resetSleepModeCounter();
     void changeEpisode(currentInfo.episode + 1, { autoplay: true });
   }
 });
@@ -1532,8 +1660,26 @@ next.addEventListener("click", () => {
 episodePicker.addEventListener("change", () => {
   const target = Number(episodePicker.value);
   if (currentInfo && target !== currentInfo.episode) {
+    resetSleepModeCounter();
     void changeEpisode(target, { autoplay: true });
   }
+});
+
+sleepContinue.addEventListener("click", () => {
+  const info = sleepPromptInfo;
+  if (!info?.has_next || changingEpisode) return;
+  resetSleepModeCounter();
+  void changeEpisode(info.episode + 1, { autoplay: true });
+});
+
+sleepStop.addEventListener("click", () => {
+  hideSleepPrompt();
+  setCastStatus("Sleep Mode stopped autoplay. Choose Next episode when ready.");
+});
+
+sleepPrompt.addEventListener("cancel", (event) => {
+  event.preventDefault();
+  sleepStop.click();
 });
 
 sourcePicker.addEventListener("change", () => {
@@ -1686,6 +1832,15 @@ document.addEventListener("visibilitychange", () => {
 });
 
 window.addEventListener("pagehide", (event) => {
+  const closingProgress = reliablePlaybackPosition();
+  const completesOnClose =
+    !event.persisted &&
+    !remotePlaybackActive() &&
+    completionOnClose(
+      currentInfo,
+      closingProgress.position,
+      closingProgress.duration,
+    );
   resumeAfterBfcacheRestore = Boolean(
     event.persisted &&
       (googleCastConnected()
@@ -1707,8 +1862,20 @@ window.addEventListener("pagehide", (event) => {
           remotePlayer.duration,
         );
       }
-    } else if (!sendProgressBeacon()) {
-      void saveProgress(true, false, null, null, playbackId, true);
+    } else if (
+      !sendProgressBeacon(
+        closingProgress.position,
+        closingProgress.duration,
+        playbackId,
+        completesOnClose,
+      )
+    ) {
+      void saveProgress(
+        true,
+        completesOnClose,
+        closingProgress.position,
+        closingProgress.duration,
+      );
     }
   }
   // BFCache freezes and later restores this exact page. Destroying HLS or its

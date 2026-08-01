@@ -58,12 +58,12 @@ async def test_schema_versions_are_recorded_and_idempotent(tmp_path: Path) -> No
                     )
                 )
             )
-        assert versions == [1, 2, 3, 4, 5]
+        assert versions == [1, 2, 3, 4, 5, 6]
         await database.initialize()
         async with database.sessions() as session:
             assert list(
                 await session.scalars(select(SchemaMigration.version))
-            ) == [1, 2, 3, 4, 5]
+            ) == [1, 2, 3, 4, 5, 6]
     finally:
         await database.close()
 
@@ -149,6 +149,79 @@ async def test_autoplay_defaults_on_and_persists_per_user(tmp_path: Path) -> Non
         assert await reopened.autoplay_enabled(123) is True
     finally:
         await reopened.close()
+
+
+async def test_sleep_mode_columns_are_added_to_an_existing_preferences_table(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "db.sqlite"
+    database = await database_at(path)
+    try:
+        await database.set_autoplay_enabled(123, False)
+        async with database.engine.begin() as connection:
+            await connection.execute(
+                SchemaMigration.__table__.delete().where(
+                    SchemaMigration.version == 6
+                )
+            )
+            await connection.exec_driver_sql(
+                "ALTER TABLE user_preferences DROP COLUMN sleep_mode_episodes"
+            )
+            await connection.exec_driver_sql(
+                "ALTER TABLE user_preferences DROP COLUMN sleep_mode_enabled"
+            )
+        await database.initialize()
+        assert await database.autoplay_enabled(123) is False
+        assert await database.sleep_mode(123) == (False, 3)
+        async with database.engine.connect() as connection:
+            columns = {
+                row[1]
+                for row in (
+                    await connection.exec_driver_sql(
+                        "PRAGMA table_info(user_preferences)"
+                    )
+                ).all()
+            }
+        assert {"sleep_mode_enabled", "sleep_mode_episodes"} <= columns
+    finally:
+        await database.close()
+
+
+async def test_sleep_mode_defaults_off_and_persists_per_user(tmp_path: Path) -> None:
+    path = tmp_path / "db.sqlite"
+    database = await database_at(path)
+    try:
+        assert await database.sleep_mode(123) == (False, 3)
+        assert await database.toggle_sleep_mode(123) is True
+        assert await database.set_sleep_mode_episodes(123, 5) == 5
+        assert await database.sleep_mode(123) == (True, 5)
+        assert await database.sleep_mode(999) == (False, 3)
+    finally:
+        await database.close()
+
+    reopened = await database_at(path)
+    try:
+        assert await reopened.sleep_mode(123) == (True, 5)
+        assert await reopened.toggle_sleep_mode(123) is False
+        assert await reopened.sleep_mode(123) == (False, 5)
+    finally:
+        await reopened.close()
+
+
+async def test_sleep_mode_rejects_episode_limits_outside_supported_range(
+    tmp_path: Path,
+) -> None:
+    database = await database_at(tmp_path / "db.sqlite")
+    try:
+        for invalid in (0, 13):
+            try:
+                await database.set_sleep_mode_episodes(123, invalid)
+            except ValueError as exc:
+                assert "between 1 and 12" in str(exc)
+            else:  # pragma: no cover - documents the validation contract.
+                raise AssertionError("invalid sleep mode limit was accepted")
+    finally:
+        await database.close()
 
 
 async def test_provider_preferences_default_on_and_persist_per_user(
