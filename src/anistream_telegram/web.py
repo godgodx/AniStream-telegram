@@ -101,6 +101,22 @@ class WebRoutes:
         app.router.add_post("/api/progress/beacon", self.progress_beacon)
         app.router.add_post("/api/cast", self.cast)
         app.router.add_post("/api/logout", self.logout)
+        app.router.add_get(
+            "/cast/{cast_token}/media/{playback_id}/master",
+            self.media.master,
+        )
+        app.router.add_get(
+            "/cast/{cast_token}/media/{playback_id}/resource/{resource_token}",
+            self.media.resource,
+        )
+        app.router.add_options(
+            "/cast/{cast_token}/media/{playback_id}/master",
+            self.media.options,
+        )
+        app.router.add_options(
+            "/cast/{cast_token}/media/{playback_id}/resource/{resource_token}",
+            self.media.options,
+        )
         app.router.add_get("/media/{playback_id}/master", self.media.master)
         app.router.add_get("/media/{playback_id}/resource", self.media.resource)
         app.router.add_options("/media/{playback_id}/master", self.media.options)
@@ -114,6 +130,12 @@ class WebRoutes:
             app.router.add_static("/app/", path=dist, append_version=True)
         else:
             app.router.add_get("/app/", self.frontend_missing)
+
+    def _cast_media_url(self, playback_id: str, grant: str) -> str:
+        return (
+            f"{self.config.public_base_url}/cast/{grant}"
+            f"/media/{playback_id}/master"
+        )
 
     def _client_key(self, request: web.Request) -> str:
         if self.config.trusted_proxy_count > 0:
@@ -391,6 +413,10 @@ class WebRoutes:
         sleep_mode_enabled, sleep_mode_episodes = await self.database.sleep_mode(
             session.telegram_user_id
         )
+        native_cast_grant = await self.database.create_cast_grant(
+            playback,
+            ttl_seconds=min(7200, self.config.playback_ttl_seconds),
+        )
         return {
             "playback_id": playback.id,
             "playback_generation": max(
@@ -398,6 +424,10 @@ class WebRoutes:
                 int(getattr(playback, "generation", 0)),
             ),
             "stream_url": f"/media/{playback.id}/master",
+            "native_cast_url": self._cast_media_url(
+                playback.id,
+                native_cast_grant,
+            ),
             "kind": playback.media_kind,
             "source": playback.source_name,
             "source_index": source_index,
@@ -863,10 +893,7 @@ class WebRoutes:
         )
         return web.json_response(
             {
-                "url": (
-                    f"{self.config.public_base_url}/media/{playback.id}/master"
-                    f"?cast={grant}"
-                ),
+                "url": self._cast_media_url(playback.id, grant),
                 "content_type": content_type,
                 "kind": playback.media_kind,
                 "episode": playback.episode,

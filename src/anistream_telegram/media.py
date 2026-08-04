@@ -454,7 +454,10 @@ class MediaGateway:
         request: web.Request,
         playback_id: str,
     ) -> tuple[int, PlaybackSession, str, str]:
-        cast_token = request.query.get("cast", "")
+        cast_token = request.match_info.get("cast_token", "") or request.query.get(
+            "cast",
+            "",
+        )
         if cast_token:
             playback = await self.database.get_cast_playback(cast_token, playback_id)
             if playback is None:
@@ -550,7 +553,10 @@ class MediaGateway:
             request,
             playback_id,
         )
-        token = request.query.get("t", "")
+        token = request.match_info.get("resource_token", "") or request.query.get(
+            "t",
+            "",
+        )
         try:
             target = self.tokens.parse(token, playback_id)
         except AuthenticationError as exc:
@@ -734,9 +740,13 @@ class MediaGateway:
                 raise web.HTTPBadGateway(
                     text="Upstream playlist contains an invalid resource URI"
                 )
-            path = f"/media/{playback.id}/resource?t={quote(token)}"
             if cast_token:
-                path += f"&cast={quote(cast_token)}"
+                path = (
+                    f"/cast/{quote(cast_token, safe='')}"
+                    f"/media/{playback.id}/resource/{quote(token, safe='')}"
+                )
+            else:
+                path = f"/media/{playback.id}/resource?t={quote(token)}"
             return path
 
         output = bytearray()

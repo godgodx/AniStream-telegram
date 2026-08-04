@@ -709,6 +709,47 @@ async def test_playback_without_saved_progress_forces_zero_start(
         await database.close()
 
 
+async def test_playback_prepares_cookie_independent_native_cast_grant(
+    tmp_path: Path,
+) -> None:
+    settings = config(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize(settings.allowed_users)
+    raw_session, csrf = await database.create_web_session(
+        123,
+        {"catalogue": catalogue(), "episode": 3},
+        ttl_seconds=600,
+    )
+    media = MediaGateway(settings, database)
+    app = web.Application(middlewares=[error_boundary, security_headers])
+    app[CONFIG_KEY] = settings
+    WebRoutes(settings, database, FakeCore(), media).register(app)  # type: ignore[arg-type]
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.post(
+            "/api/playback",
+            headers={
+                "Origin": settings.public_origin,
+                "X-CSRF-Token": csrf,
+                "Cookie": f"{settings.cookie_name}={raw_session}",
+            },
+        )
+
+        assert response.status == 200
+        payload = await response.json()
+        prefix = f"{settings.public_base_url}/cast/"
+        assert payload["native_cast_url"].startswith(prefix)
+        suffix = f"/media/{payload['playback_id']}/master"
+        assert payload["native_cast_url"].endswith(suffix)
+        grant = payload["native_cast_url"][len(prefix) : -len(suffix)]
+        assert "?" not in payload["native_cast_url"]
+        assert await database.get_cast_playback(grant, payload["playback_id"]) is not None
+    finally:
+        await client.close()
+        await database.close()
+
+
 async def test_paused_progress_is_returned_after_reopening_player(
     tmp_path: Path,
 ) -> None:
@@ -1326,10 +1367,12 @@ async def test_cast_endpoint_returns_short_lived_playback_grant(
         assert response.status == 200
         payload = await response.json()
         assert payload["content_type"] == "video/mp4"
-        assert payload["url"].startswith(
-            f"{settings.public_base_url}/media/{playback.id}/master?cast="
-        )
-        grant = payload["url"].split("cast=", 1)[1]
+        prefix = f"{settings.public_base_url}/cast/"
+        suffix = f"/media/{playback.id}/master"
+        assert payload["url"].startswith(prefix)
+        assert payload["url"].endswith(suffix)
+        assert "?" not in payload["url"]
+        grant = payload["url"][len(prefix) : -len(suffix)]
         assert await database.get_cast_playback(grant, playback.id) is not None
     finally:
         await client.close()

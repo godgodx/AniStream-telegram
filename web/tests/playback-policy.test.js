@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import * as playbackPolicy from "../src/playback-policy.js";
+
 import {
   completionOnClose,
   nextSleepModeState,
@@ -241,4 +243,153 @@ test("a delayed completion uses the latest autoplay preferences", async () => {
     true,
   );
   assert.equal(appliedAutoplayPreference, false);
+});
+
+test("native casting replaces the cookie stream before opening the device picker", () => {
+  assert.equal(typeof playbackPolicy.beginNativeCast, "function");
+
+  const calls = [];
+  const video = {
+    currentTime: 412.5,
+    pause() {
+      calls.push("pause");
+    },
+    load() {
+      calls.push("load");
+    },
+  };
+
+  const result = playbackPolicy.beginNativeCast({
+    video,
+    castUrl: "https://watch.example/cast/grant/media/playback/master",
+    releaseAdaptivePlayer() {
+      calls.push("release-hls");
+    },
+    beforeLoad(resumePosition) {
+      calls.push(`resume:${resumePosition}`);
+    },
+    openPicker() {
+      calls.push("picker");
+      return "picker-result";
+    },
+  });
+
+  assert.equal(result.resumePosition, 412.5);
+  assert.equal(result.pickerResult, "picker-result");
+  assert.equal(
+    video.src,
+    "https://watch.example/cast/grant/media/playback/master",
+  );
+  assert.deepEqual(calls, [
+    "resume:412.5",
+    "release-hls",
+    "pause",
+    "load",
+    "picker",
+  ]);
+});
+
+test("native casting preserves a pending resume before metadata exists", () => {
+  const observedResumePositions = [];
+  const video = {
+    currentTime: 0,
+    pause() {},
+    load() {},
+  };
+
+  const result = playbackPolicy.beginNativeCast({
+    video,
+    castUrl: "https://watch.example/cast/grant/media/playback/master",
+    positionOverride: 412.5,
+    beforeLoad(position) {
+      observedResumePositions.push(position);
+    },
+    openPicker() {},
+  });
+
+  assert.equal(result.resumePosition, 412.5);
+  assert.deepEqual(observedResumePositions, [412.5]);
+});
+
+test("native cast failures restore local playback", async () => {
+  assert.equal(typeof playbackPolicy.runNativeCastAttempt, "function");
+  const rejectedCalls = [];
+  await assert.rejects(
+    playbackPolicy.runNativeCastAttempt({
+      begin() {
+        rejectedCalls.push("begin");
+        return { pickerResult: Promise.reject(new Error("cancelled")) };
+      },
+      rollback() {
+        rejectedCalls.push("rollback");
+      },
+    }),
+    /cancelled/,
+  );
+  assert.deepEqual(rejectedCalls, ["begin", "rollback"]);
+
+  const thrownCalls = [];
+  await assert.rejects(
+    playbackPolicy.runNativeCastAttempt({
+      begin() {
+        thrownCalls.push("begin");
+        throw new Error("picker failed");
+      },
+      rollback() {
+        thrownCalls.push("rollback");
+      },
+    }),
+    /picker failed/,
+  );
+  assert.deepEqual(thrownCalls, ["begin", "rollback"]);
+});
+
+test("native remote playback keeps grant URLs across episode and source changes", () => {
+  assert.equal(typeof playbackPolicy.playbackAttachment, "function");
+  const info = {
+    kind: "hls",
+    stream_url: "/media/playback/master",
+    native_cast_url:
+      "https://watch.example/cast/grant/media/playback/master",
+  };
+
+  assert.deepEqual(
+    playbackPolicy.playbackAttachment(info, {
+      hlsSupported: true,
+      nativeRemoteActive: false,
+    }),
+    { streamUrl: info.stream_url, useAdaptiveHls: true },
+  );
+  assert.deepEqual(
+    playbackPolicy.playbackAttachment(info, {
+      hlsSupported: true,
+      nativeRemoteActive: true,
+    }),
+    { streamUrl: info.native_cast_url, useAdaptiveHls: false },
+  );
+});
+
+test("native cast transitions suppress local source fallback", () => {
+  assert.equal(typeof playbackPolicy.localPlaybackRecoveryAllowed, "function");
+  assert.equal(
+    playbackPolicy.localPlaybackRecoveryAllowed({
+      nativeCastTransition: true,
+      nativeRemoteActive: false,
+    }),
+    false,
+  );
+  assert.equal(
+    playbackPolicy.localPlaybackRecoveryAllowed({
+      nativeCastTransition: false,
+      nativeRemoteActive: true,
+    }),
+    false,
+  );
+  assert.equal(
+    playbackPolicy.localPlaybackRecoveryAllowed({
+      nativeCastTransition: false,
+      nativeRemoteActive: false,
+    }),
+    true,
+  );
 });

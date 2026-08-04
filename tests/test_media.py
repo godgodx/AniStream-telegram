@@ -551,6 +551,39 @@ async def test_master_reuses_the_prefetched_hls_manifest_once(
         await database.close()
 
 
+async def test_cast_path_authorizes_without_query_or_cookie(tmp_path: Path) -> None:
+    settings = config(tmp_path)
+    database = Database(settings.database_url)
+    await database.initialize(settings.allowed_users)
+    playback = await database.create_playback(
+        123,
+        {},
+        1,
+        media_url="https://cdn.example/video.mp4",
+        media_headers={},
+        media_kind="mp4",
+        source_name="Test",
+        ttl_seconds=600,
+    )
+    grant = await database.create_cast_grant(playback, ttl_seconds=300)
+    gateway = MediaGateway(settings, database)
+    request = SimpleNamespace(
+        match_info={"cast_token": grant},
+        query={},
+        cookies={},
+    )
+    try:
+        user_id, selected, cast_token, session_key = (
+            await gateway._session_and_playback(request, playback.id)  # type: ignore[arg-type]
+        )
+        assert user_id == 123
+        assert selected.id == playback.id
+        assert cast_token == grant
+        assert session_key == "cast"
+    finally:
+        await database.close()
+
+
 async def test_cast_hls_playlist_propagates_grant_and_cors(tmp_path: Path) -> None:
     database = Database(config(tmp_path).database_url)
     gateway = MediaGateway(config(tmp_path), database)
@@ -577,7 +610,9 @@ async def test_cast_hls_playlist_propagates_grant_and_cors(tmp_path: Path) -> No
         cast_token="cast-grant",
     )
 
-    assert "cast=cast-grant" in response.text
+    text = response.text or ""
+    assert "/cast/cast-grant/media/playback-id/resource/" in text
+    assert "?" not in text
     assert response.headers["Access-Control-Allow-Origin"] == "*"
     assert "Range" in response.headers["Access-Control-Allow-Headers"]
 

@@ -1,0 +1,18 @@
+services:
+  app:
+    container_name: anistream-app
+    ports:
+      - "127.0.0.1:8081:8080"
+    pids_limit: 256
+    mem_limit: 2g
+
+  database:
+    container_name: anistream-postgres
+    pids_limit: 128
+    mem_limit: 512m
+
+  caddy:
+    # The VPS already has one hardened Caddy instance on public ports 80/443.
+    # This bundled proxy stays disabled unless explicitly requested.
+    profiles:
+      - standalone-caddy

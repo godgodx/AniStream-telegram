@@ -68,6 +68,76 @@ export function progressPersistenceAccepted(response) {
   return response?.accepted === true;
 }
 
+export function playbackAttachment(
+  info,
+  { hlsSupported = false, nativeRemoteActive = false } = {},
+) {
+  const streamUrl = nativeRemoteActive
+    ? info?.native_cast_url
+    : info?.stream_url;
+  if (typeof streamUrl !== "string" || !streamUrl) {
+    throw new Error("The playback stream is not ready. Try again in a moment.");
+  }
+  return {
+    streamUrl,
+    useAdaptiveHls:
+      info?.kind === "hls" && hlsSupported === true && !nativeRemoteActive,
+  };
+}
+
+export function localPlaybackRecoveryAllowed(
+  { nativeCastTransition = false, nativeRemoteActive = false } = {},
+) {
+  return nativeCastTransition !== true && nativeRemoteActive !== true;
+}
+
+export function beginNativeCast({
+  video,
+  castUrl,
+  releaseAdaptivePlayer = () => {},
+  beforeLoad = () => {},
+  openPicker,
+  positionOverride = null,
+}) {
+  if (
+    !video ||
+    typeof castUrl !== "string" ||
+    !castUrl ||
+    typeof openPicker !== "function"
+  ) {
+    throw new Error("The TV stream is not ready. Try again in a moment.");
+  }
+  const currentTime =
+    positionOverride === null
+      ? Number(video.currentTime)
+      : Number(positionOverride);
+  const resumePosition = Number.isFinite(currentTime)
+    ? Math.max(0, currentTime)
+    : 0;
+  beforeLoad(resumePosition);
+  releaseAdaptivePlayer();
+  video.pause();
+  video.src = castUrl;
+  video.load();
+  const pickerResult = openPicker();
+  return { resumePosition, pickerResult };
+}
+
+export async function runNativeCastAttempt({ begin, rollback }) {
+  try {
+    const result = begin();
+    await result?.pickerResult;
+    return result;
+  } catch (reason) {
+    try {
+      await rollback(reason);
+    } catch {
+      // Preserve the picker error; restoration is best-effort.
+    }
+    throw reason;
+  }
+}
+
 function playbackCompletionIsCurrent(completion, current) {
   return (
     completion?.playbackId === current?.playbackId &&

@@ -1,8 +1,12 @@
 import {
+  beginNativeCast,
   completionOnClose,
+  localPlaybackRecoveryAllowed,
   nextSleepModeState,
+  playbackAttachment,
   progressPersistenceAccepted,
   runCurrentPlaybackCompletion,
+  runNativeCastAttempt,
   sleepModeConfigurationChanged,
   sleepModeStatusText,
 } from "./playback-policy.js";
@@ -42,6 +46,7 @@ const sleepStop = document.querySelector("#sleep-stop");
 const NEXT_PREFETCH_WINDOW_SECONDS = 5 * 60;
 const PREFETCH_EXPIRY_MARGIN_MS = 30_000;
 const PREFETCH_RETRY_DELAY_MS = 60_000;
+const NATIVE_CAST_SELECTION_TIMEOUT_MS = 60_000;
 
 let csrfToken = "";
 let playbackId = "";
@@ -84,6 +89,9 @@ let remoteController = null;
 let castProgressTimer = null;
 let castLoadInFlight = false;
 let castEndHandled = false;
+let nativeCastSelectionTimer = null;
+let nativeCastPendingAttempt = null;
+let nativeCastTransitionActive = false;
 
 function formatTime(value) {
   const seconds = Math.max(0, Math.floor(Number(value) || 0));
@@ -132,12 +140,15 @@ function pictureInPictureActive() {
   );
 }
 
-function remotePlaybackActive() {
+function nativeRemotePlaybackActive() {
   return (
-    googleCastConnected() ||
     video.remote?.state === "connected" ||
     video.webkitCurrentPlaybackTargetIsWireless === true
   );
+}
+
+function remotePlaybackActive() {
+  return googleCastConnected() || nativeRemotePlaybackActive();
 }
 
 function updatePictureInPictureUi() {
@@ -873,6 +884,7 @@ function attachPlayer(
     recoveryState = null,
   } = {},
 ) {
+  const continueNativeRemotePlayback = nativeRemotePlaybackActive();
   playbackWorkflowEpoch += 1;
   invalidateNextPrefetch();
   teardownPlayer();
@@ -884,8 +896,10 @@ function attachPlayer(
   const events = new AbortController();
   playerEvents = events;
   const options = { signal: events.signal };
-  const streamUrl = info.stream_url;
-  const useHls = info.kind === "hls";
+  const { streamUrl, useAdaptiveHls } = playbackAttachment(info, {
+    hlsSupported: Boolean(Hls?.isSupported()),
+    nativeRemoteActive: continueNativeRemotePlayback,
+  });
   const requestedPosition = Number(info.start_position);
   playerRecoveryState =
     recoveryState || {
@@ -900,7 +914,7 @@ function attachPlayer(
       : 0;
   localResumePending = localResumeTarget > 0;
 
-  if (useHls && Hls?.isSupported()) {
+  if (useAdaptiveHls) {
     hls = new Hls({
       enableWorker: true,
       lowLatencyMode: false,
@@ -1012,7 +1026,7 @@ function attachPlayer(
     "loadedmetadata",
     () => {
       applyResumePosition();
-      if (!useHls || !Hls?.isSupported()) {
+      if (!useAdaptiveHls) {
         updateNativeTrackOptions();
       }
       finishPlayerReady();
@@ -1162,6 +1176,14 @@ function nextUntriedSource(info, recoveryState) {
 
 async function recoverFatalPlayback(data, info, autoplay) {
   if (
+    !localPlaybackRecoveryAllowed({
+      nativeCastTransition: nativeCastTransitionActive,
+      nativeRemoteActive: nativeRemotePlaybackActive(),
+    })
+  ) {
+    return;
+  }
+  if (
     changingEpisode ||
     changingSource ||
     playbackId !== info.playback_id ||
@@ -1263,6 +1285,82 @@ async function loadCurrentOnGoogleCast(
   } finally {
     castLoadInFlight = false;
   }
+}
+
+function loadCurrentForNativeCast(openPicker) {
+  const resume = reliablePlaybackPosition();
+  return beginNativeCast({
+    video,
+    castUrl: currentInfo?.native_cast_url,
+    openPicker,
+    positionOverride: resume.position,
+    beforeLoad(position) {
+      localResumeTarget = position;
+      localResumePending = position > 0;
+    },
+    releaseAdaptivePlayer() {
+      hls?.destroy();
+      hls = null;
+      resetStreamControls();
+    },
+  });
+}
+
+function captureNativeCastAttempt() {
+  const resume = reliablePlaybackPosition();
+  return {
+    playbackId,
+    playbackGeneration,
+    info: currentInfo ? { ...currentInfo } : null,
+    position: resume.position,
+    wasPlaying: !video.paused,
+  };
+}
+
+function clearNativeCastPendingAttempt() {
+  if (nativeCastSelectionTimer !== null) {
+    window.clearTimeout(nativeCastSelectionTimer);
+    nativeCastSelectionTimer = null;
+  }
+  nativeCastPendingAttempt = null;
+}
+
+function restoreLocalPlaybackAfterNativeCastFailure(attempt) {
+  if (
+    !attempt?.info ||
+    playbackId !== attempt.playbackId ||
+    playbackGeneration !== attempt.playbackGeneration ||
+    nativeRemotePlaybackActive()
+  ) {
+    return;
+  }
+  nativeCastTransitionActive = false;
+  clearNativeCastPendingAttempt();
+  attachPlayer(
+    { ...attempt.info, start_position: attempt.position },
+    { autoplay: attempt.wasPlaying },
+  );
+}
+
+async function startNativeCast(openPicker, { monitorWebKitCancellation = false } = {}) {
+  const attempt = captureNativeCastAttempt();
+  nativeCastTransitionActive = true;
+  const result = await runNativeCastAttempt({
+    begin: () => loadCurrentForNativeCast(openPicker),
+    rollback: () => restoreLocalPlaybackAfterNativeCastFailure(attempt),
+  });
+  if (monitorWebKitCancellation && !nativeRemotePlaybackActive()) {
+    clearNativeCastPendingAttempt();
+    nativeCastPendingAttempt = attempt;
+    nativeCastSelectionTimer = window.setTimeout(() => {
+      const pending = nativeCastPendingAttempt;
+      clearNativeCastPendingAttempt();
+      if (!nativeRemotePlaybackActive()) {
+        restoreLocalPlaybackAfterNativeCastFailure(pending);
+      }
+    }, NATIVE_CAST_SELECTION_TIMEOUT_MS);
+  }
+  return result;
 }
 
 async function handleRemoteCastFinished() {
@@ -1402,10 +1500,12 @@ function setupCast() {
   if (hasRemotePlayback) {
     video.remote.onconnecting = () => setCastStatus("Connecting to the TV…");
     video.remote.onconnect = () => {
+      nativeCastTransitionActive = false;
       setCastStatus("Playing on the TV.");
       updatePictureInPictureUi();
     };
     video.remote.ondisconnect = () => {
+      nativeCastTransitionActive = false;
       setCastStatus("Remote playback disconnected.");
       updatePictureInPictureUi();
     };
@@ -1419,6 +1519,23 @@ function setupCast() {
         // Some browsers discover devices only after prompt() is called.
       });
   }
+
+  video.addEventListener("webkitcurrentplaybacktargetiswirelesschanged", () => {
+    const isWireless = video.webkitCurrentPlaybackTargetIsWireless === true;
+    const pendingAttempt = nativeCastPendingAttempt;
+    if (isWireless) {
+      nativeCastTransitionActive = false;
+      clearNativeCastPendingAttempt();
+    } else if (pendingAttempt) {
+      restoreLocalPlaybackAfterNativeCastFailure(pendingAttempt);
+    } else {
+      nativeCastTransitionActive = false;
+    }
+    setCastStatus(
+      isWireless ? "Playing on the TV." : "AirPlay disconnected.",
+    );
+    updatePictureInPictureUi();
+  });
 
   if (window.location.protocol === "https:") {
     window.__onGCastApiAvailable = (available) => {
@@ -1795,14 +1912,19 @@ castButton.addEventListener("click", async () => {
         await castContext.requestSession();
       }
     } else if (typeof video.webkitShowPlaybackTargetPicker === "function") {
-      video.webkitShowPlaybackTargetPicker();
+      await startNativeCast(
+        () => video.webkitShowPlaybackTargetPicker(),
+        { monitorWebKitCancellation: true },
+      );
     } else if (video.remote?.prompt) {
-      await video.remote.prompt();
+      await startNativeCast(() => video.remote.prompt());
     } else {
       setCastStatus("Cast is not supported in this Telegram browser.");
     }
-  } catch {
-    setCastStatus("No compatible TV was selected.");
+  } catch (reason) {
+    setCastStatus(
+      reason instanceof Error ? reason.message : "No compatible TV was selected.",
+    );
   }
 });
 
@@ -1974,7 +2096,10 @@ window.addEventListener("pageshow", (event) => {
   if (!currentInfo || googleCastConnected()) return;
 
   const resume = reliablePlaybackPosition();
-  const hlsExpected = currentInfo.kind === "hls" && Hls?.isSupported();
+  const hlsExpected =
+    currentInfo.kind === "hls" &&
+    Hls?.isSupported() &&
+    !nativeRemotePlaybackActive();
   if (!playerEvents || (hlsExpected && !hls)) {
     attachPlayer(
       { ...currentInfo, start_position: resume.position },
