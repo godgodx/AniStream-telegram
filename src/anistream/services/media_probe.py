@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from urllib.parse import urlparse
 
 from anistream.models import (
@@ -11,6 +12,16 @@ from anistream.utils.http import HttpClient
 
 
 MP4_PROBE_BYTES = 4 * 1024
+MIN_HLS_VOD_SECONDS = 60.0
+
+
+def _complete_hls_vod_duration(body: bytes) -> float | None:
+    if b"#EXT-X-ENDLIST" not in body:
+        return None
+    durations = re.findall(rb"(?m)^#EXTINF:([0-9]+(?:\.[0-9]+)?)", body)
+    if not durations:
+        return None
+    return sum(float(value) for value in durations)
 
 
 class RemoteMediaProbe:
@@ -69,6 +80,13 @@ class RemoteMediaProbe:
             )
             if is_hls:
                 if body.lstrip().startswith(b"#EXTM3U"):
+                    duration = _complete_hls_vod_duration(body) if complete else None
+                    if duration is not None and duration < MIN_HLS_VOD_SECONDS:
+                        return ProbeResult(
+                            False,
+                            "hls",
+                            f"complete HLS VOD is too short ({duration:.1f}s)",
+                        )
                     return ProbeResult(
                         True,
                         "hls",

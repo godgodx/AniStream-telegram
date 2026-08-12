@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import threading
 import time
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from anistream.models import (
     ProbeResult,
     ResolvedMedia,
 )
+from anistream.resolvers.hosts import VidzyResolver
 from anistream.services.media_probe import MP4_PROBE_BYTES, RemoteMediaProbe
 from anistream_telegram.core import (
     CoreService,
@@ -629,6 +631,69 @@ def test_media_probe_does_not_reuse_a_partial_hls_manifest() -> None:
     assert result.prefetched_playlist == b""
     assert result.prefetched_playlist_url == ""
     assert response.closed is True
+
+
+def test_media_probe_rejects_a_complete_hls_vod_that_is_only_an_ad() -> None:
+    body = (
+        b"#EXTM3U\n"
+        b"#EXT-X-TARGETDURATION:2\n"
+        + (b"#EXTINF:2.0,\nsegment.ts\n" * 9)
+        + b"#EXT-X-ENDLIST\n"
+    )
+    response = ProbeResponse(
+        body,
+        url="https://cdn.example/path/ad.m3u8",
+        headers={"Content-Type": "application/vnd.apple.mpegurl"},
+    )
+    http = SimpleNamespace(get=Mock(return_value=response))
+    probe = RemoteMediaProbe(http)  # type: ignore[arg-type]
+
+    result = probe.probe(
+        ResolvedMedia(
+            response.url,
+            "https://embed.example/",
+            "Test",
+            {},
+            "hls",
+        )
+    )
+
+    assert result.valid is False
+    assert result.kind == "hls"
+    assert "too short" in result.detail
+    assert response.closed is True
+
+
+def test_vidzy_resolver_prefers_the_obfuscated_content_source_over_the_decoy() -> None:
+    embed_url = "https://vidzy.cc/embed-video.html"
+    content_url = "https://v6.vidzy.cc/hls2/video/master.m3u8?token=test"
+    host_key = sum(map(ord, "vidzy.cc")) & 255
+    encrypted = bytes(
+        byte ^ ((0x3D + index * 89 + host_key) & 255)
+        for index, byte in enumerate(content_url.encode())
+    )
+    encoded = base64.b64encode(encrypted[::-1]).decode()
+    page = (
+        'var _fsvHls="https://s1.fsvid.lol/troll/master.m3u8";'
+        "sources: [{src: (function(s){"
+        'var h=(location&&location.hostname)||"",H=0;'
+        "for(var j=0;j<h.length;j++){H=(H+h.charCodeAt(j))&255;}"
+        'var b=atob(s),a=b.split("").reverse().join(""),r="";'
+        "for(var i=0;i<a.length;i++){"
+        "var kk=(0x3d+i*89+H)&255;"
+        "r+=String.fromCharCode(a.charCodeAt(i)^kk)}"
+        'return /^https?:/.test(r)?r:"https://s1.fsvid.lol/troll/master.m3u8"'
+        '})("' + encoded + '")} ]'
+    )
+    http = SimpleNamespace(
+        user_agent="Test Agent",
+        get=Mock(return_value=SimpleNamespace(status_code=200, text=page)),
+    )
+
+    media = VidzyResolver(http).resolve(embed_url)  # type: ignore[arg-type]
+
+    assert media.url == content_url
+    assert media.kind == "hls"
 
 
 def test_media_probe_uses_a_small_mp4_range() -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import binascii
+import base64
 import json
 import re
 from urllib.parse import urljoin, urlparse
@@ -36,6 +37,25 @@ def _extract_media_url(content: str) -> str | None:
         match = re.search(pattern, content, re.IGNORECASE)
         if match:
             return match.group(1).replace("\\/", "/")
+    return None
+
+
+def _extract_vidzy_obfuscated_url(content: str, host: str) -> str | None:
+    markers = ("atob(s)", 'split("").reverse()', "0x3d+i*89+H")
+    if not all(marker in content for marker in markers):
+        return None
+    host_key = sum(map(ord, host)) & 255
+    for encoded in re.findall(r'\}\)\(["\']([A-Za-z0-9+/=]{40,})["\']\)', content):
+        try:
+            encrypted = base64.b64decode(encoded, validate=True)[::-1]
+            decoded = bytes(
+                byte ^ ((0x3D + index * 89 + host_key) & 255)
+                for index, byte in enumerate(encrypted)
+            ).decode()
+        except (ValueError, binascii.Error, UnicodeError):
+            continue
+        if decoded.startswith(("http://", "https://")):
+            return decoded
     return None
 
 
@@ -197,7 +217,9 @@ class VidzyResolver(Resolver):
         response = self.http.get(url, headers={"Referer": origin})
         if response.status_code != 200:
             raise ResolverError(f"Vidzy returned HTTP {response.status_code}")
-        media_url = _extract_media_url(response.text)
+        media_url = _extract_vidzy_obfuscated_url(response.text, parsed.hostname or "")
+        if not media_url:
+            media_url = _extract_media_url(response.text)
         if not media_url:
             media_url = _extract_media_url(unpack_packer(response.text) or "")
         if not media_url:
