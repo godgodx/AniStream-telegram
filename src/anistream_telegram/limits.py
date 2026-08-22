@@ -29,7 +29,22 @@ class SlidingWindowLimiter:
                 return False
             values.append(now)
             if len(self.values) > 10_000:
-                self.values = defaultdict(deque, {key: values})
+                # Bound memory without discarding every other caller's
+                # window: expire stale keys first, then evict only the
+                # least recently active key until the map fits again.
+                expired = [
+                    key
+                    for key, window in self.values.items()
+                    if not window or window[-1] <= cutoff
+                ]
+                for key in expired:
+                    del self.values[key]
+                while len(self.values) > 10_000:
+                    oldest = min(
+                        self.values,
+                        key=lambda key: self.values[key][-1],
+                    )
+                    del self.values[oldest]
             return True
 
 
